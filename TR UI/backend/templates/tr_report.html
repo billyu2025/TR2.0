@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <link rel="stylesheet" href="tr_report.css">
+</head>
+<body>
+    <!-- Header Section -->
+    <div class="header">
+        <table class="header-table">
+            <tr>
+                {% if logo_exists %}
+                <td class="logo-cell">
+                    <img src="{{ logo_path}}" alt="VSC Logo" class="logo">
+                </td>
+                {% endif %}
+                <td class="company-cell">
+                    <div class="company-name">VSC CONSTRUCTION STEEL SOLUTIONS LIMITED</div>
+                    <div class="company-address">17 Tsing Keung St, Tsing Yi, New Territories, Hong Kong</div>
+                    <div class="company-phone">Tel: 2165 5788&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Fax: 2165 5789</div>
+                </td>
+                <td class="title-cell">
+                    <div class="title">Order Traceability Record</div>
+                    <div class="order-number"><strong>Order No:</strong> {{ order_info.Order_No }}</div>
+                </td>
+            </tr>
+        </table>
+    </div>
+
+    <!-- Order Information Section -->
+    <div class="order-info-section">
+        <div class="order-info-row-first">
+            <div class="field-group">
+                <strong>Client:</strong> {{ order_info.Client or '' }}
+            </div>
+            <div class="field-group">
+                <strong>Job No:</strong> {{ order_info.Job_No or '' }}
+            </div>
+            <div class="field-group">
+                <strong>PO No:</strong> {{ order_info['PO_No(2)'] or '' }}
+            </div>
+            <div class="field-group">
+                <strong>Del_Date:</strong> {{ order_info.Del_Date or '' }}
+            </div>
+        </div>
+        
+        <div class="order-info-row-second">
+            <div class="field-group">
+                <strong>Jobsite:</strong> {{ order_info.Jobsite or '' }}
+            </div>
+            <div class="field-group-spacer"></div>
+            <div class="field-group-spacer"></div>
+            <div class="field-group">
+                <strong>Ref_No:</strong> {{ order_info.Ref_No or '' }}
+            </div>
+        </div>
+        
+        <div class="order-description-row">
+            <div class="order-description">
+                <strong>Order Description:</strong> {{ order_info.Order_Description or '' }}
+            </div>
+        </div>
+    </div>
+
+    <!-- Header Spacer for subsequent pages - 在后续页面的表格前添加占位空间 -->
+    <div class="header-spacer"></div>
+
+    <!-- Materials Table -->
+    <table class="materials-table">
+        <thead>
+            <tr>
+                <th>Dia</th>
+                <th>Wt(ton)</th>
+                <th>Product</th>
+                <th>Grade</th>
+                <th>Pattern</th>
+                <th>Mill Cert</th>
+                <th>{% if use_test_cert1 %}Test Cert 1{% else %}Test Cert 2{% endif %}</th>
+                <th>Supplier</th>
+                <th>Stockist Cert</th>
+                <th>PO_No</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% set row_counter = namespace(value=0) %}
+            {% for group in grouped_materials %}
+                {% set row_span = group.rows|length %}
+                {% for item in group.rows %}
+                    {% set row_counter.value = row_counter.value + 1 %}
+                    {% set row_class = 'row-even' if row_counter.value % 2 == 0 else 'row-odd' %}
+                    {% set continued = not loop.first %}
+                    {% set is_last = loop.last %}
+                    <tr class="{{ row_class }} grouped-row{% if loop.first %} group-start{% endif %}{% if loop.last %} group-end{% endif %}">
+                        {% if loop.first %}
+                            <td rowspan="{{ row_span }}" class="wrap-cell">
+                                {% if group.dia is sequence and group.dia is not string %}
+                                    {% for part in group.dia %}
+                                        {% if part %}
+                                            <span class="single-line-item">{{ part }}</span>
+                                        {% endif %}
+                                    {% endfor %}
+                                {% else %}
+                                    {{ group.dia or '' }}
+                                {% endif %}
+                            </td>
+                            <td rowspan="{{ row_span }}" class="wrap-cell">
+                                {% if group.wt_total is not none %}
+                                    <span class="single-line-item">{{ group.wt_total|format('%.5f') }}</span>
+                                {% endif %}
+                            </td>
+                        {% endif %}
+                        <td class="wrap-cell{% if continued %} group-continued{% endif %}">
+                            {% if item.product is sequence and item.product is not string %}
+                                {% for part in item.product %}
+                                    {% if part %}
+                                        <span class="multi-line-item">{{ part }}</span>
+                                    {% endif %}
+                                {% endfor %}
+                            {% else %}
+                                {{ item.product|replace('None', '')|safe }}
+                            {% endif %}
+                        </td>
+                        <td class="wrap-cell{% if continued %} group-continued{% endif %}">
+                            {% if item.grade is sequence and item.grade is not string %}
+                                {% for part in item.grade %}
+                                    {% if part %}
+                                        <span class="single-line-item">{{ part }}</span>
+                                    {% endif %}
+                                {% endfor %}
+                            {% else %}
+                                {{ item.grade|replace('None', '')|safe }}
+                            {% endif %}
+                        </td>
+                        <td class="wrap-cell{% if continued %} group-continued{% endif %}">
+                            {% if item.pattern is sequence and item.pattern is not string %}
+                                {% for part in item.pattern %}
+                                    {% if part %}
+                                        <span class="multi-line-item">{{ part }}</span>
+                                    {% endif %}
+                                {% endfor %}
+                            {% else %}
+                                {{ item.pattern|replace('None', '')|safe }}
+                            {% endif %}
+                        </td>
+                        <td class="wrap-cell mill-cert-cell{% if continued %} group-continued{% endif %}">
+                            {% if item.mill_cert is sequence and item.mill_cert is not string %}
+                                {% for part in item.mill_cert %}
+                                    {% if part %}
+                                        <div class="cert-item">{{ part }}</div>
+                                    {% endif %}
+                                {% endfor %}
+                            {% else %}
+                                <div class="cert-item">{{ item.mill_cert|replace('None', '')|safe }}</div>
+                            {% endif %}
+                        </td>
+                        <td class="wrap-cell cert-cell{% if continued %} group-continued{% endif %}">
+                            {% if item.test_cert is sequence and item.test_cert is not string %}
+                                {% for part in item.test_cert %}
+                                    {% if part %}
+                                        <span class="cert-item">{{ part }}</span>
+                                    {% endif %}
+                                {% endfor %}
+                            {% else %}
+                                {{ item.test_cert|replace('None', '')|safe }}
+                            {% endif %}
+                        </td>
+                        <td class="wrap-cell{% if continued %} group-continued{% endif %}">
+                            {% if item.supplier is sequence and item.supplier is not string %}
+                                {% for part in item.supplier %}
+                                    {% if part %}
+                                        <span class="multi-line-item">{{ part }}</span>
+                                    {% endif %}
+                                {% endfor %}
+                            {% else %}
+                                {{ item.supplier|replace('None', '')|safe }}
+                            {% endif %}
+                        </td>
+                        <td class="wrap-cell{% if continued %} group-continued{% endif %}">
+                            {% if item.stockist is sequence and item.stockist is not string %}
+                                {% for part in item.stockist %}
+                                    {% if part %}
+                                        <span class="multi-line-item">{{ part }}</span>
+                                    {% endif %}
+                                {% endfor %}
+                            {% else %}
+                                {{ item.stockist|replace('None', '')|safe }}
+                            {% endif %}
+                        </td>
+                        <td class="wrap-cell{% if continued %} group-continued{% endif %}">
+                            {% if item.po_no is sequence and item.po_no is not string %}
+                                {% for part in item.po_no %}
+                                    {% if part %}
+                                        <span class="multi-line-item">{{ part }}</span>
+                                    {% endif %}
+                                {% endfor %}
+                            {% else %}
+                                {{ item.po_no|replace('None', '')|safe }}
+                            {% endif %}
+                        </td>
+                    </tr>
+                {% endfor %}
+            {% endfor %}
+        </tbody>
+    </table>
+
+    <!-- Footer Section - For signature only, text is in CSS @page -->
+    <div class="footer-signature">
+        {% if signature_exists %}
+        <img src="{{ signature_path }}" alt="Signature Chop" class="signature-chop">
+        {% endif %}
+    </div>
+
+</body>
+</html>
+

@@ -1,0 +1,17 @@
+TR database/data_180days.db
+TR database/data_3years.db
+
+# 环境变量文件（包含敏感信息）
+.env
+TR UI/backend/.env
+TR UI/.env
+
+# 但保留示例文件
+!.env.example
+!TR UI/backend/.env.example
+
+# 日志文件
+TR database/logs/
+
+# 生成的PDF文件
+TR UI/backend/Generated_PDFs/

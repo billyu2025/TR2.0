@@ -1,0 +1,49 @@
+# Nginx 反向代理配置示例
+# 将此文件内容复制到 Nginx 的 nginx.conf 或 conf/nginx.conf 文件中
+# 或者放在 conf/sites-enabled/ 目录下（如果使用 sites-enabled）
+
+server {
+    listen 80;
+    server_name localhost;  # 如果有域名，改为你的域名；如果只有IP，可以改为你的外网IP或保持 localhost
+    
+    # 设置字符编码
+    charset utf-8;
+    
+    # 前端静态文件服务
+    # 指向你的前端项目目录
+    location / {
+        root C:/TR-master/TR UI;
+        index login.html index.html;
+        
+        # 尝试查找文件，如果找不到则返回 login.html（用于前端路由）
+        try_files $uri $uri/ /login.html;
+    }
+    
+    # 后端 API 反向代理
+    location /api/ {
+        # 代理到后端 Flask 服务器
+        proxy_pass http://127.0.0.1:5000;
+        
+        # 设置代理请求头
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        
+        # WebSocket 支持（如果需要）
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        
+        # 超时设置
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+    }
+    
+    # 错误页面
+    error_page 500 502 503 504 /50x.html;
+    location = /50x.html {
+        root html;
+    }
+}

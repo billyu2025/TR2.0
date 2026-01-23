@@ -1,0 +1,1221 @@
+@page {
+    size: A4 landscape;
+    margin: 8mm 6mm 22mm 6mm;  /* 上15mm、左右12mm、下30mm，减少左右留白 */
+    
+    @bottom-left {
+        content: "We, VSC Construction Steel Solutions Limited, Certify the processed steel bar are in compliance with the quality assurance scheme and products are in compliance with the Construction Standard HK CS2:2012 Grade 500B and according to Specification BS 4449:2005, including amendments thereto and replacement thereof and other relevant prevailing technical memorandums, practice notes, codes of practice and specifications related to testing of reinforcement issued by the Government.";
+        font-size: 9pt;
+        text-align: left;
+        margin-left: 0.1in;
+        margin-right: 0.3in;  /* 减少右侧边距，让文字更靠近右侧页码 */
+        width: calc(100% - 0.3in - 0.1in);  /* 宽度计算要与 margin-right 匹配 */
+        max-width: 9.5in;  /* 增加最大宽度，允许文字区域扩展到更右侧 */
+    }
+    
+    /* 页码：第一页使用CSS生成，第二页及后续页面由代码生成 */
+    /* 字体样式与代码生成保持一致：9pt，Helvetica Bold（与第二页的/Helvetica-Bold一致） */
+    @bottom-right {
+        content: "Page " counter(page) "/" counter(pages);
+        font-size: 9pt;
+        font-weight: bold;
+        font-family: 'Helvetica Neue', 'Helvetica', 'Arial', sans-serif;
+        text-align: right;
+        white-space: nowrap;
+    }
+}
+
+/* 字体定义 - 使用绝对路径或系统字体作为后备 */
+@font-face {
+    font-family: 'NotoSansCJK';
+    src: url('../fonts/NotoSansCJKsc-Regular.otf') format('opentype');
+    font-weight: normal;
+    font-style: normal;
+    /* 添加后备，如果字体加载失败 */
+    font-display: fallback;
+}
+
+@font-face {
+    font-family: 'NotoSansCJK';
+    src: url('../fonts/NotoSansCJKsc-Bold.otf') format('opentype');
+    font-weight: bold;
+    font-style: normal;
+    font-display: fallback;
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    /* 确保使用系统字体作为后备，以防自定义字体加载失败 */
+    font-family: 'NotoSansCJK', 'Helvetica Neue', 'Helvetica', 'Arial', 'Microsoft YaHei', 'SimHei', 'SimSun', sans-serif;
+    font-size: 10pt;
+    color: #000000 !important; /* 强制使用黑色，确保文字可见 */
+    line-height: 1.4;
+    padding-bottom: 1in;
+    /* 确保文字可见 */
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+/* Header Styles */
+.header {
+    margin-bottom: 0.5in;
+}
+
+.header-table {
+    width: 100%;
+    border-collapse: collapse;
+    table-layout: fixed;
+}
+
+.logo-cell {
+    width: 0.7in;
+    vertical-align: top;
+    padding: 0;
+    padding-left: 0.4in;  /* 调整Logo整体位置向右 */
+}
+
+.logo {
+    width: 0.7in;
+    height: 0.7in;
+    display: block;
+}
+
+.company-cell {
+    width: 3.4in;
+    vertical-align: top;
+    padding: 0;
+    padding-left: -400px;  /* 进一步向左移动 */
+}
+
+.company-name {
+    font-size: 12pt;
+    font-weight: bold;
+    margin-bottom: 6px;  /* 改为正数，让地址在下面有正常间距 */
+    line-height: 11pt;
+    margin-left: -30px;  /* 确保左对齐 */
+}
+
+.company-address {
+    font-size: 10pt;
+    margin-top: 0;  /* 移除负值，让它在公司名称下面正常显示 */
+    margin-bottom: 3px;
+    line-height: 10pt;
+    margin-left: -30px;  /* 确保左对齐 */
+}
+
+.company-phone {
+    font-size: 10pt;
+    margin-top: 0;
+    line-height: 10pt;
+    margin-left: -30px;  /* 确保左对齐 */
+}
+
+.title-cell {
+    width: 4.0in;
+    vertical-align: top;
+    text-align: right;
+    padding: 0;
+    padding-right: -30px;
+    padding-top: -0.8in;  /* 向上移动标题区域 */
+    position: relative;  /* 为 Order No 的绝对定位提供参考 */
+}
+
+.title {
+    font-size: 20pt;
+    font-weight: bold;
+    text-align: right;
+    margin-bottom: 18px;
+    transform: translateY(-0.15in);   /* 视需要调整 -0.3in 的数值 */
+}
+
+.order-number {
+    font-size: 10pt;
+    font-weight: normal;  /* 默认不加粗，只有 <strong> 标签内的文字加粗 */
+    text-align: left;  /* 左对齐，让 O 对齐 */
+    padding-left: 2.75in;  /* 调整Order No 与 Del_Date、Ref_No 对齐 */
+    position: absolute;  /* 改为绝对定位，这样下移时不会影响 header 高度 */
+    top: 60px;  /* 提升 Order No 位置 */
+}
+
+/* Order Information Section */
+.order-info-section {
+    margin-top: -0.4in;  /* 往上移动（负值减小上方间距） */
+    margin-bottom: 0.2in;
+}
+
+.order-info-row-first {
+    display: table;
+    width: 100%;
+    table-layout: fixed;
+}
+
+.order-info-row-first .field-group {
+    display: table-cell;
+    padding-right: 40px;
+    font-size: 10pt;
+    vertical-align: top;
+}
+
+.order-info-row-first .field-group:first-child {
+    width: 3in;
+    padding-left: -20px;
+    white-space: nowrap;  /* Client 内容保持在一行，不换行 */
+}
+
+/* Job No 向右移动，并保持在一行 */
+.order-info-row-first .field-group:nth-child(2) {
+    padding-left: 2in;  /* 增加左侧padding，向右移动 */
+    white-space: nowrap;  /* 内容保持在一行，不换行 */
+}
+
+/* PO No 向右移动，并保持在一行 */
+.order-info-row-first .field-group:nth-child(3) {
+    padding-left: 1in;  /* 增加左侧padding，向右移动 */
+    white-space: nowrap;  /* 内容保持在一行，不换行 */
+}
+
+/* Del_Date 左对齐，与 Order No 的第一个字母对齐 */
+.order-info-row-first .field-group:last-child {
+    text-align: left;  /* 左对齐，让 D 对齐 */
+    padding-left: 0.45in;  /* 与 Order No 对齐 */
+    padding-right: 0;
+    /* 计算方法：
+       Order No 实际位置：logo(1.0in) + company(3.5in) = 4.5in
+       但需要考虑页边距和实际内容对齐
+       通过调整 padding-left 来精确对齐 */
+}
+
+.order-info-row-second {
+    display: table;
+    width: 100%;
+    table-layout: fixed;
+    margin-top: 0;
+    /* 确保第二行的列宽与第一行一致 */
+}
+
+.order-info-row-second .field-group {
+    display: table-cell;
+    font-size: 10pt;
+    vertical-align: top;
+}
+
+.order-info-row-second .field-group:first-child {
+    width: 3in;
+    padding-left: -20px;
+    white-space: nowrap;  /* Jobsite 内容保持在一行，不换行 */
+}
+
+/* Ref_No 左对齐，与 Order No 和 Del_Date 的第一个字母对齐 */
+.order-info-row-second .field-group:last-child {
+    text-align: left;  /* 左对齐，让 R 对齐 */
+    padding-left: 1.93in;  /* 与 Order No 对齐 */
+    padding-right: 0;
+}
+
+.field-group-spacer {
+    display: table-cell;
+    width: 2in;
+}
+
+.order-description-row {
+    margin-top: 0;
+}
+
+.order-description {
+    font-size: 14pt;
+    font-weight: bold;
+    padding-left: -20px;
+    margin-top: 6px;
+}
+
+/* Materials Table */
+/* Header Spacer - 在后续页面的表格前添加占位空间 */
+.header-spacer {
+    /* 第一页：高度为 0，不占据空间，不触发分页 */
+    height: 0;
+    display: block;
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    /* 不触发分页 */
+    page-break-before: avoid;
+    page-break-after: avoid;
+}
+
+.materials-table {
+    width: 100%;
+    max-width: 100%;  /* 确保不超过页面宽度 */
+    border-collapse: collapse;
+    margin-bottom: 0.3in;
+    margin-top: -0.15in;
+    /* 为后续页面的表格添加顶部边距 */
+    /* 当表格在新页面开始时，通过 thead 的重复显示来添加空间 */
+    font-size: 6pt;
+    table-layout: fixed;  /* 固定表格布局，确保列宽被遵守 */
+    overflow: visible;  /* 允许内容完整显示 */
+}
+
+.materials-table thead {
+    background-color: #979595;
+    /* 表格头部会在每页重复显示 */
+    display: table-header-group;
+}
+
+.materials-table th {
+    padding: 4px 4px;  /* 减少内边距，节省空间 */
+    text-align: center;
+    font-weight: bold;
+    font-size: 8pt;  /* 稍微减小字体 */
+    border: 1px solid #000;
+    color: #000 !important;
+    vertical-align: middle !important;  /* 表头垂直居中对齐 */
+}
+
+.materials-table tbody tr {
+    background-color: #ffffff;
+    vertical-align: top !important;  /* 确保所有行都顶部对齐 */
+}
+
+/* 特别针对 Mill Cert 列所在的行 - 强制顶部对齐 */
+.materials-table tbody tr td:nth-child(6) {
+    vertical-align: top !important;
+}
+
+.materials-table tbody tr.row-odd {
+    background-color: #ffffff;
+}
+
+.materials-table tbody tr.row-even {
+    background-color: #ffffff;
+}
+
+.materials-table tbody tr.grouped-row:not(.group-start) td,
+.materials-table tbody tr.grouped-row:not(.group-start) .wrap-cell {
+    border-top: none;
+}
+
+.materials-table tbody tr.grouped-row:not(.group-end) td,
+.materials-table tbody tr.grouped-row:not(.group-end) .wrap-cell {
+    border-bottom: none;
+}
+
+.materials-table tbody tr.grouped-row.group-start td[rowspan] {
+    border-bottom: 1px solid #000;
+}
+
+.materials-table tbody tr.grouped-row.group-end td,
+.materials-table tbody tr.grouped-row.group-end .wrap-cell {
+    border-bottom: 1px solid #000;
+}
+
+.materials-table td {
+    padding: 1px;  /* 减少内边距，节省空间 */
+    text-align: left;
+    border: 1px solid #000;
+    vertical-align: top;
+    overflow: visible;  /* 允许内容完整显示 */
+    text-overflow: clip;  /* 不使用省略号 */
+    font-size: 7pt !important;  /* 基础字体大小，会被特定列覆盖 */
+}
+
+/* Stockist Cert 列特殊设置 - 确保左对齐 */
+.materials-table td:nth-child(9) {
+    text-align: left !important;  /* Stockist Cert 左对齐，覆盖通用设置 */
+    vertical-align: top !important;  /* Stockist Cert 顶部对齐 */
+}
+
+
+.materials-table td.group-continued {
+    border-top: none;
+    border-bottom: none;
+    font-size: 7pt !important;  /* 确保字体大小一致 */
+}
+
+/* Mill Cert 列在 grouped-row 中的特殊设置 - 确保顶部对齐 */
+.materials-table tbody tr.grouped-row td:nth-child(6),
+.materials-table tbody tr.grouped-row td:nth-child(6).group-continued,
+.materials-table tbody tr.group-start td:nth-child(6),
+.materials-table tbody tr.group-end td:nth-child(6) {
+    padding-top: 0 !important;  /* 确保顶部无内边距 */
+    padding-bottom: 0 !important;  /* 确保底部无内边距 */
+    vertical-align: top !important;  /* 强制顶部对齐 */
+    margin-top: 0 !important;
+    margin-bottom: 0 !important;
+}
+
+/* Mill Cert 的 wrap-cell 在 grouped-row 中的特殊设置 - 强制顶部对齐 */
+.materials-table tbody tr.grouped-row td:nth-child(6) .wrap-cell,
+.materials-table tbody tr.grouped-row td:nth-child(6).group-continued .wrap-cell,
+.materials-table tbody tr.group-start td:nth-child(6) .wrap-cell,
+.materials-table tbody tr.group-end td:nth-child(6) .wrap-cell {
+    margin-top: 0 !important;
+    margin-bottom: 0 !important;
+    padding-top: 0 !important;
+    padding-bottom: 0 !important;
+    vertical-align: top !important;
+}
+
+/* Mill Cert 的 cert-item 在 grouped-row 中的特殊设置 - 强制所有行顶部对齐 */
+.materials-table tbody tr.grouped-row td:nth-child(6) .mill-cert-cell .cert-item,
+.materials-table tbody tr.grouped-row td:nth-child(6).group-continued .mill-cert-cell .cert-item,
+.materials-table tbody tr.group-start td:nth-child(6) .mill-cert-cell .cert-item,
+.materials-table tbody tr.group-end td:nth-child(6) .mill-cert-cell .cert-item,
+.materials-table tbody tr.grouped-row td:nth-child(6).wrap-cell.mill-cert-cell .cert-item,
+.materials-table tbody tr.grouped-row td:nth-child(6).wrap-cell.mill-cert-cell.group-continued .cert-item {
+    margin-top: 0 !important;
+    margin-bottom: 0 !important;
+    padding-top: 0 !important;
+    padding-bottom: 0 !important;
+    line-height: 1.0 !important;
+}
+
+.materials-table .wrap-cell {
+    padding: 4px;  /* 与基础 td 的 padding 保持一致 * 调整这个参数可以调整内容之间的间距/ 
+    word-wrap: break-word;
+    word-break: break-word;
+    white-space: normal;  /* 允许换行 */
+    font-size: 7pt !important;  /* 确保 wrap-cell 字体大小一致 */
+}
+
+.materials-table .wrap-cell.group-continued {
+    border-top: none;
+    border-bottom: none;
+}
+
+.materials-table tr:last-child td.group-continued,
+.materials-table tr:last-child .wrap-cell.group-continued {
+    border-bottom: 1px solid #000;
+}
+
+/* Product、Pattern、Mill Cert、Test Cert、Supplier、Stockist Cert、PO_No 多行列对齐设置 */
+/* 这些列需要与 Test Cert (第7列) 对齐，同一框内的两行之间不留间距 */
+
+/* 多行列通用设置 - 确保同一单元格内行与行之间无间距 */
+.materials-table td:nth-child(3),
+.materials-table td:nth-child(5),
+.materials-table td:nth-child(7),
+.materials-table td:nth-child(8),
+.materials-table td:nth-child(10) {
+    padding: 0 4px 1pt 4px !important;  /* padding-top 改为 0，确保严格顶部对齐 */
+    line-height: 1.0 !important;  /* 进一步减小基础行高 */
+    white-space: normal !important;  /* 允许换行 */
+    word-wrap: break-word !important;
+    word-break: break-word !important;
+    overflow: visible !important;  /* 允许内容完整显示，不截断 */
+    text-overflow: clip !important;  /* 不使用省略号 */
+    max-width: none !important;  /* 移除最大宽度限制 */
+    font-size: 7pt !important;  /* Product、Pattern、Test Cert、Supplier、Stockist Cert、PO No 使用 7pt */
+    vertical-align: top !important;  /* 顶部对齐，确保多行内容正确显示 */
+    text-align: left !important;  /* Product、Pattern、Test Cert、Supplier、PO No 左对齐 */
+}
+
+/* Mill Cert 列的单独设置 - 顶部对齐，只在内容超出宽度时换行，不在逗号处换行 */
+.materials-table td:nth-child(6) {
+    padding: 0 4px 0 4px !important;  /* 上下内边距都为 0，确保严格顶部对齐 */
+    padding-top: 0 !important;  /* 明确设置顶部内边距为 0，确保顶部对齐 */
+    padding-bottom: 0 !important;  /* 明确设置底部内边距为 0，避免内容被推下 */
+    line-height: 1.0 !important;  /* 进一步减小基础行高 */
+    white-space: normal !important;  /* 允许换行 */
+    overflow-wrap: break-word !important;  /* 只在内容超出宽度时换行 */
+    word-wrap: break-word !important;  /* 兼容性 */
+    word-break: normal !important;  /* 不在标点（如逗号）处换行，只在单词边界或必要时换行 */
+    overflow: visible !important;  /* 允许内容完整显示，不截断 */
+    text-overflow: clip !important;  /* 不使用省略号 */
+    max-width: 2.6in !important;  /* 固定最大宽度，确保换行生效 */
+    font-size: 7pt !important;  /* Mill Cert 使用 7pt */
+    vertical-align: top !important;  /* 顶部对齐，确保多行内容从顶部开始 */
+    text-align: left !important;  /* Mill Cert 左对齐 */
+    height: auto !important;  /* 高度自适应内容 */
+    min-height: 0 !important;  /* 无最小高度限制 */
+}
+
+/* Stockist Cert 列单独设置 - 确保左对齐 */
+.materials-table td:nth-child(9) {
+    padding: 0 4px 1pt 4px !important;  /* padding-top 改为 0，确保严格顶部对齐 */
+    line-height: 1.0 !important;
+    white-space: normal !important;
+    word-wrap: break-word !important;
+    word-break: break-word !important;
+    overflow: visible !important;
+    text-overflow: clip !important;
+    max-width: none !important;
+    font-size: 7pt !important;
+    vertical-align: top !important;
+    text-align: left !important;  /* Stockist Cert 左对齐 */
+}
+
+/* Test Cert 列特殊设置 - 所有内容左对齐 */
+.materials-table td:nth-child(7) {
+    text-align: left !important;  /* Test Cert 左对齐 */
+}
+
+/* wrap-cell 清零所有间距 */
+.materials-table td:nth-child(3) .wrap-cell,
+.materials-table td:nth-child(5) .wrap-cell,
+.materials-table td:nth-child(8) .wrap-cell,
+.materials-table td:nth-child(10) .wrap-cell {
+    margin: 0 !important;
+    padding: 0 !important;
+    padding-left: 0 !important;  /* 确保无左内边距 */
+    margin-left: 0 !important;  /* 确保无左边距 */
+    text-indent: 0 !important;  /* 确保无文本缩进 */
+    line-height: 1.0 !important;  /* 与单元格保持一致 */
+    font-size: 7pt !important;  /* 确保 wrap-cell 字体大小一致 */
+    overflow: visible !important;  /* 允许内容完整显示 */
+    text-overflow: clip !important;  /* 不使用省略号 */
+    vertical-align: top !important;
+    text-align: left !important;  /* Product、Pattern、Supplier、PO No wrap-cell 左对齐 */
+    white-space: normal !important;  /* 允许换行 */
+    word-wrap: break-word !important;  /* 允许单词内换行 */
+    word-break: break-word !important;  /* 允许在任意字符间换行 */
+}
+
+/* Mill Cert 的 wrap-cell 单独设置 - 顶部对齐，只在内容超出宽度时换行 */
+.materials-table td:nth-child(6) .wrap-cell {
+    margin: 0 !important;
+    margin-top: 0 !important;  /* 确保顶部无外边距，顶部对齐 */
+    margin-bottom: 0 !important;  /* 确保底部无外边距 */
+    padding: 0 !important;
+    padding-top: 0 !important;  /* 确保顶部无内边距，顶部对齐 */
+    padding-bottom: 0 !important;  /* 确保底部无内边距 */
+    padding-left: 0 !important;  /* 确保无左内边距 */
+    margin-left: 0 !important;  /* 确保无左边距 */
+    text-indent: 0 !important;  /* 确保无文本缩进 */
+    line-height: 1.0 !important;  /* 与单元格保持一致 */
+    font-size: 7pt !important;  /* 确保 wrap-cell 字体大小一致 */
+    overflow: visible !important;  /* 允许内容完整显示 */
+    text-overflow: clip !important;  /* 不使用省略号 */
+    text-align: left !important;  /* Mill Cert wrap-cell 左对齐 */
+    white-space: normal !important;  /* 允许换行 */
+    word-wrap: break-word !important;  /* 只在内容超出宽度时换行 */
+    word-break: normal !important;  /* 不在标点（如逗号）处换行，只在单词边界或必要时换行 */
+    display: block !important;  /* 确保是块级元素，从顶部开始排列 */
+    height: auto !important;  /* 高度自适应内容 */
+    min-height: 0 !important;  /* 无最小高度限制 */
+}
+
+/* Stockist Cert 列的 wrap-cell 特殊设置 - 确保左对齐 */
+.materials-table td:nth-child(9) .wrap-cell {
+    margin: 0 !important;
+    padding: 0 !important;
+    line-height: 1.0 !important;
+    font-size: 7pt !important;
+    overflow: visible !important;
+    text-overflow: clip !important;
+    vertical-align: top !important;
+    text-align: left !important;  /* Stockist Cert wrap-cell 左对齐 */
+}
+
+/* Test Cert 列的 wrap-cell 特殊设置 - 左对齐 */
+.materials-table td:nth-child(7) .wrap-cell {
+    margin: 0 !important;
+    padding: 0 !important;
+    padding-left: 0 !important;  /* 确保无左内边距 */
+    margin-left: 0 !important;  /* 确保无左边距 */
+    text-indent: 0 !important;  /* 确保无文本缩进 */
+    line-height: 1.0 !important;
+    font-size: 7pt !important;
+    overflow: visible !important;
+    text-overflow: clip !important;
+    vertical-align: top !important;
+    text-align: left !important;  /* Test Cert wrap-cell 左对齐 */
+}
+
+/* 如果有 <br> 标签，隐藏它们，避免额外空隙 */
+.materials-table td:nth-child(7) br {
+    display: none !important;
+}
+
+/* 所有 p、div、span 元素 - 完全消除间距，使用紧凑布局 */
+.materials-table td:nth-child(3) p,
+.materials-table td:nth-child(3) div:not(.cert-item),
+.materials-table td:nth-child(3) span:not(.multi-line-item):not(.cert-item) {
+    margin: 0 !important;
+    padding: 0 !important;
+    line-height: 1.0 !important;  /* 与单元格保持一致 */
+    font-size: 7pt !important;  /* 确保所有元素字体大小一致 */
+    display: block !important;
+    text-align: left !important;  /* Product 所有子元素左对齐 */
+}
+
+.materials-table td:nth-child(3) p,
+.materials-table td:nth-child(3) div:not(.cert-item),
+.materials-table td:nth-child(3) span:not(.multi-line-item):not(.cert-item),
+.materials-table td:nth-child(5) p,
+.materials-table td:nth-child(5) div:not(.cert-item):not(.cert-spacer),
+.materials-table td:nth-child(5) span:not(.multi-line-item):not(.cert-item),
+.materials-table td:nth-child(7) p,
+.materials-table td:nth-child(7) div:not(.cert-item):not(.cert-spacer),
+.materials-table td:nth-child(7) span:not(.multi-line-item):not(.cert-item) {
+    margin: 0 !important;
+    padding: 0 !important;
+    line-height: 1.0 !important;  /* 与单元格保持一致 */
+    font-size: 7pt !important;  /* 确保所有元素字体大小一致 */
+    display: block !important;
+    text-align: left !important;  /* Test Cert 所有子元素左对齐 */
+}
+
+/* Mill Cert 的 p、div、span 元素单独设置 */
+.materials-table td:nth-child(6) p,
+.materials-table td:nth-child(6) div:not(.cert-item):not(.cert-spacer),
+.materials-table td:nth-child(6) span:not(.multi-line-item):not(.cert-item) {
+    margin: 0 !important;
+    padding: 0 !important;
+    line-height: 1.0 !important;  /* 与单元格保持一致 */
+    font-size: 7pt !important;  /* 确保所有元素字体大小一致 */
+    display: block !important;
+    text-align: left !important;  /* Mill Cert 所有子元素左对齐 */
+}
+
+.materials-table td:nth-child(8) p,
+.materials-table td:nth-child(8) div:not(.cert-item):not(.cert-spacer),
+.materials-table td:nth-child(8) span:not(.multi-line-item):not(.cert-item),
+.materials-table td:nth-child(8) p,
+.materials-table td:nth-child(8) div:not(.cert-item):not(.cert-spacer),
+.materials-table td:nth-child(8) span:not(.multi-line-item):not(.cert-item),
+.materials-table td:nth-child(9) p,
+.materials-table td:nth-child(9) div:not(.cert-item):not(.cert-spacer),
+.materials-table td:nth-child(9) span:not(.multi-line-item):not(.cert-item) {
+    margin: 0 !important;
+    padding: 0 !important;
+    line-height: 1.0 !important;  /* 与单元格保持一致 */
+    font-size: 7pt !important;  /* 确保所有元素字体大小一致 */
+    display: block !important;
+    text-align: left !important;  /* Stockist Cert 所有子元素左对齐 */
+}
+
+.materials-table td:nth-child(10) p,
+.materials-table td:nth-child(10) div:not(.cert-item):not(.cert-spacer),
+.materials-table td:nth-child(10) span:not(.multi-line-item):not(.cert-item),
+.materials-table td:nth-child(10) p,
+.materials-table td:nth-child(10) div:not(.cert-item):not(.cert-spacer),
+.materials-table td:nth-child(10) span:not(.multi-line-item):not(.cert-item) {
+    margin: 0 !important;
+    padding: 0 !important;
+    line-height: 1.0 !important;  /* 与单元格保持一致 */
+    font-size: 7pt !important;  /* 确保所有元素字体大小一致 */
+    display: block !important;
+}
+
+/* 多行文本内容 - 确保所有子元素都没有间距，字体大小一致 */
+.materials-table td:nth-child(3) *:not(br),
+.materials-table td:nth-child(5) *:not(br):not(.cert-spacer) {
+    margin-top: 0 !important;
+    margin-bottom: 0 !important;
+    padding-top: 0 !important;
+    padding-bottom: 0 !important;
+    font-size: 7pt !important;  /* 确保所有子元素字体大小一致 */
+    overflow: visible !important;  /* 允许内容完整显示 */
+    text-overflow: clip !important;  /* 不使用省略号 */
+    white-space: normal !important;  /* 允许换行 */
+    word-wrap: break-word !important;
+    word-break: break-word !important;
+    text-align: left !important;  /* Product、Pattern 左对齐 */
+}
+
+/* Mill Cert 的所有子元素单独设置 - 只在内容超出宽度时换行 */
+.materials-table td:nth-child(6) *:not(br):not(.cert-spacer) {
+    margin-top: 0 !important;
+    margin-bottom: 0 !important;
+    padding-top: 0 !important;
+    padding-bottom: 0 !important;
+    font-size: 7pt !important;  /* 确保所有子元素字体大小一致 */
+    overflow: visible !important;  /* 允许内容完整显示 */
+    text-overflow: clip !important;  /* 不使用省略号 */
+    white-space: normal !important;  /* 允许换行 */
+    word-wrap: break-word !important;  /* 只在内容超出宽度时换行 */
+    word-break: normal !important;  /* 不在标点（如逗号）处换行，只在单词边界或必要时换行 */
+    text-align: left !important;  /* Mill Cert 左对齐 */
+}
+
+/* Test Cert 列的所有子元素 - 左对齐 */
+.materials-table td:nth-child(7) *:not(br):not(.cert-spacer) {
+    margin-top: 0 !important;
+    margin-bottom: 0 !important;
+    padding-top: 0 !important;
+    padding-bottom: 0 !important;
+    font-size: 7pt !important;  /* 确保所有子元素字体大小一致 */
+    overflow: visible !important;  /* 允许内容完整显示 */
+    text-overflow: clip !important;  /* 不使用省略号 */
+    white-space: normal !important;  /* 允许换行 */
+    word-wrap: break-word !important;
+    word-break: break-word !important;
+    text-align: left !important;  /* Test Cert 所有子元素左对齐 */
+}
+
+.materials-table td:nth-child(8) *:not(br):not(.cert-spacer) {
+    margin-top: 0 !important;
+    margin-bottom: 0 !important;
+    padding-top: 0 !important;
+    padding-bottom: 0 !important;
+    font-size: 7pt !important;  /* 确保所有子元素字体大小一致 */
+    overflow: visible !important;  /* 允许内容完整显示 */
+    text-overflow: clip !important;  /* 不使用省略号 */
+    white-space: normal !important;  /* 允许换行 */
+    word-wrap: break-word !important;
+    word-break: break-word !important;
+}
+
+/* Stockist Cert 列的所有子元素 - 确保左对齐，覆盖 Test Cert 的居中设置 */
+.materials-table td:nth-child(9) *:not(br):not(.cert-spacer),
+.materials-table td:nth-child(9) *:not(br):not(.cert-spacer) * {
+    margin-top: 0 !important;
+    margin-bottom: 0 !important;
+    padding-top: 0 !important;
+    padding-bottom: 0 !important;
+    font-size: 7pt !important;  /* 确保所有子元素字体大小一致 */
+    overflow: visible !important;  /* 允许内容完整显示 */
+    text-overflow: clip !important;  /* 不使用省略号 */
+    white-space: normal !important;  /* 允许换行 */
+    word-wrap: break-word !important;
+    word-break: break-word !important;
+    text-align: left !important;  /* Stockist Cert 所有子元素左对齐，覆盖任何继承的居中设置 */
+    direction: ltr !important;  /* 确保从左到右的文本方向 */
+}
+
+.materials-table td:nth-child(10) *:not(br):not(.cert-spacer) {
+    margin-top: 0 !important;
+    margin-bottom: 0 !important;
+    padding-top: 0 !important;
+    padding-bottom: 0 !important;
+    font-size: 7pt !important;  /* 确保所有子元素字体大小一致 */
+    overflow: visible !important;  /* 允许内容完整显示 */
+    text-overflow: clip !important;  /* 不使用省略号 */
+    white-space: normal !important;  /* 允许换行 */
+    word-wrap: break-word !important;
+    word-break: break-word !important;
+}
+
+/* 多行列的块元素样式 - 确保条目之间无间距 */
+.materials-table td:nth-child(3) .multi-line-item,
+.materials-table td:nth-child(5) .multi-line-item,
+.materials-table td:nth-child(8) .multi-line-item,
+.materials-table td:nth-child(10) .multi-line-item {
+    display: block !important;
+    margin: 0 !important;
+    margin-top: 0 !important;
+    margin-bottom: 0pt !important;  /* 增加负边距，彻底消除间距 */
+    margin-left: 0 !important;  /* 确保无左边距 */
+    padding: 0 !important;
+    padding-left: 0 !important;  /* 确保无左内边距 */
+    text-indent: 0 !important;  /* 确保无文本缩进 */
+    line-height: 1.0 !important;  /* 进一步减小行高 */
+    font-size: 7pt !important;  /* Product、Pattern、Supplier、Stockist Cert、PO No 使用 7pt */
+    height: auto !important;
+    min-height: 0 !important;
+    max-height: none !important;
+    max-width: 100% !important;  /* 确保不超过容器宽度 */
+    transform: translateY(0) !important;  /* 确保没有额外的变换 */
+    text-align: left !important;  /* Product、Pattern、Supplier、PO No multi-line-item 左对齐 */
+    white-space: normal !important;  /* 允许换行 */
+    word-wrap: break-word !important;  /* 允许单词内换行 */
+    word-break: break-word !important;  /* 允许在任意字符间换行 */
+    overflow-wrap: break-word !important;  /* 额外的换行支持 */
+    overflow: visible !important;  /* 允许内容完整显示 */
+}
+
+/* Mill Cert 的 multi-line-item 单独设置 - 顶部对齐，只在内容超出宽度时换行 */
+.materials-table td:nth-child(6) .multi-line-item {
+    display: block !important;
+    margin: 0 !important;
+    margin-top: 0 !important;  /* 确保顶部无外边距，顶部对齐 */
+    margin-bottom: 0pt !important;  /* 增加负边距，彻底消除间距 */
+    margin-left: 0 !important;  /* 确保无左边距 */
+    padding: 0 !important;
+    padding-top: 0 !important;  /* 确保顶部无内边距，顶部对齐 */
+    padding-left: 0 !important;  /* 确保无左内边距 */
+    text-indent: 0 !important;  /* 确保无文本缩进 */
+    line-height: 1.0 !important;  /* 进一步减小行高 */
+    font-size: 7pt !important;  /* Mill Cert 使用 7pt */
+    height: auto !important;
+    min-height: 0 !important;
+    max-height: none !important;
+    max-width: 100% !important;  /* 确保不超过容器宽度（2.6in） */
+    width: 100% !important;  /* 占满容器宽度 */
+    box-sizing: border-box !important;  /* 包含 padding 和 border 在宽度内 */
+    transform: translateY(0) !important;  /* 确保没有额外的变换 */
+    text-align: left !important;  /* Mill Cert multi-line-item 左对齐 */
+    white-space: normal !important;  /* 允许换行 */
+    overflow-wrap: break-word !important;  /* 只在内容超出宽度时换行 */
+    word-wrap: break-word !important;  /* 兼容性 */
+    word-break: normal !important;  /* 不在标点（如逗号）处换行，只在单词边界或必要时换行 */
+    overflow: visible !important;  /* 允许内容完整显示 */
+}
+
+/* Mill Cert 的新方案 - 使用 mill-cert-cell 和 cert-item，只在内容超出宽度时换行，所有行顶部对齐 */
+.mill-cert-cell .cert-item {
+    display: block !important;  /* 块级元素，从上到下排列 */
+    margin: 0 !important;  /* 移除所有外边距，确保顶部对齐 */
+    margin-top: 0 !important;  /* 确保第一行顶部对齐 */
+    margin-bottom: 0 !important;  /* 移除底部边距，行与行之间无间距 */
+    padding: 0 !important;  /* 移除所有内边距 */
+    padding-top: 0 !important;  /* 确保顶部无内边距 */
+    padding-bottom: 0 !important;  /* 确保底部无内边距 */
+    line-height: 1.0 !important;  /* 减小行高，确保紧凑对齐 */
+    white-space: normal;
+    overflow-wrap: break-word !important;  /* 只在内容超出宽度时换行 */
+    word-wrap: break-word !important;  /* 兼容性 */
+    word-break: normal !important;  /* 不在标点（如逗号）处换行，只在单词边界或必要时换行 */
+    text-align: left !important;  /* 左对齐 */
+    height: auto !important;  /* 高度自适应内容 */
+    min-height: 0 !important;  /* 无最小高度限制 */
+}
+
+/* Mill Cert 的第一行 - 确保从顶部开始 */
+.mill-cert-cell .cert-item:first-child {
+    margin-top: 0 !important;
+    padding-top: 0 !important;
+}
+
+/* Mill Cert 的第二行、第三行及之后的行 - 确保顶部对齐，无上边距，紧贴上一行 */
+.mill-cert-cell .cert-item:nth-child(2),
+.mill-cert-cell .cert-item:nth-child(3),
+.mill-cert-cell .cert-item:nth-child(4),
+.mill-cert-cell .cert-item:nth-child(5),
+.mill-cert-cell .cert-item:nth-child(n+2),
+.materials-table td:nth-child(6) .mill-cert-cell .cert-item:nth-child(2),
+.materials-table td:nth-child(6) .mill-cert-cell .cert-item:nth-child(3),
+.materials-table td:nth-child(6) .mill-cert-cell .cert-item:nth-child(n+2),
+.materials-table tbody tr.grouped-row td:nth-child(6) .mill-cert-cell .cert-item:nth-child(2),
+.materials-table tbody tr.grouped-row td:nth-child(6) .mill-cert-cell .cert-item:nth-child(3),
+.materials-table tbody tr.grouped-row td:nth-child(6) .mill-cert-cell .cert-item:nth-child(n+2) {
+    margin-top: 0 !important;  /* 确保所有后续行都顶部对齐，无上边距，紧贴上一行 */
+    padding-top: 0 !important;  /* 确保无上内边距 */
+    margin-bottom: 0 !important;  /* 确保无下边距 */
+    padding-bottom: 0 !important;  /* 确保无下内边距 */
+    line-height: 1.0 !important;  /* 减小行高 */
+}
+
+/* 确保 Mill Cert 的 cert-item 内的所有内容都不会在逗号处换行 */
+.mill-cert-cell .cert-item,
+.mill-cert-cell .cert-item * {
+    word-break: normal !important;  /* 不在标点（如逗号）处换行 */
+    overflow-wrap: break-word !important;  /* 只在内容超出宽度时换行 */
+    word-wrap: break-word !important;  /* 兼容性 */
+}
+
+/* Stockist Cert 列的 multi-line-item 特殊设置 - 确保左对齐 */
+.materials-table td:nth-child(9) .multi-line-item {
+    display: block !important;
+    margin: 0 !important;
+    margin-top: 0 !important;
+    margin-bottom: 0pt !important;
+    padding: 0 !important;
+    line-height: 1.0 !important;
+    font-size: 7pt !important;
+    height: auto !important;
+    min-height: 0 !important;
+    max-height: none !important;
+    transform: translateY(0) !important;
+    text-align: left !important;  /* Stockist Cert multi-line-item 左对齐，覆盖所有其他设置 */
+    direction: ltr !important;  /* 确保从左到右的文本方向 */
+}
+
+
+/* Stockist Cert 列的 multi-line-item 所有状态 - 确保左对齐 */
+.materials-table td:nth-child(9) .multi-line-item,
+.materials-table td:nth-child(9) .multi-line-item:first-child,
+.materials-table td:nth-child(9) .multi-line-item:last-child,
+.materials-table td:nth-child(9) .multi-line-item:nth-child(1),
+.materials-table td:nth-child(9) .multi-line-item:nth-child(2),
+.materials-table td:nth-child(9) .multi-line-item:nth-child(3),
+.materials-table td:nth-child(9) .multi-line-item:nth-child(4),
+.materials-table td:nth-child(9) .multi-line-item:nth-child(5),
+.materials-table td:nth-child(9) .multi-line-item:nth-child(6),
+.materials-table td:nth-child(9) .multi-line-item:nth-child(7),
+.materials-table td:nth-child(9) .multi-line-item:nth-child(8),
+.materials-table td:nth-child(9) .multi-line-item:nth-child(9),
+.materials-table td:nth-child(9) .multi-line-item:nth-child(10),
+.materials-table td:nth-child(9) .multi-line-item:nth-child(n),
+.materials-table td:nth-child(9) .multi-line-item:nth-of-type(1),
+.materials-table td:nth-child(9) .multi-line-item:nth-of-type(2),
+.materials-table td:nth-child(9) .multi-line-item:nth-of-type(3),
+.materials-table td:nth-child(9) .multi-line-item:nth-of-type(4),
+.materials-table td:nth-child(9) .multi-line-item:nth-of-type(5),
+.materials-table td:nth-child(9) .multi-line-item:nth-of-type(6),
+.materials-table td:nth-child(9) .multi-line-item:nth-of-type(7),
+.materials-table td:nth-child(9) .multi-line-item:nth-of-type(8),
+.materials-table td:nth-child(9) .multi-line-item:nth-of-type(9),
+.materials-table td:nth-child(9) .multi-line-item:nth-of-type(10),
+.materials-table td:nth-child(9) .multi-line-item:nth-of-type(n) {
+    text-align: left !important;  /* Stockist Cert multi-line-item 所有状态都左对齐 */
+    direction: ltr !important;  /* 确保从左到右的文本方向 */
+}
+
+/* 第一个条目不需要负的上边距，确保左对齐 */
+.materials-table td:nth-child(3) .multi-line-item:first-child,
+.materials-table td:nth-child(5) .multi-line-item:first-child,
+.materials-table td:nth-child(8) .multi-line-item:first-child,
+.materials-table td:nth-child(9) .multi-line-item:first-child,
+.materials-table td:nth-child(10) .multi-line-item:first-child {
+    margin-top: 0 !important;
+    margin-left: 0 !important;
+    padding-left: 0 !important;
+    text-indent: 0 !important;
+    text-align: left !important;  /* 确保第一行左对齐 */
+}
+
+/* Mill Cert 的 first-child 单独设置 */
+.materials-table td:nth-child(6) .multi-line-item:first-child {
+    margin-top: 0 !important;
+    margin-left: 0 !important;
+    padding-left: 0 !important;
+    text-indent: 0 !important;
+    text-align: left !important;  /* 确保第一行左对齐 */
+}
+
+/* Mill Cert 的第二行、第三行等后续行的换行设置 - 只在内容超出宽度时换行 */
+.materials-table td:nth-child(6) .multi-line-item:nth-child(2),
+.materials-table td:nth-child(6) .multi-line-item:nth-child(3),
+.materials-table td:nth-child(6) .multi-line-item:nth-child(4),
+.materials-table td:nth-child(6) .multi-line-item:nth-child(5),
+.materials-table td:nth-child(6) .multi-line-item:nth-child(n+2) {
+    white-space: normal !important;
+    word-wrap: break-word !important;  /* 只在内容超出宽度时换行 */
+    word-break: normal !important;  /* 不在标点（如逗号）处换行，只在单词边界或必要时换行 */
+    overflow-wrap: break-word !important;
+    max-width: 100% !important;
+    width: 100% !important;
+    display: block !important;
+    box-sizing: border-box !important;
+    overflow: visible !important;
+}
+
+/* Mill Cert 的所有 multi-line-item（包括第二行、第三行）内的文本 - 只在内容超出宽度时换行 */
+.materials-table td:nth-child(6) .multi-line-item:nth-child(2) *,
+.materials-table td:nth-child(6) .multi-line-item:nth-child(3) *,
+.materials-table td:nth-child(6) .multi-line-item:nth-child(4) *,
+.materials-table td:nth-child(6) .multi-line-item:nth-child(5) *,
+.materials-table td:nth-child(6) .multi-line-item:nth-child(n+2) * {
+    white-space: normal !important;
+    word-wrap: break-word !important;  /* 只在内容超出宽度时换行 */
+    word-break: normal !important;  /* 不在标点（如逗号）处换行，只在单词边界或必要时换行 */
+    overflow-wrap: break-word !important;
+    max-width: 100% !important;
+}
+
+/* 最后一个条目不需要负边距 */
+.materials-table td:nth-child(3) .multi-line-item:last-child,
+.materials-table td:nth-child(5) .multi-line-item:last-child,
+.materials-table td:nth-child(8) .multi-line-item:last-child,
+.materials-table td:nth-child(9) .multi-line-item:last-child,
+.materials-table td:nth-child(10) .multi-line-item:last-child {
+    margin-bottom: 0 !important;
+}
+
+/* Mill Cert 的 last-child 单独设置 */
+.materials-table td:nth-child(6) .multi-line-item:last-child {
+    margin-bottom: 0 !important;
+}
+
+/* 针对 cert-item 元素，去掉 margin/padding，压缩行距 */
+.materials-table td:nth-child(7) .cert-item {
+    display: block !important; /* 每个元素独占一行 */
+    margin: 0 !important;
+    padding: 0 !important;
+    line-height: 1.0 !important; /* 行间距紧凑 */
+    font-size: 7pt !important;  /* Test Cert 使用 7pt */
+    text-align: left !important;  /* Test Cert cert-item 左对齐 */
+    margin-left: 0 !important;  /* 确保左对齐，无左边距 */
+    padding-left: 0 !important;  /* 确保左对齐，无左内边距 */
+    text-indent: 0 !important;  /* 确保无文本缩进 */
+}
+
+/* Test Cert 的第一个 cert-item 确保左对齐 */
+.materials-table td:nth-child(7) .cert-item:first-child {
+    margin-left: 0 !important;
+    padding-left: 0 !important;
+    text-indent: 0 !important;
+    text-align: left !important;
+}
+
+/* Column widths - 优化后确保不超过页面宽度 (A4 landscape 约10.1in可用宽度) */
+.materials-table th:nth-child(1),
+.materials-table td:nth-child(1) {
+    width: 0.3in;  /* Dia - 略微加宽 */
+    padding: 2px !important;  /* 确保 Dia 列的 padding 与 Wt 列一致 */
+}
+
+/* Dia 列：表头垂直居中，数据单元格顶部对齐 */
+.materials-table th:nth-child(1) {
+    vertical-align: middle !important;  /* 表头垂直居中对齐 */
+}
+
+.materials-table td:nth-child(1) {
+    padding-top: 0 !important;  /* 顶部对齐，无上内边距 */
+    padding-bottom: 0 !important;  /* 无下内边距 */
+    vertical-align: top !important;  /* 数据单元格顶部对齐 */
+}
+
+.materials-table th:nth-child(2),
+.materials-table td:nth-child(2) {
+    width: 0.6in;  /* Wt(ton) - 略微加宽 */
+    padding: 2px !important;  /* 确保 Wt 列的 padding 与 Dia 列一致 */
+}
+
+/* Wt 列：表头垂直居中，数据单元格顶部对齐 */
+.materials-table th:nth-child(2) {
+    vertical-align: middle !important;  /* 表头垂直居中对齐 */
+}
+
+.materials-table td:nth-child(2) {
+    padding-top: 0 !important;  /* 顶部对齐，无上内边距 */
+    padding-bottom: 0 !important;  /* 无下内边距 */
+    vertical-align: top !important;  /* 数据单元格顶部对齐 */
+}
+
+.materials-table th:nth-child(3),
+.materials-table td:nth-child(3) {
+    width: 1.4in;  /* Product - 加宽以确保内容完整显示 */
+    min-width: 1.4in;  /* 确保最小宽度 */
+}
+
+.materials-table th:nth-child(4),
+.materials-table td:nth-child(4) {
+    width: 0.35in;  /* Grade - 略微加宽 */
+}
+
+/* Grade 列：表头垂直居中，数据单元格顶部对齐 */
+.materials-table th:nth-child(4) {
+    vertical-align: middle !important;  /* 表头垂直居中对齐 */
+}
+
+.materials-table td:nth-child(4) {
+    padding-top: 0 !important;  /* 顶部对齐，无上内边距 */
+    padding-bottom: 0 !important;  /* 无下内边距 */
+    vertical-align: top !important;  /* 数据单元格顶部对齐 */
+}
+
+.materials-table th:nth-child(5),
+.materials-table td:nth-child(5) {
+    width: 0.55in;  /* Pattern - 略微加宽 */
+}
+
+.materials-table th:nth-child(6),
+.materials-table td:nth-child(6) {
+    width: 2.6in;  /* Mill Cert - 略微加宽 */
+    max-width: 2.6in !important;  /* 限制最大宽度，确保换行 */
+}
+
+/* Mill Cert 列的特殊换行设置 - 只在内容超出宽度时换行，不在逗号处换行 */
+.materials-table td:nth-child(6) {
+    white-space: normal !important;
+    overflow-wrap: break-word !important;  /* 只在内容超出宽度时换行 */
+    word-wrap: break-word !important;  /* 兼容性 */
+    word-break: normal !important;  /* 不在标点（如逗号）处换行，只在单词边界或必要时换行 */
+}
+
+.materials-table td:nth-child(6) .wrap-cell {
+    white-space: normal !important;
+    overflow-wrap: break-word !important;  /* 只在内容超出宽度时换行 */
+    word-wrap: break-word !important;  /* 兼容性 */
+    word-break: normal !important;  /* 不在标点（如逗号）处换行，只在单词边界或必要时换行 */
+    max-width: 100% !important;  /* 不超过父容器宽度 */
+    width: 100% !important;
+    min-width: 0 !important;  /* 允许收缩，确保子元素能正确换行 */
+    box-sizing: border-box !important;
+    display: block !important;
+    overflow: visible !important;
+}
+
+/* Mill Cert 的 wrap-cell 内的所有内容 - 只在内容超出宽度时换行 */
+.materials-table td:nth-child(6) .wrap-cell,
+.materials-table td:nth-child(6) .wrap-cell * {
+    white-space: normal !important;
+    word-wrap: break-word !important;  /* 只在内容超出宽度时换行 */
+    word-break: normal !important;  /* 不在标点（如逗号）处换行，只在单词边界或必要时换行 */
+    overflow-wrap: break-word !important;
+}
+
+.materials-table td:nth-child(6) .multi-line-item {
+    white-space: normal !important;
+    word-wrap: break-word !important;  /* 只在内容超出宽度时换行 */
+    word-break: normal !important;  /* 不在标点（如逗号）处换行，只在单词边界或必要时换行 */
+    overflow-wrap: break-word !important;
+    max-width: 100% !important;
+    width: 100% !important;
+    box-sizing: border-box !important;
+    display: block !important;
+}
+
+/* Mill Cert 的 multi-line-item 内的所有内容 - 只在内容超出宽度时换行 */
+.materials-table td:nth-child(6) .multi-line-item,
+.materials-table td:nth-child(6) .multi-line-item * {
+    white-space: normal !important;
+    word-wrap: break-word !important;  /* 只在内容超出宽度时换行 */
+    word-break: normal !important;  /* 不在标点（如逗号）处换行，只在单词边界或必要时换行 */
+    overflow-wrap: break-word !important;
+    max-width: 100% !important;
+}
+
+.materials-table th:nth-child(7),
+.materials-table td:nth-child(7) {
+    width: 1.4in;  /* Test Cert - 略微加宽 */
+}
+
+/* 针对第 7 列的单元格，去掉上下 padding，压缩行高 */
+.materials-table td:nth-child(7) {
+    padding-top: 0 !important;
+    padding-bottom: 0 !important;
+    padding-left: 4px !important;
+    padding-right: 4px !important;
+    line-height: 1.0 !important; /* 压缩整体行高 */
+    vertical-align: top !important;
+    text-align: left !important;  /* Test Cert 左对齐 */
+}
+
+/* 若单元格内还有包裹容器（wrap-cell），同步收紧 */
+.materials-table td:nth-child(7) .wrap-cell {
+    margin: 0 !important;
+    padding: 0 !important;  /* 覆盖通用 wrap-cell 的 padding: 6px */
+    line-height: 1.0 !important;
+    text-align: left !important;  /* Test Cert wrap-cell 左对齐 */
+}
+
+/* 每条证书作为块元素，确保行与行之间无间距 - 已在上面统一定义 */
+
+/* cert-spacer 样式已移除 - 不再使用 cert-spacer，改用块元素 */
+
+/* 同一 Product 分组行进一步收紧（已有 grouped-row 类） */
+.materials-table tbody tr.grouped-row td:nth-child(7) {
+    padding-top: 0pt !important;
+    padding-bottom: 0pt !important;
+}
+
+/* 清零单元格内 p/div 默认外边距，防止意外空隙 - 已在通用规则中处理 */
+
+.materials-table th:nth-child(8),
+.materials-table td:nth-child(8) {
+    width: 1.7in;  /* Supplier - 加宽以减少留白 */
+}
+
+.materials-table th:nth-child(9),
+.materials-table td:nth-child(9) {
+    width: 0.8in;  /* Stockist Cert - 略微加宽 */
+}
+
+.materials-table th:nth-child(10),
+.materials-table td:nth-child(10) {
+    width: 0.6in;  /* PO_No - 略微加宽 */
+}
+/* 总宽度约 9.15in，确保在页面范围内 */
+
+/* 材料表格所有列的字体颜色设为黑色，字体大小统一 */
+.materials-table td:nth-child(1),
+.materials-table td:nth-child(2),
+.materials-table td:nth-child(3),
+.materials-table td:nth-child(4),
+.materials-table td:nth-child(5),
+.materials-table td:nth-child(7),
+.materials-table td:nth-child(8),
+.materials-table td:nth-child(9),
+.materials-table td:nth-child(10) {
+    color: #000;
+    font-size: 7pt !important;  /* 确保所有列字体大小统一为 7pt */
+}
+
+/* Mill Cert 的字体颜色和大小单独设置 */
+.materials-table td:nth-child(6) {
+    color: #000;
+    font-size: 7pt !important;  /* Mill Cert 字体大小统一为 7pt */
+}
+
+/* Stockist Cert 列特殊设置 - 确保所有内容左对齐 */
+.materials-table td:nth-child(9) {
+    text-align: left !important;  /* Stockist Cert 左对齐，覆盖所有其他设置 */
+    direction: ltr !important;  /* 确保从左到右的文本方向 */
+}
+
+.materials-table td:nth-child(9) * {
+    text-align: left !important;  /* Stockist Cert 所有子元素左对齐 */
+    direction: ltr !important;  /* 确保从左到右的文本方向 */
+}
+
+/* Stockist Cert 列的所有子元素和后代元素 - 确保左对齐 */
+.materials-table td:nth-child(9) *,
+.materials-table td:nth-child(9) * *,
+.materials-table td:nth-child(9) * * * {
+    text-align: left !important;  /* Stockist Cert 所有子元素和后代元素左对齐 */
+}
+
+/* DIA、Wt(Ton) 和 Grade 列的块元素样式 - 顶部对齐 */
+.materials-table td:nth-child(1) .single-line-item,
+.materials-table td:nth-child(2) .single-line-item {
+    display: block !important;
+    margin: 0 !important;
+    margin-top: 0 !important;  /* 确保顶部无外边距 */
+    margin-bottom: 0 !important;  /* 确保底部无外边距 */
+    padding: 0 !important;
+    padding-top: 0 !important;  /* 顶部对齐，无上内边距 */
+    padding-bottom: 0 !important;  /* 无下内边距 */
+    line-height: 1.0 !important;
+    font-size: 7.5pt !important;  /* Dia 和 Wt 使用 7.5pt */
+}
+
+.materials-table td:nth-child(4) .single-line-item {
+    display: block !important;
+    margin: 0 !important;
+    margin-top: 0 !important;  /* 确保顶部无外边距 */
+    margin-bottom: 0 !important;  /* 确保底部无外边距 */
+    padding: 0 !important;
+    padding-top: 0 !important;  /* 顶部对齐，无上内边距 */
+    padding-bottom: 0 !important;  /* 无下内边距 */
+    line-height: 1.0 !important;
+    font-size: 7pt !important;  /* Grade 使用 7pt */
+}
+
+/* Grade 列的字体大小 */
+.materials-table td:nth-child(4) .single-line-item {
+    font-size: 7pt !important;  /* Grade 使用 7pt */
+}
+
+/* DIA、Wt(Ton) 和 Grade 列的内容字体大小和垂直对齐 - 所有情况都顶部对齐 */
+.materials-table tr.group-start td:nth-child(1),
+.materials-table tr.group-start td:nth-child(2),
+.materials-table tr.group-start td:nth-child(4),
+.materials-table tr.grouped-row td:nth-child(1),
+.materials-table tr.grouped-row td:nth-child(2),
+.materials-table tr.grouped-row td:nth-child(4),
+.materials-table tbody tr td:nth-child(1),
+.materials-table tbody tr td:nth-child(2),
+.materials-table tbody tr td:nth-child(4) {
+    vertical-align: top !important;  /* Dia、Wt 和 Grade 使用顶部对齐 */
+    padding-top: 0 !important;  /* 确保顶部无内边距 */
+    padding-bottom: 0 !important;  /* 确保底部无内边距 */
+}
+
+/* DIA、Wt 和 Grade 列的 wrap-cell - 顶部对齐 */
+.materials-table td:nth-child(1) .wrap-cell,
+.materials-table td:nth-child(2) .wrap-cell,
+.materials-table td:nth-child(4) .wrap-cell {
+    margin-top: 0 !important;
+    margin-bottom: 0 !important;
+    padding-top: 0 !important;
+    padding-bottom: 0 !important;
+    vertical-align: top !important;
+}
+
+/* Footer Styles */
+.footer-signature {
+    position: fixed;
+    bottom: 1.2in;
+    right: 0;
+    width: 1.2in;
+    height: 1.2in;
+}
+
+.signature-chop {
+    width: 1.2in;
+    height: 1.2in;
+    display: block;
+    margin: 0 auto;
+    border-radius: 50%;
+    object-fit: contain;
+    overflow: hidden;
+    /* 新图片已经是透明背景，不需要透明度和混合模式 */
+}
+

@@ -1,0 +1,21 @@
+{
+  "name": "ui-ux-pro-max",
+  "version": "2.2.0",
+  "description": "AI skill that provides design intelligence for building professional UI/UX across multiple platforms",
+  "author": "nextlevelbuilder",
+  "license": "MIT",
+  "triggers": [
+    "ui",
+    "ux",
+    "design",
+    "界面",
+    "设计",
+    "样式",
+    "优化"
+  ],
+  "commands": {
+    "generate-design-system": "Generate a complete design system for the project",
+    "optimize-ui": "Optimize existing UI components",
+    "create-component": "Create a new UI component with best practices"
+  }
+}

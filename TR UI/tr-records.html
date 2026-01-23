@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TR記錄管理 - TR Report System</title>
+    <link rel="stylesheet" href="styles/dashboard.css">
+    <link rel="stylesheet" href="styles/tr-records.css">
+    <script src="scripts/vue.global.js"></script>
+    <script src="config.js"></script>
+</head>
+<body>
+    <div id="app">
+        <!-- 顶部导航栏 -->
+        <header class="header">
+            <div class="header-content">
+                <div class="logo">
+                    <img src="images/logo.png" alt="VSC Logo" class="header-logo">
+                    <h2>TR Report System</h2>
+                </div>
+                <div class="user-info">
+                    <div class="user-avatar">
+                        <span>{{ getCurrentAvatar() }}</span>
+                    </div>
+                    <div class="user-details">
+                        <div class="user-name">{{ userInfo.name }}</div>
+                        <div class="user-role">{{ getRoleDisplayName(userInfo.role) }}</div>
+                    </div>
+                    <button class="settings-btn" @click="showSettings = true">⚙️</button>
+                    <button class="logout-btn" @click="handleLogout">退出</button>
+                </div>
+            </div>
+        </header>
+
+        <!-- 主要内容区域 -->
+        <div class="main-container">
+            <!-- 侧边栏 -->
+            <aside class="sidebar">
+                <nav class="nav-menu">
+                    <div class="nav-item active">
+                        <span class="nav-icon">📊</span>
+                        <span class="nav-text">TR記錄管理</span>
+                    </div>
+                    <div class="nav-item" v-if="userInfo.role === 'admin'" @click="goToPage('user-management')">
+                        <span class="nav-icon">👥</span>
+                        <span class="nav-text">帳號管理</span>
+                    </div>
+                </nav>
+            </aside>
+
+            <!-- 内容区域 -->
+            <main class="content">
+                <div class="page-header">
+                    <h1>TR記錄管理</h1>
+                    <button 
+                        class="update-data-btn" 
+                        @click="startUpdateAllTables"
+                        :disabled="updateDataLoading"
+                        v-if="userInfo.role === 'admin'"
+                    >
+                        <span v-if="!updateDataLoading">🔄 更新數據</span>
+                        <span v-else>⏳ 更新中...</span>
+                    </button>
+                </div>
+
+                <!-- Tab 导航 -->
+                <div class="tab-navigation">
+                    <button 
+                        class="tab-btn" 
+                        :class="{ 'tab-btn--active': activeSubTab === 'records' }"
+                        @click="activeSubTab = 'records'"
+                    >
+                        TR记录管理
+                    </button>
+                    <button 
+                        class="tab-btn" 
+                        :class="{ 'tab-btn--active': activeSubTab === 'stocklist-test' }"
+                        @click="activeSubTab = 'stocklist-test'"
+                    >
+                        STOCKIST & TEST REPORT
+                    </button>
+                </div>
+
+                <!-- TR记录管理 Tab 内容 -->
+                <div v-if="activeSubTab === 'records'">
+                <!-- 搜索栏 -->
+                <div class="search-section">
+                    <div class="search-box">
+                        <input 
+                            type="text" 
+                            v-model="searchQuery.orderNo" 
+                            placeholder="按 Order No 搜索"
+                            @keyup.enter="performSearch"
+                        >
+                    </div>
+                    <div class="search-box">
+                        <input 
+                            type="text" 
+                            v-model="searchQuery.jobNo" 
+                            placeholder="按Job No搜索"
+                            @keyup.enter="performSearch"
+                        >
+                    </div>
+                    <div class="date-filter">
+                        <label>開始日期</label>
+                        <input 
+                            type="date" 
+                            v-model="searchQuery.startDate"
+                            :min="minDate"
+                            :max="maxDate"
+                        >
+                    </div>
+                    <div class="date-filter">
+                        <label>結束日期</label>
+                        <input 
+                            type="date" 
+                            v-model="searchQuery.endDate"
+                            :min="minDate"
+                            :max="maxDate"
+                        >
+                    </div>
+                    <button class="search-btn" @click="performSearch">搜索</button>
+                    <button class="reset-btn" @click="resetSearch">重置</button>
+                </div>
+
+                <!-- 批量操作区域 -->
+                <div class="batch-actions" v-if="currentSelectedRecords.length > 0">
+                    <div class="batch-info">
+                        <span>已选择 {{ currentSelectedRecords.length }} 条记录</span>
+                    </div>
+                    <div class="batch-buttons">
+                        <button 
+                            class="batch-download-btn" 
+                            @click="batchDownload"
+                            :disabled="!hasSelectedGeneratedRecords"
+                        >
+                            📥 批量下載PDF ({{ selectedGeneratedCount }})
+                        </button>
+                        <button 
+                            class="batch-generate-btn" 
+                            @click="batchGenerate"
+                            :disabled="!hasSelectedPendingRecords"
+                        >
+                            ⚙️ 批量生成PDF ({{ selectedPendingCount }})
+                        </button>
+                        <button 
+                            class="batch-regenerate-btn" 
+                            @click="batchRegenerate"
+                            :disabled="!hasSelectedGeneratedRecords"
+                        >
+                            🔄 批量重新生成PDF ({{ selectedGeneratedCount }})
+                        </button>
+                        <button class="clear-selection-btn" @click="clearSelection">
+                            ✕ 清除選擇
+                        </button>
+                    </div>
+                </div>
+
+                <!-- TR记录表格 -->
+                <div class="table-container">
+                    <table class="tr-table">
+                        <thead>
+                            <tr>
+                                <th class="checkbox-column">
+                                    <input 
+                                        type="checkbox" 
+                                        :checked="isAllSelected" 
+                                        @change="toggleSelectAll"
+                                        class="select-all-checkbox"
+                                    >
+                                </th>
+                                <th>Order No</th>
+                                <th>Order Description</th>
+                                <th>Job No</th>
+                                <th>Jobsite</th>
+                                <th>Jobsite Type</th>
+                                <th>Client</th>
+                                <th>Del Date</th>
+                                <th>狀態</th>
+                                <th>操作</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <!-- 加载状态 -->
+                            <tr v-if="loading">
+                                <td colspan="10" class="loading-row">
+                                    <div class="table-loading">
+                                        <div class="loading-spinner-small"></div>
+                                        <span>正在加载数据...</span>
+                                    </div>
+                                </td>
+                            </tr>
+                            <!-- 数据行 -->
+                            <template v-else>
+                                <tr 
+                                    v-for="record in filteredRecords" 
+                                    :key="record.id"
+                                    @click="handleRowClick(record, $event)"
+                                    :class="{ 'row-clickable': record.status === 'generated', 'row-hover': true }"
+                                    style="cursor: pointer;"
+                                >
+                                    <td class="checkbox-column" @click.stop>
+                                        <input 
+                                            type="checkbox" 
+                                            :value="record.id"
+                                            v-model="currentSelectedRecordsModel"
+                                            class="record-checkbox"
+                                            @click.stop
+                                        >
+                                    </td>
+                                    <td>{{ record.orderNo }}</td>
+                                    <td>{{ record.orderDescription }}</td>
+                                    <td>{{ record.jobNo }}</td>
+                                    <td>{{ record.jobsite }}</td>
+                                    <td>{{ record.jobsiteType }}</td>
+                                    <td>{{ record.client }}</td>
+                                    <td>{{ record.delDate }}</td>
+                                    <td class="status-cell">
+                                        <span v-if="record.status === 'generated'" class="status-badge generated">
+                                            ✅ 已生成
+                                        </span>
+                                        <span v-else class="status-badge pending">
+                                            ⏳ 未生成
+                                        </span>
+                                    </td>
+                                    <td class="action-cell" @click.stop>
+                                        <button 
+                                            v-if="record.status === 'pending'"
+                                            class="generate-btn" 
+                                            @click="generatePDF(record)"
+                                        >
+                                            📄 生成
+                                        </button>
+                                        <button 
+                                            v-if="record.status === 'generated'" 
+                                            class="download-btn" 
+                                            @click="downloadRecord(record)"
+                                        >
+                                            📥 下載
+                                        </button>
+                                        <button 
+                                            v-if="record.status === 'generated' && (userInfo.role === 'admin' || userInfo.role === 'manager')" 
+                                            class="generate-btn" 
+                                            @click.stop="regeneratePDF(record)"
+                                            :title="'重新生成 Order ' + record.orderNo + ' 的PDF'"
+                                        >
+                                            🔄 生成
+                                        </button>
+                                    </td>
+                                </tr>
+                                <tr v-if="filteredRecords.length === 0">
+                                    <td colspan="10" class="no-data">暫無數據</td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                </div>
+
+                <!-- 分页 - 只在非搜索状态时显示 -->
+                <div class="pagination" v-if="!isSearching">
+                    <button @click="prevPage" :disabled="currentPage === 1">上一頁</button>
+                    <span>第 {{ currentPage }} 頁，共 {{ totalPages }} 頁</span>
+                    <button @click="nextPage" :disabled="currentPage === totalPages">下一頁</button>
+                </div>
+                </div>
+
+                <!-- Stocklist&Test Report Tab 内容 -->
+                <div v-if="activeSubTab === 'stocklist-test'">
+                <!-- 搜索栏 -->
+                <div class="search-section">
+                    <div class="search-box">
+                        <input 
+                            type="text" 
+                            v-model="searchQuery.orderNo" 
+                            placeholder="按 Order No 搜索"
+                            @keyup.enter="performSearch"
+                        >
+                    </div>
+                    <div class="search-box">
+                        <input 
+                            type="text" 
+                            v-model="searchQuery.dnNo" 
+                            placeholder="按DD_No搜索"
+                            @keyup.enter="performSearch"
+                        >
+                    </div>
+                    <div class="date-filter">
+                        <label>开始日期</label>
+                        <input 
+                            type="date" 
+                            v-model="searchQuery.startDate"
+                            :min="minDate"
+                            :max="maxDate"
+                        >
+                    </div>
+                    <div class="date-filter">
+                        <label>结束日期</label>
+                        <input 
+                            type="date" 
+                            v-model="searchQuery.endDate"
+                            :min="minDate"
+                            :max="maxDate"
+                        >
+                    </div>
+                    <button class="search-btn" @click="performSearch">搜索</button>
+                    <button class="reset-btn" @click="resetSearch">重置</button>
+                </div>
+
+                <!-- 批量操作区域 -->
+                <div class="batch-actions" v-if="currentSelectedRecords.length > 0">
+                    <div class="batch-info">
+                        <span>已选择 {{ currentSelectedRecords.length }} 条记录</span>
+                    </div>
+                    <div class="batch-buttons">
+                        <button 
+                            class="batch-download-btn" 
+                            @click="downloadByOrder"
+                            :disabled="currentSelectedRecords.length === 0"
+                        >
+                            📥 按Order下载{{ currentSelectedRecords.length > 1 ? ` (${currentSelectedRecords.length}个)` : '' }}
+                        </button>
+                        <button 
+                            class="batch-download-btn" 
+                            @click="downloadByDdNo"
+                            :disabled="currentSelectedRecords.length === 0"
+                        >
+                            📥 按DD_No下载{{ currentSelectedRecords.length > 1 ? ` (${currentSelectedRecords.length}个)` : '' }}
+                        </button>
+                        <button 
+                            class="batch-download-btn" 
+                            @click="downloadByDate"
+                            :disabled="currentSelectedRecords.length === 0"
+                        >
+                            📥 按日期下载{{ currentSelectedRecords.length > 1 ? ` (${currentSelectedRecords.length}个)` : '' }}
+                        </button>
+                        <button class="clear-selection-btn" @click="clearSelection">
+                            ✕ 清除选择
+                        </button>
+                    </div>
+                </div>
+
+                <!-- TR记录表格 -->
+                <div class="table-container">
+                    <table class="tr-table stocklist-test-table">
+                        <thead>
+                            <tr>
+                                <th class="checkbox-column">
+                                    <input 
+                                        type="checkbox" 
+                                        :checked="isAllSelected" 
+                                        @change="toggleSelectAll"
+                                        class="select-all-checkbox"
+                                    >
+                                </th>
+                                <th>Order_no</th>
+                                <th>Job_No</th>
+                                <th>Order Description</th>
+                                <th>JobsiteType</th>
+                                <th>DD_No</th>
+                                <th>Del_Date</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <!-- 加载状态 -->
+                            <tr v-if="loading">
+                                <td colspan="7" class="loading-row">
+                                    <div class="table-loading">
+                                        <div class="loading-spinner-small"></div>
+                                        <span>正在加载数据...</span>
+                                    </div>
+                                </td>
+                            </tr>
+                            <!-- 数据行 -->
+                            <template v-else>
+                                <tr v-for="record in filteredRecords" :key="record.id">
+                                    <td class="checkbox-column">
+                                        <input 
+                                            type="checkbox" 
+                                            :value="record.id"
+                                            v-model="currentSelectedRecordsModel"
+                                            class="record-checkbox"
+                                        >
+                                    </td>
+                                    <td>{{ record.orderNo }}</td>
+                                    <td>{{ record.jobNo }}</td>
+                                    <td>{{ record.orderDescription }}</td>
+                                    <td>{{ record.jobsiteType }}</td>
+                                    <td>{{ record.rmDnNo }}</td>
+                                    <td>{{ record.delDate }}</td>
+                                </tr>
+                                <tr v-if="filteredRecords.length === 0">
+                                    <td colspan="7" class="no-data">暂无数据</td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                </div>
+
+                <!-- 分页 - 只在非搜索状态时显示 -->
+                <div class="pagination" v-if="!isSearching">
+                    <button @click="prevPage" :disabled="currentPage <= 1">上一页</button>
+                    <span>第 {{ currentPage }} 页，共 {{ totalPages }} 页</span>
+                    <button @click="nextPage" :disabled="currentPage >= totalPages">下一页</button>
+                </div>
+                </div>
+            </main>
+        <!-- 编辑弹窗（放在根容器内） -->
+        <div v-if="editModalVisible" class="download-progress-overlay" @click="closeEditModal">
+            <div class="download-progress-content edit-modal" @click.stop>
+                <div class="edit-modal-header">
+                    <h3>編輯訂單 {{ editData.header?.Order_No || '' }}</h3>
+                    <button class="edit-close-btn" @click="closeEditModal">✕</button>
+                </div>
+                <div class="form-grid">
+                    <div class="form-row"><label>Client</label><input type="text" v-model="editData.header.Client"></div>
+                    <div class="form-row"><label>Jobsite</label><input type="text" v-model="editData.header.Jobsite"></div>
+                    <div class="form-row"><label>Job No</label><input type="text" v-model="editData.header.Job_No"></div>
+                    <div class="form-row"><label>PO No(2)</label><input type="text" v-model="editData.header.PO_No_2"></div>
+                    <div class="form-row"><label>Del Date</label><input type="date" v-model="editData.header.Del_Date"></div>
+                    <div class="form-row"><label>Ref No</label><input type="text" v-model="editData.header.Ref_No"></div>
+                    <div class="form-row full"><label>Order Description</label><input type="text" v-model="editData.header.Order_Description"></div>
+                    <div class="form-row"><label>Supplier</label><input type="text" v-model="editData.header.Supplier"></div>
+                </div>
+                <div class="edit-section-title">行明細</div>
+                <div class="table-container edit-lines-table">
+                    <table class="tr-table">
+                        <thead>
+                            <tr>
+                                <th>Dia</th>
+                                <th>Wt(ton)</th>
+                                <th>Product</th>
+                                <th>Grade</th>
+                                <th>Pattern</th>
+                                <th>Mill_Cert</th>
+                                <th>Test_Cert2</th>
+                                <th>Test_Cert1</th>
+                                <th>Supplier</th>
+                                <th>Stockist_Cert</th>
+                                <th>PO_No(1)</th>
+                                <th>Tag_No</th>
+                                <th>DN_No</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr v-for="(line, idx) in editData.lines" :key="line.id">
+                                <td><input type="text" v-model="line.Dia"></td>
+                                <td><input type="number" step="0.001" v-model.number="line.Wt"></td>
+                                <td><input type="text" v-model="line.Product"></td>
+                                <td><input type="text" v-model="line.Grade"></td>
+                                <td><input type="text" v-model="line.Pattern"></td>
+                                <td><input type="text" v-model="line.Mill_Cert"></td>
+                                <td><input type="text" v-model="line.Test_Cert2"></td>
+                                <td><input type="text" v-model="line.Test_Cert1"></td>
+                                <td><input type="text" v-model="line.Supplier"></td>
+                                <td><input type="text" v-model="line.Stockist_Cert"></td>
+                                <td><input type="text" v-model="line.PO_No_1"></td>
+                                <td><input type="text" v-model="line.Tag_No"></td>
+                                <td><input type="text" v-model="line.DN_No"></td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="edit-actions">
+                    <button class="save-btn" @click="saveEdits">保存</button>
+                    <button class="cancel-btn" @click="closeEditModal">取消</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- 设置弹窗 -->
+        <div v-if="showSettings" class="modal-overlay" @click="closeSettings">
+            <div class="modal-content" @click.stop>
+                <div class="modal-header">
+                    <h2>用戶設置</h2>
+                    <button class="close-btn" @click="closeSettings">✕</button>
+                </div>
+                <div class="modal-body">
+                    <form @submit.prevent="saveSettings">
+                        <div class="form-group">
+                            <label>頭像</label>
+                            <div class="avatar-options">
+                                <div 
+                                    v-for="avatar in avatarOptions" 
+                                    :key="avatar.value"
+                                    class="avatar-option"
+                                    :class="{ active: userSettings.avatar === avatar.value }"
+                                    @click="userSettings.avatar = avatar.value"
+                                >
+                                    <span class="avatar-icon">{{ avatar.icon }}</span>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>用戶名</label>
+                            <input type="text" v-model="userSettings.name" required>
+                        </div>
+                        <div class="form-group">
+                            <label>郵箱</label>
+                            <input type="email" v-model="userSettings.email" required>
+                        </div>
+                        <div class="form-group">
+                            <label>電話號碼</label>
+                            <input type="tel" v-model="userSettings.phone">
+                        </div>
+                        <div class="form-group">
+                            <label>部門</label>
+                            <input type="text" v-model="userSettings.department">
+                        </div>
+                        <div class="form-group">
+                            <label>備註</label>
+                            <textarea v-model="userSettings.notes" rows="3"></textarea>
+                        </div>
+                        <div class="form-actions">
+                            <button type="submit" class="save-btn">保存</button>
+                            <button type="button" class="cancel-btn" @click="closeSettings">取消</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </div>
+
+        <!-- 更新数据模态框 -->
+        <div v-if="showUpdateModal" class="modal-overlay update-modal-overlay" @keyup.enter="closeUpdateModal">
+            <div class="update-modal-content" @click.stop>
+                <!-- 更新中状态 -->
+                <div v-if="updateDataStatus === 'running'" class="update-status">
+                    <div class="loading-spinner"></div>
+                    <h2>正在更新數據...</h2>
+                    <p>請稍候，此過程可能需要幾分鐘時間</p>
+                    <div class="loading-dots">
+                        <span></span>
+                        <span></span>
+                        <span></span>
+                    </div>
+                </div>
+                <!-- 更新完成状态 -->
+                <div v-else-if="updateDataStatus === 'completed'" class="update-status">
+                    <div class="success-icon">✓</div>
+                    <h2>更新完成</h2>
+                    <p>{{ updateDataMessage }}</p>
+                    <div class="update-hint">
+                        <p>按 <kbd>Enter</kbd> 鍵關閉</p>
+                    </div>
+                </div>
+                <!-- 更新失败状态 -->
+                <div v-else-if="updateDataStatus === 'failed'" class="update-status">
+                    <div class="error-icon">✕</div>
+                    <h2>更新失敗</h2>
+                    <p>{{ updateDataMessage }}</p>
+                    <div class="update-hint">
+                        <p>按 <kbd>Enter</kbd> 鍵關閉</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="scripts/tr-records.js"></script>
+</body>
+</html>
+

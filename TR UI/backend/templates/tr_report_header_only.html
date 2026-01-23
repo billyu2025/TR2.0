@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <link rel="stylesheet" href="tr_report_header_only.css">
+</head>
+<body>
+    <!-- Header Section -->
+    <div class="header">
+        <table class="header-table">
+            <tr>
+                {% if logo_exists %}
+                <td class="logo-cell">
+                    <img src="{{ logo_path}}" alt="VSC Logo" class="logo">
+                </td>
+                {% endif %}
+                <td class="company-cell">
+                    <div class="company-name">VSC CONSTRUCTION STEEL SOLUTIONS LIMITED</div>
+                    <div class="company-address">17 Tsing Keung St, Tsing Yi, New Territories, Hong Kong</div>
+                    <div class="company-phone">Tel: 2165 5788&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Fax: 2165 5789</div>
+                </td>
+                <td class="title-cell">
+                    <div class="title">Order Traceability Record</div>
+                    <div class="order-number"><strong>Order No:</strong> {{ order_info.Order_No }}</div>
+                </td>
+            </tr>
+        </table>
+    </div>
+
+    <!-- Order Information Section -->
+    <div class="order-info-section">
+        <div class="order-info-row-first">
+            <div class="field-group">
+                <strong>Client:</strong> {{ order_info.Client or '' }}
+            </div>
+            <div class="field-group">
+                <strong>Job No:</strong> {{ order_info.Job_No or '' }}
+            </div>
+            <div class="field-group">
+                <strong>PO No:</strong> {{ order_info['PO_No(2)'] or '' }}
+            </div>
+            <div class="field-group">
+                <strong>Del_Date:</strong> {{ order_info.Del_Date or '' }}
+            </div>
+        </div>
+        
+        <div class="order-info-row-second">
+            <div class="field-group">
+                <strong>Jobsite:</strong> {{ order_info.Jobsite or '' }}
+            </div>
+            <div class="field-group-spacer"></div>
+            <div class="field-group-spacer"></div>
+            <div class="field-group">
+                <strong>Ref_No:</strong> {{ order_info.Ref_No or '' }}
+            </div>
+        </div>
+        
+        <div class="order-description-row">
+            <div class="order-description">
+                <strong>Order Description:</strong> {{ order_info.Order_Description or '' }}
+            </div>
+        </div>
+    </div>
+    <!-- 注意：印章不需要在这里，因为内容页面的印章使用 position: fixed，会在每页底部显示 -->
+</body>
+</html>
+

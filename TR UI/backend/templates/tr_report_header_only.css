@@ -1,0 +1,219 @@
+@page {
+    size: A4 landscape;
+    margin: 8mm 6mm 22mm 6mm;  /* 上15mm、左右12mm、下30mm，减少左右留白 */
+    
+    @bottom-left {
+        content: "We, VSC Construction Steel Solutions Limited, Certify the processed steel bar are in compliance with the quality assurance scheme and products are in compliance with the Construction Standard HK CS2:2012 Grade 500B and according to Specification BS 4449:2005, including amendments thereto and replacement thereof and other relevant prevailing technical memorandums, practice notes, codes of practice and specifications related to testing of reinforcement issued by the Government.";
+        font-size: 9pt;
+        text-align: left;
+        margin-left: 0.1in;
+        margin-right: 0.3in;  /* 距离右边边框的尺寸 */
+        width: calc(100% - 0.3in - 0.1in);
+    }
+    
+    
+    /* 注意：Header 模板不显示页码，页码由内容页面提供 */
+    /* @bottom-right {
+        content: "Page " counter(page) "/" counter(pages);
+        font-size: 9pt;
+        font-weight: bold;
+        text-align: right;
+        white-space: nowrap;
+    } */ 
+}
+
+@font-face {
+    font-family: 'NotoSansCJK';
+    src: url('../fonts/NotoSansCJKsc-Regular.otf') format('opentype');
+    font-weight: normal;
+}
+
+@font-face {
+    font-family: 'NotoSansCJK';
+    src: url('../fonts/NotoSansCJKsc-Bold.otf') format('opentype');
+    
+    font-weight: bold;
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: 'NotoSansCJK', 'Helvetica', 'Arial', sans-serif;
+    font-size: 10pt;
+    color: #333;
+    line-height: 1.4;
+    padding-bottom: 1in;
+}
+
+/* Header Styles */
+.header {
+    margin-bottom: 0.5in;
+}
+
+.header-table {
+    width: 100%;
+    border-collapse: collapse;
+    table-layout: fixed;
+}
+
+.logo-cell {
+    width: 0.7in;
+    vertical-align: top;
+    padding: 0;
+    padding-left: 0.4in;  /* 调整Logo整体位置向右 */
+}
+
+.logo {
+    width: 0.7in;
+    height: 0.7in;
+    display: block;
+}
+
+.company-cell {
+    width: 3.4in;
+    vertical-align: top;
+    padding: 0;
+    padding-left: -400px;  /* 进一步向左移动 */
+}
+
+.company-name {
+    font-size: 12pt;
+    font-weight: bold;
+    margin-bottom: 6px;  /* 改为正数，让地址在下面有正常间距 */
+    line-height: 11pt;
+    margin-left: -30px;  /* 确保左对齐 */
+}
+
+.company-address {
+    font-size: 10pt;
+    margin-top: 0;  /* 移除负值，让它在公司名称下面正常显示 */
+    margin-bottom: 3px;
+    line-height: 10pt;
+    margin-left: -30px;  /* 确保左对齐 */
+}
+
+.company-phone {
+    font-size: 10pt;
+    margin-top: 0;
+    line-height: 10pt;
+    margin-left: -30px;  /* 确保左对齐 */
+}
+
+.title-cell {
+    width: 4.0in;
+    vertical-align: top;
+    text-align: right;
+    padding: 0;
+    padding-right: -30px;
+    padding-top: -0.8in;  /* 向上移动标题区域 */
+    position: relative;  /* 为 Order No 的绝对定位提供参考 */
+}
+
+.title {
+    font-size: 20pt;
+    font-weight: bold;
+    text-align: right;
+    margin-bottom: 18px;
+    transform: translateY(-0.15in);   /* 视需要调整 -0.3in 的数值 */
+}
+
+.order-number {
+    font-size: 10pt;
+    font-weight: normal;  /* 默认不加粗，只有 <strong> 标签内的文字加粗 */
+    text-align: left;  /* 左对齐，让 O 对齐 */
+    padding-left: 2.75in;  /* 调整Order No 与 Del_Date、Ref_No 对齐 */
+    position: absolute;  /* 改为绝对定位，这样下移时不会影响 header 高度 */
+    top: 60px;  /* 提升 Order No 位置 */
+}
+
+/* Order Information Section */
+.order-info-section {
+    margin-top: -0.4in;  /* 往上移动（负值减小上方间距） */
+    margin-bottom: 0.2in;
+}
+
+.order-info-row-first {
+    display: table;
+    width: 100%;
+    table-layout: fixed;
+}
+
+.order-info-row-first .field-group {
+    display: table-cell;
+    padding-right: 40px;
+    font-size: 10pt;
+    vertical-align: top;
+}
+
+.order-info-row-first .field-group:first-child {
+    width: 3in;
+    padding-left: -20px;
+    white-space: nowrap;  /* Client 内容保持在一行，不换行 */
+}
+
+/* Job No 向右移动，并保持在一行 */
+.order-info-row-first .field-group:nth-child(2) {
+    padding-left: 2in;  /* 增加左侧padding，向右移动 */
+    white-space: nowrap;  /* 内容保持在一行，不换行 */
+}
+
+/* PO No 向右移动，并保持在一行 */
+.order-info-row-first .field-group:nth-child(3) {
+    padding-left: 1in;  /* 增加左侧padding，向右移动 */
+    white-space: nowrap;  /* 内容保持在一行，不换行 */
+}
+
+/* Del_Date 左对齐，与 Order No 的第一个字母对齐 */
+.order-info-row-first .field-group:last-child {
+    text-align: left;  /* 左对齐，让 D 对齐 */
+    padding-left: 0.45in;  /* 与 Order No 对齐 */
+    padding-right: 0;
+}
+
+.order-info-row-second {
+    display: table;
+    width: 100%;
+    table-layout: fixed;
+    margin-top: 0;
+    /* 确保第二行的列宽与第一行一致 */
+}
+
+.order-info-row-second .field-group {
+    display: table-cell;
+    font-size: 10pt;
+    vertical-align: top;
+}
+
+.order-info-row-second .field-group:first-child {
+    width: 3in;
+    padding-left: -20px;
+    white-space: nowrap;  /* Jobsite 内容保持在一行，不换行 */
+}
+
+/* Ref_No 左对齐，与 Order No 和 Del_Date 的第一个字母对齐 */
+.order-info-row-second .field-group:last-child {
+    text-align: left;  /* 左对齐，让 R 对齐 */
+    padding-left: 1.93in;  /* 与 Order No 对齐 */
+    padding-right: 0;
+}
+
+.field-group-spacer {
+    display: table-cell;
+    width: 2in;
+}
+
+.order-description-row {
+    margin-top: 0;
+}
+
+.order-description {
+    font-size: 14pt;
+    font-weight: bold;
+    padding-left: -20px;
+    margin-top: 6px;
+}
+

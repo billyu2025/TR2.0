@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TR Report System - 登录</title>
+    <link rel="stylesheet" href="styles/login.css">
+    <script src="scripts/vue.global.js"></script>
+</head>
+<body>
+    <div id="app">
+        <div class="login-container">
+            <div class="login-card">
+                <!-- 左侧品牌区域 -->
+                <div class="brand-section">
+                    <div class="brand-content">
+                        <img src="images/logo.png" alt="VSC Logo" class="brand-logo">
+                        <h1 class="brand-title">TR Report System</h1>
+                        <p class="brand-subtitle">TR报告管理系统</p>
+                    </div>
+                </div>
+
+                <!-- 右侧表单区域 -->
+                <div class="form-section">
+                    <div class="login-header">
+                        <h1>用户登录</h1>
+                    </div>
+
+                    <form @submit.prevent="handleLogin" class="login-form">
+                    <!-- 账号输入 -->
+                    <div class="form-group">
+                        <label for="username">账号名称</label>
+                        <input 
+                            type="text" 
+                            id="username"
+                            v-model="loginForm.username"
+                            placeholder="请输入账号名称"
+                            required
+                            autocomplete="username"
+                        >
+                    </div>
+
+                    <!-- 密码输入 -->
+                    <div class="form-group">
+                        <label for="password">密码</label>
+                        <div class="password-input-wrapper">
+                            <input 
+                                :type="showPassword ? 'text' : 'password'" 
+                                id="password"
+                                v-model="loginForm.password"
+                                placeholder="请输入密码"
+                                required
+                                autocomplete="current-password"
+                            >
+                            <button 
+                                type="button" 
+                                class="toggle-password"
+                                @click="showPassword = !showPassword"
+                            >
+                                {{ showPassword ? '显示' : '隐藏' }}
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- 记住我 -->
+                    <div class="form-options">
+                        <label class="remember-me">
+                            <input type="checkbox" v-model="loginForm.remember">
+                            <span>记住我</span>
+                        </label>
+                    </div>
+
+                    <!-- 错误提示 -->
+                    <div v-if="errorMessage" class="error-message">
+                        {{ errorMessage }}
+                    </div>
+
+                    <!-- 成功提示 -->
+                    <div v-if="successMessage" class="success-message">
+                        {{ successMessage }}
+                    </div>
+
+                    <!-- 登录按钮 -->
+                    <button type="submit" class="login-button" :disabled="loading">
+                        <span v-if="!loading">登录</span>
+                        <span v-else>登录中...</span>
+                    </button>
+                    </form>
+
+                    <div class="login-footer">
+                        <p>© 2025 TR Report System. All rights reserved.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="config.js"></script>
+    <script src="scripts/login.js"></script>
+</body>
+</html>
+

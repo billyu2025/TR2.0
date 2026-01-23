@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TR Report System - 主控制台</title>
+    <link rel="stylesheet" href="styles/dashboard.css">
+    <script src="scripts/vue.global.js"></script>
+</head>
+<body>
+    <div id="app">
+        <!-- 顶部导航栏 -->
+        <header class="header">
+            <div class="header-content">
+                <div class="logo">
+                    <img src="images/logo.png" alt="VSC Logo" class="header-logo">
+                    <h2>TR Report System</h2>
+                </div>
+                <div class="user-info">
+                    <div class="user-avatar">
+                        <span>{{ userInfo.role === 'admin' ? '👑' : '👤' }}</span>
+                    </div>
+                    <div class="user-details">
+                        <div class="user-name">{{ userInfo.name }}</div>
+                        <div class="user-role">{{ userInfo.role === 'admin' ? '超级管理员' : '普通用户' }}</div>
+                    </div>
+                    <button class="logout-btn" @click="handleLogout">退出</button>
+                </div>
+            </div>
+        </header>
+
+        <!-- 主要内容区域 -->
+        <div class="main-container">
+            <!-- 侧边栏 -->
+            <aside class="sidebar">
+                <nav class="nav-menu">
+                    <div 
+                        v-for="item in menuItems" 
+                        :key="item.id"
+                        class="nav-item"
+                        :class="{ active: activeMenu === item.id }"
+                        @click="activeMenu = item.id"
+                    >
+                        <span class="nav-icon">{{ item.icon }}</span>
+                        <span class="nav-text">{{ item.text }}</span>
+                    </div>
+                </nav>
+            </aside>
+
+            <!-- 内容区域 -->
+            <main class="content">
+                <div class="welcome-section">
+                    <h1>欢迎回来，{{ userInfo.name }}！</h1>
+                    <p class="welcome-subtitle">这是TR报告管理系统主控制台</p>
+                </div>
+
+                <!-- 统计卡片 -->
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-icon">📊</div>
+                        <div class="stat-info">
+                            <div class="stat-value">128</div>
+                            <div class="stat-label">总报告数</div>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon">✅</div>
+                        <div class="stat-info">
+                            <div class="stat-value">95</div>
+                            <div class="stat-label">已完成</div>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon">⏳</div>
+                        <div class="stat-info">
+                            <div class="stat-value">23</div>
+                            <div class="stat-label">进行中</div>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon">⚠️</div>
+                        <div class="stat-info">
+                            <div class="stat-value">10</div>
+                            <div class="stat-label">待处理</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 快捷操作 -->
+                <div class="quick-actions">
+                    <h2>快捷操作</h2>
+                    <div class="actions-grid">
+                        <div class="action-card" @click="goToPage('tr-records')">
+                            <div class="action-icon">📋</div>
+                            <div class="action-title">查看报告列表</div>
+                            <p class="action-desc">浏览所有测试报告</p>
+                        </div>
+                        <div class="action-card" v-if="userInfo.role === 'admin'">
+                            <div class="action-icon">👥</div>
+                            <div class="action-title">用户管理</div>
+                            <p class="action-desc">管理系统用户</p>
+                        </div>
+                        <div class="action-card">
+                            <div class="action-icon">⚙️</div>
+                            <div class="action-title">系统设置</div>
+                            <p class="action-desc">配置系统参数</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 最近活动 -->
+                <div class="recent-activity">
+                    <h2>最近活动</h2>
+                    <div class="activity-list">
+                        <div class="activity-item">
+                            <div class="activity-icon">📄</div>
+                            <div class="activity-content">
+                                <div class="activity-title">TR_124889 报告已生成</div>
+                                <div class="activity-time">2小时前</div>
+                            </div>
+                        </div>
+                        <div class="activity-item">
+                            <div class="activity-icon">✏️</div>
+                            <div class="activity-content">
+                                <div class="activity-title">SS78828 报告已更新</div>
+                                <div class="activity-time">5小时前</div>
+                            </div>
+                        </div>
+                        <div class="activity-item">
+                            <div class="activity-icon">👤</div>
+                            <div class="activity-content">
+                                <div class="activity-title">新用户注册</div>
+                                <div class="activity-time">1天前</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </main>
+        </div>
+    </div>
+
+    <script src="scripts/dashboard.js"></script>
+</body>
+</html>
+

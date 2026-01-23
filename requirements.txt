@@ -1,0 +1,10 @@
+pandas==2.1.4
+openpyxl==3.1.2
+reportlab==4.0.7
+matplotlib==3.8.2
+seaborn==0.13.0
+# 数据库连接依赖
+pyodbc==5.0.1
+sqlalchemy==2.0.23
+pymysql==1.1.0
+psycopg2-binary==2.9.9

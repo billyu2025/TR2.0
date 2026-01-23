@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TR Report System - 超级管理员控制台</title>
+    <link rel="stylesheet" href="styles/super-admin.css">
+    <script src="scripts/vue.global.prod.js"></script>
+</head>
+<body>
+    <div id="app" v-cloak>
+        <!-- 顶部导航 -->
+        <header class="topbar">
+            <div class="topbar__left">
+                <img src="images/logo.png" alt="VSC Logo" class="topbar__logo">
+                <div class="topbar__title">
+                    <h1>TR Report System</h1>
+                    <p>超级管理员控制台</p>
+                </div>
+            </div>
+            <div class="topbar__right">
+                <div class="user-chip">
+                    <span class="user-chip__avatar">👑</span>
+                    <div class="user-chip__info">
+                        <span class="user-chip__name">{{ userInfo.name }}</span>
+                        <span class="user-chip__role">超级管理员</span>
+                    </div>
+                </div>
+                <button class="btn btn--ghost" @click="openPage('dashboard.html')">主控制台</button>
+                <button class="btn btn--ghost" @click="openPage('tr-records.html')">订单列表</button>
+                <button class="btn btn--danger" @click="handleLogout">退出</button>
+            </div>
+        </header>
+
+        <!-- 主体布局 -->
+        <div class="layout">
+            <aside class="layout__sidebar">
+                <nav class="menu">
+                    <button 
+                        class="menu__item" 
+                        :class="{ 'menu__item--active': activeTab === 'overview' }"
+                        @click="activeTab = 'overview'"
+                    >
+                        <span>📊 订单总览</span>
+                    </button>
+                    <button 
+                        class="menu__item" 
+                        :class="{ 'menu__item--active': activeTab === 'jobs' }"
+                        @click="activeTab = 'jobs'"
+                    >
+                        <span>🏗️ Job No 分布</span>
+                    </button>
+                    <button 
+                        class="menu__item" 
+                        :class="{ 'menu__item--active': activeTab === 'users' }"
+                        @click="activeTab = 'users'"
+                    >
+                        <span>👥 账号管理</span>
+                    </button>
+                    <button 
+                        class="menu__item" 
+                        :class="{ 'menu__item--active': activeTab === 'tasks' }"
+                        @click="activeTab = 'tasks'"
+                    >
+                        <span>🛠️ 系统任务</span>
+                    </button>
+                    <button 
+                        class="menu__item" 
+                        :class="{ 'menu__item--active': activeTab === 'logs' }"
+                        @click="activeTab = 'logs'"
+                    >
+                        <span>📝 活动日志</span>
+                    </button>
+                </nav>
+
+                <section class="quick-panel">
+                    <h3>系统状态</h3>
+                    <ul>
+                        <li>
+                            <span>数据库连接</span>
+                            <strong :class="{'status-ok': systemStatus.database, 'status-warn': !systemStatus.database}">
+                                {{ systemStatus.database ? '正常' : '待检查' }}
+                            </strong>
+                        </li>
+                        <li>
+                            <span>自动更新任务</span>
+                            <strong :class="{'status-ok': systemStatus.scheduler === '正常', 'status-warn': systemStatus.scheduler !== '正常'}">
+                                {{ systemStatus.scheduler }}
+                            </strong>
+                        </li>
+                        <li>
+                            <span>邮件通知</span>
+                            <strong :class="{'status-ok': systemStatus.mail === '已启用', 'status-warn': systemStatus.mail !== '已启用'}">
+                                {{ systemStatus.mail }}
+                            </strong>
+                        </li>
+                    </ul>
+                </section>
+            </aside>
+
+            <main class="layout__content">
+                <!-- 概览面板 -->
+                <section v-if="activeTab === 'overview'" class="panel">
+                    <header class="panel__header">
+                        <div>
+                            <h2>订单总览</h2>
+                            <p>可查看所有 Job 的订单和 PDF 状态，支持快速搜索</p>
+                        </div>
+                        <div class="filter-bar">
+                            <input 
+                                v-model.trim="filters.orderNo"
+                                type="text" 
+                                placeholder="搜索 Order No"
+                                @input="debouncedFilter"
+                            >
+                            <input 
+                                v-model.trim="filters.jobNo"
+                                type="text" 
+                                placeholder="搜索 Job No"
+                                @input="debouncedFilter"
+                            >
+                            <select v-model="filters.status" @change="applyFilters">
+                                <option value="">全部状态</option>
+                                <option value="generated">已生成 PDF</option>
+                                <option value="pending">待生成</option>
+                                <option value="failed">生成失败</option>
+                            </select>
+                            <button class="btn btn--ghost" @click="resetFilters">重置</button>
+                        </div>
+                    </header>
+
+                    <div class="stats-grid">
+                        <div class="stat-card">
+                            <div class="stat-card__label">总订单数</div>
+                            <div class="stat-card__value">{{ dashboard.totalOrders }}</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-card__label">已生成 PDF</div>
+                            <div class="stat-card__value">{{ dashboard.generated }}</div>
+                            <div class="stat-card__extra">占比 {{ dashboard.generatedRate }}%</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-card__label">待生成 PDF</div>
+                            <div class="stat-card__value">{{ dashboard.pending }}</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-card__label">最近更新</div>
+                            <div class="stat-card__value">{{ dashboard.latestGenerated || '暂无' }}</div>
+                            <div class="stat-card__extra">最近生成时间</div>
+                        </div>
+                    </div>
+
+                    <div class="table-wrapper">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Order No</th>
+                                    <th>Job No</th>
+                                    <th>客户</th>
+                                    <th>工地</th>
+                                    <th>送货日期</th>
+                                    <th>重量 (Wt)</th>
+                                    <th>PDF 状态</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr v-if="loading">
+                                    <td colspan="8" class="table-empty">正在加载数据...</td>
+                                </tr>
+                                <tr v-else-if="filteredOrders.length === 0">
+                                    <td colspan="8" class="table-empty">暂无符合条件的订单</td>
+                                </tr>
+                                <tr v-for="order in paginatedOrders" :key="order.orderNo">
+                                    <td>{{ order.orderNo }}</td>
+                                    <td>{{ order.jobNo || '-' }}</td>
+                                    <td>{{ order.client || '-' }}</td>
+                                    <td>{{ order.jobsite || '-' }}</td>
+                                    <td>{{ order.delDate || '-' }}</td>
+                                    <td>{{ order.wt }}</td>
+                                    <td>
+                                        <span :class="['tag', `tag--${order.status}`]">
+                                            {{ renderStatus(order.status) }}
+                                        </span>
+                                    </td>
+                                    <td class="table-actions">
+                                        <button class="link" @click="openOrder(order.orderNo)">查看</button>
+                                        <button class="link" @click="downloadPdf(order)" :disabled="order.status !== 'generated'">下载 PDF</button>
+                                    </td>
+                                </tr>
+                            </tbody>
+                        </table>
+                        <div class="pagination" v-if="filteredOrders.length > pageSize">
+                            <button class="btn btn--ghost" :disabled="currentPage === 1" @click="currentPage--">上一页</button>
+                            <span>第 {{ currentPage }} / {{ totalPages }} 页</span>
+                            <button class="btn btn--ghost" :disabled="currentPage === totalPages" @click="currentPage++">下一页</button>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Job 分布 -->
+                <section v-else-if="activeTab === 'jobs'" class="panel">
+                    <header class="panel__header">
+                        <div>
+                            <h2>Job No 分布</h2>
+                            <p>快速查看各 Job 的订单数量、重量与进度</p>
+                        </div>
+                    </header>
+                    <div class="job-grid">
+                        <div v-for="job in jobSummary" :key="job.jobNo" class="job-card">
+                            <div class="job-card__header">
+                                <h3>{{ job.jobNo || '未指定' }}</h3>
+                                <span class="tag" :class="`tag--${job.status}`">{{ renderStatus(job.status) }}</span>
+                            </div>
+                            <p>订单数量：{{ job.count }}</p>
+                            <p>总重量：{{ job.totalWt.toFixed(2) }}</p>
+                            <p>已生成：{{ job.generated }}/{{ job.count }}</p>
+                            <div class="job-card__actions">
+                                <button class="btn btn--ghost" @click="filters.jobNo = job.jobNo; activeTab = 'overview'; applyFilters();">查看详情</button>
+                                <button class="btn btn--ghost" @click="assignJob(job.jobNo)">分配账号</button>
+                            </div>
+                        </div>
+                        <p v-if="jobSummary.length === 0" class="panel__empty">暂无数据，请先同步订单</p>
+                    </div>
+                </section>
+
+                <!-- 账号管理 -->
+                <section v-else-if="activeTab === 'users'" class="panel">
+                    <header class="panel__header">
+                        <div>
+                            <h2>账号管理预览</h2>
+                            <p>此处展示计划中的账号管理界面，后端完成后可直接对接</p>
+                        </div>
+                        <div>
+                            <button class="btn btn--primary" @click="openCreateUser">+ 新建用户</button>
+                        </div>
+                    </header>
+                    <div class="user-table-wrapper">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>用户名</th>
+                                    <th>姓名</th>
+                                    <th>角色</th>
+                                    <th>负责 Job No</th>
+                                    <th>状态</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr v-for="user in userAccounts" :key="user.username">
+                                    <td>{{ user.username }}</td>
+                                    <td>{{ user.name }}</td>
+                                    <td>{{ renderRole(user.role) }}</td>
+                                    <td>{{ user.jobNos.length ? user.jobNos.join(', ') : '未分配' }}</td>
+                                    <td>
+                                        <span :class="['tag', user.active ? 'tag--generated' : 'tag--pending']">
+                                            {{ user.active ? '启用' : '停用' }}
+                                        </span>
+                                    </td>
+                                    <td class="table-actions">
+                                        <button class="link" @click="editUser(user)">编辑</button>
+                                        <button class="link" @click="toggleUser(user)">{{ user.active ? '停用' : '启用' }}</button>
+                                        <button class="link" @click="resetPassword(user)">重置密码</button>
+                                    </td>
+                                </tr>
+                            </tbody>
+                        </table>
+                        <p class="panel__tip">提示：上述数据为演示用途，后端完成后即可替换为实时账号信息。</p>
+                    </div>
+                </section>
+
+                <!-- 系统任务 -->
+                <section v-else-if="activeTab === 'tasks'" class="panel">
+                    <header class="panel__header">
+                        <h2>系统任务与自动化</h2>
+                        <p>查看计划任务、最近运行结果以及下一步安排</p>
+                    </header>
+                    <ul class="timeline">
+                        <li v-for="task in systemTasks" :key="task.id">
+                            <div class="timeline__time">{{ task.schedule }}</div>
+                            <div class="timeline__content">
+                                <h3>{{ task.name }}</h3>
+                                <p>{{ task.description }}</p>
+                                <span :class="['tag', task.statusClass]">{{ task.statusText }}</span>
+                            </div>
+                        </li>
+                    </ul>
+                </section>
+
+                <!-- 活动日志 -->
+                <section v-else-if="activeTab === 'logs'" class="panel">
+                    <header class="panel__header">
+                        <h2>最近活动（演示数据）</h2>
+                        <p>后续可接入真实操作日志</p>
+                    </header>
+                    <div class="log-list">
+                        <article v-for="log in activityLogs" :key="log.id" class="log-item">
+                            <div class="log-item__icon">{{ log.icon }}</div>
+                            <div class="log-item__body">
+                                <h3>{{ log.title }}</h3>
+                                <p>{{ log.detail }}</p>
+                            </div>
+                            <div class="log-item__time">{{ log.time }}</div>
+                        </article>
+                    </div>
+                </section>
+            </main>
+        </div>
+
+        <!-- 用户编辑弹窗 -->
+        <div class="modal" v-if="modal.visible">
+            <div class="modal__overlay" @click="closeModal"></div>
+            <div class="modal__content">
+                <header class="modal__header">
+                    <h3>{{ modal.mode === 'create' ? '新建用户' : '编辑用户' }}</h3>
+                    <button class="modal__close" @click="closeModal">×</button>
+                </header>
+                <div class="modal__body">
+                    <label>
+                        用户名
+                        <input type="text" v-model.trim="modal.form.username" :disabled="modal.mode === 'edit'">
+                    </label>
+                    <label>
+                        姓名
+                        <input type="text" v-model.trim="modal.form.name">
+                    </label>
+                    <label>
+                        角色
+                        <select v-model="modal.form.role">
+                            <option value="admin">超级管理员</option>
+                            <option value="manager">账号管理员</option>
+                            <option value="user">普通用户</option>
+                        </select>
+                    </label>
+                    <label>
+                        负责 Job No（逗号分隔）
+                        <input type="text" v-model.trim="modal.form.jobNos">
+                    </label>
+                    <label v-if="modal.mode === 'create'">
+                        初始密码
+                        <input type="text" v-model.trim="modal.form.password" placeholder="暂未生成">
+                    </label>
+                    <p class="modal__hint">提示：当前仅作为 UI 预览，后续可与后台账号表打通。</p>
+                </div>
+                <footer class="modal__footer">
+                    <button class="btn btn--ghost" @click="closeModal">取消</button>
+                    <button class="btn btn--primary" @click="saveModalForm">保存</button>
+                </footer>
+            </div>
+        </div>
+    </div>
+
+    <script src="scripts/super-admin.js"></script>
+</body>
+</html>
+
