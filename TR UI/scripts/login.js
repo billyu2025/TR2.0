@@ -26,7 +26,7 @@ createApp({
             this.successMessage = '';
 
             if (!this.loginForm.username || !this.loginForm.password) {
-                this.errorMessage = '请输入账号名称和密码';
+                this.errorMessage = '請輸入帳號名稱和密碼';
                 return;
             }
 
@@ -49,18 +49,18 @@ createApp({
                 const result = await response.json();
 
                 if (!response.ok || !result.success) {
-                    throw new Error(result.error || '登录失败');
+                    throw new Error(result.error || '登入失敗');
                 }
 
-                this.successMessage = `欢迎回来，${result.user.name || result.user.username}！`;
+                this.successMessage = `歡迎回來，${result.user.name || result.user.username}！`;
                 this.persistAuthInfo(result);
 
                 setTimeout(() => {
                     window.location.href = 'tr-records.html';
                 }, 800);
             } catch (error) {
-                console.error('登录失败:', error);
-                this.errorMessage = error.message || '登录失败，请稍后重试';
+                console.error('登入失敗:', error);
+                this.errorMessage = error.message || '登入失敗，請稍後重試';
             } finally {
                 this.loading = false;
             }
@@ -92,7 +92,7 @@ createApp({
                 this.loginForm.role = parsed.role || 'admin';
                 this.loginForm.remember = true;
             } catch (err) {
-                console.warn('无法读取记住的账号信息:', err);
+                console.warn('無法讀取記住的帳號資訊:', err);
             }
         }
     }

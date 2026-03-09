@@ -107,14 +107,16 @@ class TRReportGenerator3Years:
                 count_sql = text("""
                     SELECT COUNT(*) as record_count
                     FROM tr_line_size tls
+                    JOIN tr_bbs_header tbh
+                        ON tbh.bbs_no = tls.bbs_no
                     LEFT JOIN tr_line_detail tld
                         ON tls.bbs_no = tld.bbs_no
                         AND tls.diameter = tld.diameter
-                    JOIN pedidos_produccion pp
+                    LEFT JOIN pedidos_produccion pp
                         ON pp.ID_PEDIDO_PRODUCCION = tls.bbs_no
-                    JOIN obras js
-                        ON js.ID_OBRA = tls.jobsite_no
-                    WHERE pp.fecha_entrega_prevista >= DATEADD(MONTH, -36, GETDATE())
+                    LEFT JOIN obras js
+                        ON js.ID_OBRA = COALESCE(pp.ID_OBRA, tbh.jobsite_no)
+                    WHERE COALESCE(pp.fecha_entrega_prevista, tbh.delivery_date) >= DATEADD(MONTH, -36, GETDATE())
                 """)
                 result = conn.execute(count_sql)
                 count = result.fetchone()[0]
@@ -127,14 +129,14 @@ class TRReportGenerator3Years:
                 self.logger.info("从 SQL Server 获取数据...")
                 query_sql = text("""
                     SELECT
-                        pp.id_obra AS Job_No, 
-                        js.nombre AS jobsite, 
-                        pp.id_pedido_produccion AS order_no, 
-                        pp.descripcion AS order_describution,
-                        js.arquitecto AS client,
-                        pp.fecha_entrega_prevista AS del_date,
-                        pp.referencia_1 AS ref_no,
-                        pp.referencia_2 AS bbs_po_no,
+                        COALESCE(pp.id_obra, tbh.jobsite_no) AS Job_No, 
+                        COALESCE(js.nombre, tbh.jobsite_name) AS jobsite, 
+                        COALESCE(pp.id_pedido_produccion, tbh.bbs_no) AS order_no, 
+                        COALESCE(pp.descripcion, tbh.order_desc) AS order_describution,
+                        COALESCE(js.arquitecto, tbh.main_contractor) AS client,
+                        COALESCE(pp.fecha_entrega_prevista, tbh.delivery_date) AS del_date,
+                        COALESCE(pp.referencia_1, tbh.bbs_ref_no) AS ref_no,
+                        COALESCE(pp.referencia_2, tbh.bbs_po_no) AS bbs_po_no,
                         tbh.jobsite_type,
                         tls.diameter, 
                         tls.wt_ton, 
@@ -154,12 +156,12 @@ class TRReportGenerator3Years:
                     LEFT JOIN tr_line_detail tld
                         ON tls.bbs_no = tld.bbs_no
                         AND tls.diameter = tld.diameter
-                    JOIN pedidos_produccion pp
+                    LEFT JOIN pedidos_produccion pp
                         ON pp.ID_PEDIDO_PRODUCCION = tls.bbs_no
-                    JOIN obras js
-                        ON js.ID_OBRA = tls.jobsite_no
-                    WHERE pp.fecha_entrega_prevista >= DATEADD(MONTH, -36, GETDATE())
-                    ORDER BY pp.fecha_entrega_prevista DESC, pp.id_obra, pp.ID_PEDIDO_PRODUCCION, tls.diameter, tld.pattern
+                    LEFT JOIN obras js
+                        ON js.ID_OBRA = COALESCE(pp.ID_OBRA, tbh.jobsite_no)
+                    WHERE COALESCE(pp.fecha_entrega_prevista, tbh.delivery_date) >= DATEADD(MONTH, -36, GETDATE())
+                    ORDER BY COALESCE(pp.fecha_entrega_prevista, tbh.delivery_date) DESC, COALESCE(pp.id_obra, tbh.jobsite_no), COALESCE(pp.ID_PEDIDO_PRODUCCION, tbh.bbs_no), tls.diameter, tld.pattern
                 """)
                 
                 df = pd.read_sql(query_sql, conn)

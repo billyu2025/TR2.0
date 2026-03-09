@@ -1,0 +1,19 @@
+未找到文件的文件夹路径列表
+生成时间: 2026-02-13 15:21:26
+总计: 14 个文件夹
+================================================================================
+
+\\192.168.32.212\TVSC-Internal\Dp-Supply Chain\Inventory\04 Rebar PO DN\Rebar DN\00 - Passed record\C0257\Test report\IAT test report
+\\192.168.32.212\TVSC-Internal\Dp-Supply Chain\Inventory\04 Rebar PO DN\Rebar DN\00 - Passed record\C0262\Test report\IAT test report
+\\192.168.32.212\TVSC-Internal\Dp-Supply Chain\Inventory\04 Rebar PO DN\Rebar DN\00 - Passed record\SS74320\Test report\IAT test report
+\\192.168.32.212\TVSC-Internal\Dp-Supply Chain\Inventory\04 Rebar PO DN\Rebar DN\00 - Passed record\SS74865\Test report\IAT test report
+\\192.168.32.212\TVSC-Internal\Dp-Supply Chain\Inventory\04 Rebar PO DN\Rebar DN\00 - Passed record\SS76238\Test report\IAT test report
+\\192.168.32.212\TVSC-Internal\Dp-Supply Chain\Inventory\04 Rebar PO DN\Rebar DN\00 - Passed record\SS76398\Test report\IAT test report
+\\192.168.32.212\TVSC-Internal\Dp-Supply Chain\Inventory\04 Rebar PO DN\Rebar DN\00 - Passed record\SS76511\Test report\IAT test report
+\\192.168.32.212\TVSC-Internal\Dp-Supply Chain\Inventory\04 Rebar PO DN\Rebar DN\00 - Passed record\SS76541\Test report\IAT test report
+\\192.168.32.212\TVSC-Internal\Dp-Supply Chain\Inventory\04 Rebar PO DN\Rebar DN\00 - Passed record\SS76718\Test report\IAT test report
+\\192.168.32.212\TVSC-Internal\Dp-Supply Chain\Inventory\04 Rebar PO DN\Rebar DN\00 - Passed record\SS76855\Test report\IAT test report
+\\192.168.32.212\TVSC-Internal\Dp-Supply Chain\Inventory\04 Rebar PO DN\Rebar DN\00 - Passed record\SS77273\Test report\IAT test report
+\\192.168.32.212\TVSC-Internal\Dp-Supply Chain\Inventory\04 Rebar PO DN\Rebar DN\00 - Passed record\SS77389\Test report\IAT test report
+\\192.168.32.212\TVSC-Internal\Dp-Supply Chain\Inventory\04 Rebar PO DN\Rebar DN\00 - Passed record\SS78618\Test report\IAT test report
+\\192.168.32.212\TVSC-Internal\Dp-Supply Chain\Inventory\04 Rebar PO DN\Rebar DN\00 - Passed record\TL112046\Test report\IAT test report

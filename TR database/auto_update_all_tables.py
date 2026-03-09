@@ -1,30 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TR_Report 和 TR_Report_Deduplication 自动更新脚本
-功能：自动更新 TR_Report 和 TR_Report_Deduplication 表
-作者：TR Report System
-日期：2025-11-20
+TR_Report and TR_Report_Deduplication Auto Update Script
+Function: Auto update TR_Report and TR_Report_Deduplication tables
+Author: TR Report System
+Date: 2025-11-20
 """
 
 import sys
 import os
 import io
 
-# 设置UTF-8编码环境变量（解决Windows下中文和emoji显示问题）
+# Set UTF-8 encoding environment variable (fix Chinese and emoji display issues on Windows)
 if sys.platform == 'win32':
-    # 设置环境变量
+    # Set environment variable
     os.environ['PYTHONIOENCODING'] = 'utf-8'
-    # 重新配置标准输出和错误输出为UTF-8
+    # Reconfigure stdout and stderr to UTF-8
     if sys.stdout.encoding != 'utf-8':
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
     if sys.stderr.encoding != 'utf-8':
         sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
-# 添加当前目录到Python路径
+# Add current directory to Python path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# 添加backend目录到Python路径（用于导入文件索引相关模块）
+# Add backend directory to Python path (for importing file index related modules)
 _backend_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'TR UI', 'backend')
 if os.path.exists(_backend_path):
     sys.path.insert(0, _backend_path)
@@ -42,8 +42,8 @@ import pyodbc
 import warnings
 warnings.filterwarnings('ignore')
 
-# ==================== 配置区域 ====================
-# 数据库配置
+# ==================== Configuration Section ====================
+# Database Configuration
 DB_CONFIG = {
     'server': '192.168.80.242',
     'database': 'TVSC',
@@ -52,29 +52,29 @@ DB_CONFIG = {
     'driver': 'SQL Server'
 }
 
-# SQLite数据库配置
+# SQLiteDatabase Configuration
 SQLITE_DB_PATH = os.path.join(os.path.dirname(__file__), 'data_3years.db')
 
-# 邮件配置（可选，如果不需要邮件通知可以留空）
+# Email Configuration (optional, leave empty if email notification is not needed)
 EMAIL_CONFIG = {
     'smtp_server': 'corpmail1.netvigator.com',
     'smtp_port': 25,
-    'username': 'tr@hkshalliance.com',  # 留空表示不发送邮件
+    'username': 'tr@hkshalliance.com',  # Leave empty to disable email
     'password': '',
     'to_email': 'henry.yu@hkshalliance.com,yuyuhang1991@163.com'
 }
-# ==================== 配置结束 ====================
+# ==================== End of Configuration ====================
 
-# 配置日志
+# Setup Logging
 def setup_logging():
-    """设置日志配置"""
+    """Setup logging configuration"""
     log_dir = os.path.join(os.path.dirname(__file__), 'logs')
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
     
     log_filename = os.path.join(log_dir, f'auto_update_all_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
     
-    # 创建自定义StreamHandler，确保使用UTF-8编码
+    # Create custom StreamHandler to ensure UTF-8 encoding
     class UTF8StreamHandler(logging.StreamHandler):
         def __init__(self, stream=None):
             super().__init__(stream)
@@ -82,23 +82,23 @@ def setup_logging():
         def emit(self, record):
             try:
                 msg = self.format(record) + self.terminator
-                # 使用errors='replace'避免编码错误，即使控制台无法显示emoji也不会报错
+                # Use errors='replace' to avoid encoding errors, even if console cannot display emoji
                 try:
                     if hasattr(self.stream, 'buffer'):
-                        # 对于有buffer的流（如重定向后的stdout）
+                        # For streams with buffer (like redirected stdout)
                         self.stream.buffer.write(msg.encode('utf-8', errors='replace'))
                         self.stream.buffer.flush()
                     else:
-                        # 对于普通流
+                        # For normal streams
                         self.stream.write(msg)
                         self.stream.flush()
                 except (UnicodeEncodeError, AttributeError):
-                    # 如果还是出错，使用ASCII安全版本
+                    # If still error, use ASCII safe version
                     safe_msg = msg.encode('ascii', errors='replace').decode('ascii')
                     self.stream.write(safe_msg)
                     self.stream.flush()
             except Exception:
-                # 完全静默处理错误，避免无限循环
+                # Silently handle errors to avoid infinite loop
                 pass
     
     logging.basicConfig(
@@ -112,16 +112,16 @@ def setup_logging():
     return logging.getLogger(__name__)
 
 class AutoUpdater:
-    """自动更新器 - 只更新 TR_Report 和 TR_Report_Deduplication 表"""
+    """Auto Updater - Only update TR_Report and TR_Report_Deduplication tables"""
     
     def __init__(self):
         self.logger = setup_logging()
         self.engine = None
         self.sqlite_conn = None
-        self.update_results = {}  # 记录每个步骤的执行结果
+        self.update_results = {}  # Record execution results for each step
         
     def create_database_connection(self):
-        """创建源数据库连接"""
+        """Create source database connection"""
         try:
             connection_string = f"mssql+pyodbc://{DB_CONFIG['username']}:{DB_CONFIG['password']}@{DB_CONFIG['server']}/{DB_CONFIG['database']}?driver={DB_CONFIG['driver']}"
             self.engine = create_engine(connection_string, echo=False)
@@ -129,50 +129,170 @@ class AutoUpdater:
             with self.engine.connect() as conn:
                 conn.execute(text("SELECT 1"))
             
-            self.logger.info("✅ 源数据库连接成功")
+            self.logger.info("[OK] Source database connection successful")
             return True
             
         except Exception as e:
-            self.logger.error(f"❌ 源数据库连接失败: {e}")
+            self.logger.error(f"[ERROR] Source database connection failed: {e}")
             return False
     
     def create_sqlite_connection(self):
-        """创建SQLite数据库连接"""
+        """Create SQLite database connection"""
         try:
-            # 添加超时设置（30秒）
-            self.sqlite_conn = sqlite3.connect(SQLITE_DB_PATH, timeout=30.0)
-            # 启用 WAL 模式以提高并发性能，允许多个读取器和写入器同时访问
+            # Ensure database file exists and is writable
+            db_dir = os.path.dirname(SQLITE_DB_PATH)
+            if not os.path.exists(db_dir):
+                os.makedirs(db_dir)
+            
+            # Check database file permissions (check only, do not modify, avoid affecting backend service)
+            if os.path.exists(SQLITE_DB_PATH):
+                try:
+                    import stat
+                    file_stat = os.stat(SQLITE_DB_PATH)
+                    if not (file_stat.st_mode & stat.S_IWRITE):
+                        # Only log warning, do not modify permissions (avoid affecting backend service)
+                        self.logger.warning("[WARNING] Database file may be read-only, if update fails please check file permissions")
+                except Exception as perm_error:
+                    self.logger.warning(f"Cannot check database file permissions: {perm_error}")
+            
+            # Use same connection method as backend service (standard connection, not URI mode, avoid compatibility issues)
+            # Backend service uses: sqlite3.connect(DB_PATH, timeout=30.0)
+            # Keep consistent here to ensure compatibility
+            # Increase timeout to 60 seconds, give backend service more time to release lock
+            self.sqlite_conn = sqlite3.connect(SQLITE_DB_PATH, timeout=60.0)
+            
+            # Enable WAL mode to improve concurrency, allow multiple readers and writers to access simultaneously
+            # Use same PRAGMA settings as backend service to ensure compatibility
             self.sqlite_conn.execute("PRAGMA journal_mode=WAL")
-            # 设置同步模式为 NORMAL（在 WAL 模式下更安全且性能更好）
+            # Set sync mode to NORMAL (safer and better performance in WAL mode)
             self.sqlite_conn.execute("PRAGMA synchronous=NORMAL")
-            # 设置 busy_timeout（毫秒），当数据库被锁定时等待最多30秒
-            self.sqlite_conn.execute("PRAGMA busy_timeout=30000")
-            self.logger.info("✅ SQLite数据库连接成功（WAL模式）")
+            # Set busy_timeout (milliseconds), wait up to 60 seconds when database is locked
+            self.sqlite_conn.execute("PRAGMA busy_timeout=60000")
+            
+            # Test connection (test read only, not write, avoid requiring exclusive lock)
+            # Handle lock issues during actual write operations, use retry mechanism
+            try:
+                # Execute only one read operation to test if connection is normal
+                cursor = self.sqlite_conn.cursor()
+                cursor.execute("PRAGMA user_version")
+                # Do not execute BEGIN IMMEDIATE, as this requires exclusive lock and may fail
+                # Handle lock issues during actual write operations, use retry mechanism
+                self.logger.info("[OK] Database connection test successful (read mode)")
+            except sqlite3.OperationalError as e:
+                error_msg = str(e).lower()
+                if "readonly" in error_msg or "read-only" in error_msg:
+                    self.logger.error(f"[ERROR] Database connection failed: database is read-only")
+                    self.logger.error(f"   Please check:")
+                    self.logger.error(f"   1. Database file permissions: {SQLITE_DB_PATH}")
+                    self.logger.error(f"   2. Database directory permissions: {os.path.dirname(SQLITE_DB_PATH)}")
+                    self.logger.error(f"   3. Whether other processes are locking the database")
+                    self.logger.error(f"   4. WAL file permissions: {SQLITE_DB_PATH}-wal, {SQLITE_DB_PATH}-shm")
+                    self.logger.error(f"   5. Suggestion: If backend service is running, retry later or temporarily stop the backend service")
+                    return False
+                else:
+                    # Also log other errors, but do not fail immediately
+                    self.logger.warning(f"[WARNING] Error occurred during connection test: {e}，Will retry during actual operation")
+            
+            self.logger.info("[OK] SQLite database connection successful (WAL mode, writable)")
             return True
+        except sqlite3.OperationalError as e:
+            error_msg = str(e).lower()
+            if "readonly" in error_msg or "read-only" in error_msg:
+                self.logger.error(f"[ERROR] Database connection failed: database is read-only")
+                self.logger.error(f"   Please check:")
+                self.logger.error(f"   1. Database file permissions: {SQLITE_DB_PATH}")
+                self.logger.error(f"   2. Database directory permissions: {os.path.dirname(SQLITE_DB_PATH)}")
+                self.logger.error(f"   3. Whether other processes are locking the database")
+                self.logger.error(f"   4. WAL file permissions: {SQLITE_DB_PATH}-wal, {SQLITE_DB_PATH}-shm")
+                self.logger.error(f"   5. Suggestion: If backend service is running, retry later or temporarily stop the backend service")
+            else:
+                self.logger.error(f"[ERROR] SQLite database connection failed: {e}")
+            return False
         except Exception as e:
-            self.logger.error(f"❌ SQLite数据库连接失败: {e}")
+            self.logger.error(f"[ERROR] SQLite database connection failed: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
             return False
     
+    def execute_with_retry(self, operation, max_retries=10, retry_delay=3):
+        """
+        Execute database operation with retry mechanism
+        
+        Args:
+            operation: Operation to execute (function)
+            max_retries: Maximum retry times (increased to 10, give backend service more time to release lock)
+            retry_delay: Retry delay (seconds, increased to 3 seconds)
+        """
+        import time
+        for attempt in range(max_retries):
+            try:
+                return operation()
+            except sqlite3.OperationalError as e:
+                error_msg = str(e).lower()
+                if "readonly" in error_msg or "read-only" in error_msg:
+                    if attempt < max_retries - 1:
+                        # Use fixed delay instead of exponential backoff to avoid long wait times
+                        wait_time = retry_delay
+                        self.logger.warning(f"[WARNING] Database read-only error, waiting {wait_time} seconds before retry ({attempt + 1}/{max_retries})...")
+                        self.logger.warning(f"   Tip: Backend service is using database, waiting for connection release...")
+                        if attempt == 5:
+                            self.logger.warning(f"   [TIP] Suggestion: If waiting time is too long, you can temporarily stop backend service to speed up update")
+                        time.sleep(wait_time)
+                        # Reconnect database, try to get new connection
+                        if self.sqlite_conn:
+                            try:
+                                self.sqlite_conn.close()
+                            except:
+                                pass
+                        # Reconnect after brief delay
+                        time.sleep(1)
+                        if not self.create_sqlite_connection():
+                            # If reconnection fails, continue retry
+                            continue
+                        continue
+                    else:
+                        self.logger.error(f"[ERROR] Database read-only error, retried {max_retries} times but still failed")
+                        self.logger.error(f"   Reason: Backend service continuously holds database connection, cannot acquire write lock")
+                        self.logger.error(f"   Solution:")
+                        self.logger.error(f"   1. Temporarily stop backend service: Stop-Service TR-Backend")
+                        self.logger.error(f"   2. Run update script")
+                        self.logger.error(f"   3. Restart backend service: Start-Service TR-Backend")
+                        self.logger.error(f"   Or use batch script to handle automatically: auto_update_all_tables.bat (Requires administrator privileges)")
+                        raise
+                elif "locked" in error_msg or "database is locked" in error_msg:
+                    if attempt < max_retries - 1:
+                        wait_time = retry_delay * (attempt + 1)  # exponential backoff
+                        self.logger.warning(f"[WARNING] Database is locked, waiting {wait_time} seconds before retry ({attempt + 1}/{max_retries})...")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        self.logger.error(f"[ERROR] Database is locked, retried {max_retries} times but still failed")
+                        raise
+                else:
+                    raise
+            except Exception as e:
+                raise
+    
     def execute_query(self, query, params=None):
-        """执行SQL查询"""
+        """Execute SQL query"""
         try:
             with self.engine.connect() as conn:
                 result = pd.read_sql(query, conn, params=params)
             return result
         except Exception as e:
-            self.logger.error(f"❌ 查询执行失败: {e}")
+            self.logger.error(f"[ERROR] Query execution failed: {e}")
             return None
     
-    # ========== 步骤1: 更新Orders表 ==========
+    # ========== Step 1: Update Orders table ==========
     def update_orders(self):
-        """更新订单数据（3年）"""
+        """Update order data (3 years)"""
         try:
             self.logger.info("=" * 60)
-            self.logger.info("步骤1: 更新Orders表")
+            self.logger.info("Step 1: Update Orders table")
             self.logger.info("=" * 60)
             
             today = datetime.now()
-            start_date = today - timedelta(days=1095)  # 3年 = 1095天
+            start_date = today - timedelta(days=1095)  # 3years = 1095 days
             
             order_query = """
             SELECT 
@@ -206,30 +326,30 @@ class AutoUpdater:
             
             if order_data is not None and len(order_data) > 0:
                 order_data.to_sql('orders', self.sqlite_conn, if_exists='replace', index=False)
-                self.sqlite_conn.commit()  # 显式提交确保数据被写入
-                self.logger.info(f"✅ Orders表更新成功: {len(order_data)} 行")
+                self.sqlite_conn.commit()  # Explicit commit to ensure data is written
+                self.logger.info(f"[OK] Orderstableupdate successful: {len(order_data)} rows")
                 self.update_results['Orders'] = {'status': 'success', 'count': len(order_data)}
                 return True
             else:
-                self.logger.warning("⚠️ 订单数据为空")
+                self.logger.warning("[WARNING] Order data is empty")
                 self.update_results['Orders'] = {'status': 'warning', 'count': 0}
                 return False
                 
         except Exception as e:
-            self.logger.error(f"❌ 更新Orders表失败: {e}")
+            self.logger.error(f"[ERROR] Update Orders table failed: {e}")
             self.update_results['Orders'] = {'status': 'failed', 'error': str(e)}
             return False
     
-    # ========== 步骤2: 更新Materials表 ==========
+    # ========== Step 2: Update Materials table ==========
     def update_materials(self):
-        """更新原材料数据（3年）"""
+        """Update material data (3 years)"""
         try:
             self.logger.info("=" * 60)
-            self.logger.info("步骤2: 更新Materials表")
+            self.logger.info("Step 2: Update Materials table")
             self.logger.info("=" * 60)
             
             today = datetime.now()
-            start_date = today - timedelta(days=1095)  # 3年 = 1095天
+            start_date = today - timedelta(days=1095)  # 3years = 1095 days
             
             material_query = """
             SELECT 
@@ -256,26 +376,26 @@ class AutoUpdater:
             
             if material_data is not None and len(material_data) > 0:
                 material_data.to_sql('materials', self.sqlite_conn, if_exists='replace', index=False)
-                self.sqlite_conn.commit()  # 显式提交确保数据被写入
-                self.logger.info(f"✅ Materials表更新成功: {len(material_data)} 行")
+                self.sqlite_conn.commit()  # Explicit commit to ensure data is written
+                self.logger.info(f"[OK] Materialstableupdate successful: {len(material_data)} rows")
                 self.update_results['Materials'] = {'status': 'success', 'count': len(material_data)}
                 return True
             else:
-                self.logger.warning("⚠️ 原材料数据为空")
+                self.logger.warning("[WARNING] Material data is empty")
                 self.update_results['Materials'] = {'status': 'warning', 'count': 0}
                 return False
                 
         except Exception as e:
-            self.logger.error(f"❌ 更新Materials表失败: {e}")
+            self.logger.error(f"[ERROR] Update Materials table failed: {e}")
             self.update_results['Materials'] = {'status': 'failed', 'error': str(e)}
             return False
     
-    # ========== 步骤3: 生成Orders_com表 ==========
+    # ========== Step 3: Generate Orders_com table ==========
     def compress_orders(self):
-        """压缩订单数据，生成Orders_com表"""
+        """Compress order data, generate Orders_com table"""
         try:
             self.logger.info("=" * 60)
-            self.logger.info("步骤3: 生成Orders_com表")
+            self.logger.info("Step 3: Generate Orders_com table")
             self.logger.info("=" * 60)
             
             query = """
@@ -286,7 +406,7 @@ class AutoUpdater:
             """
             
             orders_df = pd.read_sql(query, self.sqlite_conn)
-            self.logger.info(f"原始订单数据: {len(orders_df)} 行")
+            self.logger.info(f"Original order data: {len(orders_df)} rows")
             
             orders_df['Wt'] = pd.to_numeric(orders_df['Wt'], errors='coerce').fillna(0)
             
@@ -304,7 +424,7 @@ class AutoUpdater:
                 'Wt': 'sum'
             }).reset_index()
             
-            # 文本清理
+            # Text cleaning
             def clean_text_field(series, max_length=200):
                 return (
                     series.astype(str)
@@ -323,7 +443,7 @@ class AutoUpdater:
             compressed_orders['Ref_No'] = clean_text_field(compressed_orders['Ref_No'], 50)
             compressed_orders['Order_Description'] = clean_text_field(compressed_orders['Order_Description'], 200)
             
-            # 重量单位转换
+            # Weight unit conversion (kg to ton)
             compressed_orders['Wt'] = compressed_orders['Wt'] / 1000
             
             final_orders = compressed_orders[[
@@ -333,22 +453,22 @@ class AutoUpdater:
             
             final_orders.to_sql('orders_com', self.sqlite_conn, if_exists='replace', index=False)
             
-            self.logger.info(f"✅ Orders_com表生成成功: {len(final_orders)} 行")
-            self.logger.info(f"压缩率: {(1 - len(final_orders) / len(orders_df)) * 100:.2f}%")
+            self.logger.info(f"[OK] Orders_com table generated successfully: {len(final_orders)} rows")
+            self.logger.info(f"Compression rate: {(1 - len(final_orders) / len(orders_df)) * 100:.2f}%")
             self.update_results['Orders_com'] = {'status': 'success', 'count': len(final_orders)}
             return True
             
         except Exception as e:
-            self.logger.error(f"❌ 生成Orders_com表失败: {e}")
+            self.logger.error(f"[ERROR] Failed to generate Orders_com table: {e}")
             self.update_results['Orders_com'] = {'status': 'failed', 'error': str(e)}
             return False
     
-    # ========== 步骤4: 生成Materials_com表 ==========
+    # ========== Step 4: Generate Materials_com table ==========
     def compress_materials(self):
-        """压缩原材料数据，生成Materials_com表"""
+        """Compress material data, generate Materials_com table"""
         try:
             self.logger.info("=" * 60)
-            self.logger.info("步骤4: 生成Materials_com表")
+            self.logger.info("Step 4: Generate Materials_com table")
             self.logger.info("=" * 60)
             
             query = """
@@ -359,9 +479,9 @@ class AutoUpdater:
             """
             
             materials_df = pd.read_sql(query, self.sqlite_conn)
-            self.logger.info(f"原始原材料数据: {len(materials_df)} 行")
+            self.logger.info(f"Original material data: {len(materials_df)} rows")
             
-            # 提取直径信息
+            # Extract diameter information
             def extract_dia_from_product(product):
                 try:
                     if pd.isna(product) or product == '':
@@ -372,7 +492,7 @@ class AutoUpdater:
                 except:
                     return ''
             
-            # 提取长度信息
+            # Extract length information
             def extract_len_from_product(product):
                 try:
                     if pd.isna(product) or product == '':
@@ -390,7 +510,7 @@ class AutoUpdater:
             materials_df['Dia'] = materials_df['Product'].apply(extract_dia_from_product)
             materials_df['Len'] = materials_df['Product'].apply(extract_len_from_product)
             
-            # 去重
+            # Remove duplicates
             compressed_materials = materials_df.drop_duplicates(subset=[
                 'Product', 'Pattern', 'Mill_Cert', 'Test_Cert2', 'Test_Cert1',
                 'Stockist_Cert', 'PO_No', 'Tag_No', 'DN_No'
@@ -402,26 +522,26 @@ class AutoUpdater:
             
             compressed_materials.to_sql('materials_com', self.sqlite_conn, if_exists='replace', index=False)
             
-            self.logger.info(f"✅ Materials_com表生成成功: {len(compressed_materials)} 行")
-            self.logger.info(f"压缩率: {(1 - len(compressed_materials) / len(materials_df)) * 100:.2f}%")
+            self.logger.info(f"[OK] Materials_com table generated successfully: {len(compressed_materials)} rows")
+            self.logger.info(f"Compression rate: {(1 - len(compressed_materials) / len(materials_df)) * 100:.2f}%")
             self.update_results['Materials_com'] = {'status': 'success', 'count': len(compressed_materials)}
             return True
             
         except Exception as e:
-            self.logger.error(f"❌ 生成Materials_com表失败: {e}")
+            self.logger.error(f"[ERROR] Failed to generate Materials_com table: {e}")
             self.update_results['Materials_com'] = {'status': 'failed', 'error': str(e)}
             return False
     
-    # ========== 步骤5: 生成Orders_Deduplication表 ==========
+    # ========== Step 5: Generate Orders_Deduplication table ==========
     def create_orders_deduplication(self):
-        """生成Orders_Deduplication表"""
+        """Generate Orders_Deduplication table"""
         try:
             self.logger.info("=" * 60)
-            self.logger.info("步骤5: 生成Orders_Deduplication表")
+            self.logger.info("Step 5: Generate Orders_Deduplication table")
             self.logger.info("=" * 60)
             
             orders_df = pd.read_sql("SELECT * FROM orders_com", self.sqlite_conn)
-            self.logger.info(f"读取orders_com数据: {len(orders_df)} 行")
+            self.logger.info(f"Read orders_com data: {len(orders_df)} rows")
             
             grouped = orders_df.groupby('Order_No').agg({
                 'Client': 'first',
@@ -436,7 +556,7 @@ class AutoUpdater:
                 'Wt': 'sum'
             }).reset_index()
             
-            # 映射Jobsite_Type
+            # Map Jobsite_Type
             def map_jobsite_type(value):
                 try:
                     if value is None:
@@ -459,45 +579,45 @@ class AutoUpdater:
             
             grouped.to_sql('Orders_Deduplication', self.sqlite_conn, if_exists='replace', index=False)
             
-            self.logger.info(f"✅ Orders_Deduplication表生成成功: {len(grouped)} 行")
+            self.logger.info(f"[OK] Orders_Deduplication table generated successfully: {len(grouped)} rows")
             self.update_results['Orders_Deduplication'] = {'status': 'success', 'count': len(grouped)}
             return True
             
         except Exception as e:
-            self.logger.error(f"❌ 生成Orders_Deduplication表失败: {e}")
+            self.logger.error(f"[ERROR] Failed to generate Orders_Deduplication table: {e}")
             self.update_results['Orders_Deduplication'] = {'status': 'failed', 'error': str(e)}
             return False
     
-    # ========== 步骤6: 生成Orders_gen_pdf表 ==========
+    # ========== Step 6: Generate Orders_gen_pdf table ==========
     def create_orders_gen_pdf(self):
-        """生成Orders_gen_pdf表"""
+        """Generate Orders_gen_pdf table"""
         try:
             self.logger.info("=" * 60)
-            self.logger.info("步骤6: 生成Orders_gen_pdf表")
+            self.logger.info("Step 6: Generate Orders_gen_pdf table")
             self.logger.info("=" * 60)
             
-            # 检查TR_Fill_in表是否存在
+            # Check if TR_Fill_in table exists
             cursor = self.sqlite_conn.cursor()
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='TR_Fill_in'")
             if cursor.fetchone() is None:
-                self.logger.warning("⚠️ TR_Fill_in表不存在，跳过Orders_gen_pdf生成")
-                self.update_results['Orders_gen_pdf'] = {'status': 'skipped', 'reason': 'TR_Fill_in表不存在'}
+                self.logger.warning("[WARNING] TR_Fill_in table does not exist, skipping Orders_gen_pdf generation")
+                self.update_results['Orders_gen_pdf'] = {'status': 'skipped', 'reason': 'TR_Fill_in table does not exist'}
                 return False
             
-            # 检查TR_Fill_in表是否有数据
+            # Check if TR_Fill_in table has data
             cursor.execute("SELECT COUNT(*) FROM TR_Fill_in")
             tr_fill_in_count = cursor.fetchone()[0]
             if tr_fill_in_count == 0:
-                self.logger.warning("⚠️ TR_Fill_in表为空，跳过Orders_gen_pdf生成")
-                self.update_results['Orders_gen_pdf'] = {'status': 'skipped', 'reason': 'TR_Fill_in表为空'}
+                self.logger.warning("[WARNING] TR_Fill_in table is empty, skipping Orders_gen_pdf generation")
+                self.update_results['Orders_gen_pdf'] = {'status': 'skipped', 'reason': 'TR_Fill_in table is empty'}
                 return False
             
-            self.logger.info(f"TR_Fill_in表有 {tr_fill_in_count} 条记录")
+            self.logger.info(f"TR_Fill_in table has {tr_fill_in_count} records")
             
-            # 删除已存在的表
+            # Drop existing table
             cursor.execute("DROP TABLE IF EXISTS Orders_gen_pdf")
             
-            # 创建新表
+            # Create new table
             create_table_sql = """
             CREATE TABLE Orders_gen_pdf AS
             SELECT 
@@ -533,37 +653,37 @@ class AutoUpdater:
             cursor.execute("SELECT COUNT(*) FROM Orders_gen_pdf")
             count = cursor.fetchone()[0]
             
-            self.logger.info(f"✅ Orders_gen_pdf表生成成功: {count} 行")
+            self.logger.info(f"[OK] Orders_gen_pdf table generated successfully: {count} rows")
             self.update_results['Orders_gen_pdf'] = {'status': 'success', 'count': count}
             return True
             
         except Exception as e:
-            self.logger.error(f"❌ 生成Orders_gen_pdf表失败: {e}")
+            self.logger.error(f"[ERROR] Failed to generate Orders_gen_pdf table: {e}")
             self.update_results['Orders_gen_pdf'] = {'status': 'failed', 'error': str(e)}
             return False
     
-    # ========== 步骤7: 确保PDF_Status表存在 ==========
+    # ========== Step 7: Ensure PDF_Status table exists ==========
     def ensure_pdf_status_table(self):
-        """确保PDF_Status表存在（如果不存在则创建）"""
+        """Ensure PDF_Status table exists (create if not exists)"""
         try:
             self.logger.info("=" * 60)
-            self.logger.info("步骤7: 检查PDF_Status表")
+            self.logger.info("Step 7: Check PDF_Status table")
             self.logger.info("=" * 60)
             
             cursor = self.sqlite_conn.cursor()
             
-            # 检查PDF_Status表是否存在
+            # Check if PDF_Status table exists
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='PDF_Status'")
             if cursor.fetchone() is not None:
-                # 表已存在，检查记录数
+                # Table exists, check record count
                 cursor.execute("SELECT COUNT(*) FROM PDF_Status")
                 count = cursor.fetchone()[0]
-                self.logger.info(f"✅ PDF_Status表已存在，当前记录数: {count}")
+                self.logger.info(f"[OK] PDF_Status table exists, current record count: {count}")
                 self.update_results['PDF_Status'] = {'status': 'exists', 'count': count}
                 return True
             
-            # 表不存在，创建它
-            self.logger.info("📋 PDF_Status表不存在，正在创建...")
+            # Table does not exist, create it
+            self.logger.info("PDF_Status table does not exist, creating...")
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS PDF_Status (
                     Order_No INTEGER PRIMARY KEY,
@@ -577,41 +697,41 @@ class AutoUpdater:
             
             self.sqlite_conn.commit()
             
-            # 验证表创建成功
+            # Verify table creation
             cursor.execute("SELECT COUNT(*) FROM PDF_Status")
             count = cursor.fetchone()[0]
             
-            self.logger.info(f"✅ PDF_Status表创建成功，当前记录数: {count}")
+            self.logger.info(f"[OK] PDF_Status table created successfully, current record count: {count}")
             self.update_results['PDF_Status'] = {'status': 'created', 'count': count}
             return True
             
         except Exception as e:
-            self.logger.error(f"❌ 检查/创建PDF_Status表失败: {e}")
+            self.logger.error(f"[ERROR] Failed to check/create PDF_Status table: {e}")
             self.update_results['PDF_Status'] = {'status': 'failed', 'error': str(e)}
             return False
     
-    # ========== 步骤8: 确保TR_Fill_in表存在 ==========
+    # ========== Step 8: Ensure TR_Fill_in table exists ==========
     def ensure_tr_fill_in_table(self):
-        """确保TR_Fill_in表存在（如果不存在则创建）"""
+        """Ensure TR_Fill_in table exists (create if not exists)"""
         try:
             self.logger.info("=" * 60)
-            self.logger.info("步骤8: 检查TR_Fill_in表")
+            self.logger.info("Step 8: Check TR_Fill_in table")
             self.logger.info("=" * 60)
             
             cursor = self.sqlite_conn.cursor()
             
-            # 检查TR_Fill_in表是否存在
+            # Check if TR_Fill_in table exists
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='TR_Fill_in'")
             if cursor.fetchone() is not None:
-                # 表已存在，检查记录数
+                # Table exists, check record count
                 cursor.execute("SELECT COUNT(*) FROM TR_Fill_in")
                 count = cursor.fetchone()[0]
-                self.logger.info(f"✅ TR_Fill_in表已存在，当前记录数: {count}")
+                self.logger.info(f"[OK] TR_Fill_in table exists, current record count: {count}")
                 self.update_results['TR_Fill_in'] = {'status': 'exists', 'count': count}
                 return True
             
-            # 表不存在，创建它
-            self.logger.info("📋 TR_Fill_in表不存在，正在创建...")
+            # Table does not exist, create it
+            self.logger.info("TR_Fill_in table does not exist, creating...")
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS TR_Fill_in (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -633,61 +753,66 @@ class AutoUpdater:
             
             self.sqlite_conn.commit()
             
-            # 验证表创建成功
+            # Verify table creation
             cursor.execute("SELECT COUNT(*) FROM TR_Fill_in")
             count = cursor.fetchone()[0]
             
-            self.logger.info(f"✅ TR_Fill_in表创建成功，当前记录数: {count}")
+            self.logger.info(f"[OK] TR_Fill_in table created successfully, current record count: {count}")
             self.update_results['TR_Fill_in'] = {'status': 'created', 'count': count}
             return True
             
         except Exception as e:
-            self.logger.error(f"❌ 检查/创建TR_Fill_in表失败: {e}")
+            self.logger.error(f"[ERROR] Failed to check/create TR_Fill_in table: {e}")
             self.update_results['TR_Fill_in'] = {'status': 'failed', 'error': str(e)}
             return False
     
-    # ========== 创建 TR_Report 表 ==========
+    # ========== Create TR_Report table ==========
     def create_tr_report_table(self):
-        """创建 TR_Report 表 - 从 SQL Server 查询近3年的数据，直接在 SQLite 中创建"""
+        """Create TR_Report table - Query last 3 years of data from SQL Server, create directly in SQLite"""
         try:
             self.logger.info("=" * 60)
-            self.logger.info("步骤1: 创建 TR_Report 表")
+            self.logger.info("Step 1: Create TR_Report table")
             self.logger.info("=" * 60)
             
             with self.engine.connect() as conn:
-                # 先测试查询，获取数据量
-                self.logger.info("查询近3年的数据...")
+                # First test query to get data count
+                self.logger.info("Querying last 3 years of data...")
                 count_sql = text("""
                     SELECT COUNT(*) as record_count
                     FROM tr_line_size tls
+                    JOIN tr_bbs_header tbh
+                        ON tbh.bbs_no = tls.bbs_no
                     LEFT JOIN tr_line_detail tld
                         ON tls.bbs_no = tld.bbs_no
                         AND tls.diameter = tld.diameter
-                    JOIN pedidos_produccion pp
+                    LEFT JOIN pedidos_produccion pp
                         ON pp.ID_PEDIDO_PRODUCCION = tls.bbs_no
-                    JOIN obras js
-                        ON js.ID_OBRA = tls.jobsite_no
-                    WHERE pp.fecha_entrega_prevista >= DATEADD(MONTH, -36, GETDATE())
+                    LEFT JOIN obras js
+                        ON js.ID_OBRA = COALESCE(pp.ID_OBRA, tbh.jobsite_no)
+                    WHERE COALESCE(pp.fecha_entrega_prevista, tbh.delivery_date) >= DATEADD(MONTH, -36, GETDATE())
                 """)
                 result = conn.execute(count_sql)
                 count = result.fetchone()[0]
-                self.logger.info(f"找到 {count:,} 条近3年的记录")
+                self.logger.info(f"Found {count:,} records from last 3 years")
                 
                 if count == 0:
-                    self.logger.warning("⚠️ 近3年没有数据，表将为空")
+                    self.logger.warning("[WARNING] No data from last 3 years, table will be empty")
                 
-                # 查询数据
-                self.logger.info("从 SQL Server 获取数据...")
+                # Query data
+                self.logger.info("Fetching data from SQL Server...")
+                self.logger.info(f"[WARNING]  Note: Fetching {count:,} records, this may take several minutes, please wait...")
+                self.logger.info("[WARNING]  If network is slow or data volume is large, may take 5-15 minutes")
+                
                 query_sql = text("""
                     SELECT
-                        pp.id_obra AS Job_No, 
-                        js.nombre AS jobsite, 
-                        pp.id_pedido_produccion AS order_no, 
-                        pp.descripcion AS order_describution,
-                        js.arquitecto AS client,
-                        pp.fecha_entrega_prevista AS del_date,
-                        pp.referencia_1 AS ref_no,
-                        pp.referencia_2 AS bbs_po_no,
+                        COALESCE(pp.id_obra, tbh.jobsite_no) AS Job_No, 
+                        COALESCE(js.nombre, tbh.jobsite_name) AS jobsite, 
+                        COALESCE(pp.id_pedido_produccion, tbh.bbs_no) AS order_no, 
+                        COALESCE(pp.descripcion, tbh.order_desc) AS order_describution,
+                        COALESCE(js.arquitecto, tbh.main_contractor) AS client,
+                        COALESCE(pp.fecha_entrega_prevista, tbh.delivery_date) AS del_date,
+                        COALESCE(pp.referencia_1, tbh.bbs_ref_no) AS ref_no,
+                        COALESCE(pp.referencia_2, tbh.bbs_po_no) AS bbs_po_no,
                         tbh.jobsite_type,
                         tls.diameter, 
                         tls.wt_ton, 
@@ -707,42 +832,152 @@ class AutoUpdater:
                     LEFT JOIN tr_line_detail tld
                         ON tls.bbs_no = tld.bbs_no
                         AND tls.diameter = tld.diameter
-                    JOIN pedidos_produccion pp
+                    LEFT JOIN pedidos_produccion pp
                         ON pp.ID_PEDIDO_PRODUCCION = tls.bbs_no
-                    JOIN obras js
-                        ON js.ID_OBRA = tls.jobsite_no
-                    WHERE pp.fecha_entrega_prevista >= DATEADD(MONTH, -36, GETDATE())
-                    ORDER BY pp.fecha_entrega_prevista DESC, pp.id_obra, pp.ID_PEDIDO_PRODUCCION, tls.diameter, tld.pattern
+                    LEFT JOIN obras js
+                        ON js.ID_OBRA = COALESCE(pp.ID_OBRA, tbh.jobsite_no)
+                    WHERE COALESCE(pp.fecha_entrega_prevista, tbh.delivery_date) >= DATEADD(MONTH, -36, GETDATE())
+                    ORDER BY COALESCE(pp.fecha_entrega_prevista, tbh.delivery_date) DESC, COALESCE(pp.id_obra, tbh.jobsite_no), COALESCE(pp.ID_PEDIDO_PRODUCCION, tbh.bbs_no), tls.diameter, tld.pattern
                 """)
                 
-                df = pd.read_sql(query_sql, conn)
-                self.logger.info(f"获取了 {len(df):,} 条记录")
+                # Use chunksize to read in batches, avoid memory issues (if data volume is large)
+                try:
+                    # Try to read in chunks
+                    chunk_size = 50000  # Read 50,000 records each time
+                    chunks = []
+                    total_read = 0
+                    
+                    for chunk_df in pd.read_sql(query_sql, conn, chunksize=chunk_size):
+                        chunks.append(chunk_df)
+                        total_read += len(chunk_df)
+                        if total_read % 100000 == 0:  # Output progress every 100,000 records
+                            progress = (total_read * 100 // count) if count else 100
+                            self.logger.info(f"   Read: {total_read:,} / {count:,} records ({progress}%)")
+                    
+                    # Merge all chunks
+                    df = pd.concat(chunks, ignore_index=True)
+                    self.logger.info(f"[OK] Retrieved {len(df):,} records (completed)")
+                except Exception as chunk_error:
+                    # If batch read fails, fall back to one-time read
+                    self.logger.warning(f"Batch read failed, using one-time read: {chunk_error}")
+                    df = pd.read_sql(query_sql, conn)
+                    self.logger.info(f"[OK] Retrieved {len(df):,} records")
                 
-                if len(df) == 0:
-                    self.logger.warning("⚠️ 没有获取到数据")
-                    self.update_results['TR_Report'] = {'status': 'warning', 'count': 0}
-                    return False
-                
-                # 连接到 SQLite
+                # Connect to SQLite
                 if not self.sqlite_conn:
                     self.create_sqlite_connection()
                 
-                # 如果表已存在，删除它
+                # Check if TR_Report table already exists and has data
                 cursor = self.sqlite_conn.cursor()
-                cursor.execute("DROP TABLE IF EXISTS TR_Report")
-                self.sqlite_conn.commit()
-                self.logger.info("已删除旧的 TR_Report 表（如果存在）")
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='TR_Report'")
+                table_exists = cursor.fetchone() is not None
                 
-                # 将数据写入 SQLite
-                self.logger.info("写入数据到 SQLite...")
-                df.to_sql('TR_Report', self.sqlite_conn, if_exists='replace', index=False)
-                self.sqlite_conn.commit()
+                if table_exists:
+                    cursor.execute("SELECT COUNT(*) FROM TR_Report")
+                    existing_count = cursor.fetchone()[0]
+                    self.logger.info(f"TR_Report table already exists, currently has {existing_count:,} records")
+                    
+                    if len(df) == 0:
+                        self.logger.warning("[WARNING] Queried 0 new records from SQL Server")
+                        self.logger.warning(f"[WARNING] but TR_Report table already has {existing_count:,} records, keeping existing data")
+                        self.update_results['TR_Report'] = {'status': 'warning', 'count': existing_count, 'message': 'No new data from SQL Server, keeping existing data'}
+                        return True  # Keep existing data, do not delete table
                 
-                # 验证
+                # If there is new data, use table renaming strategy (avoid DROP TABLE requiring exclusive lock)
+                if len(df) > 0:
+                    # Strategy: Create new table -> Insert data (no lock needed) -> Delete old table and rename in shortest transaction
+                    # Key: Most of the time (creating and writing new table) does not need to lock old table, only need lock during final swap
+                    def replace_table():
+                        cursor = self.sqlite_conn.cursor()
+                        
+                        # Step 1-2: Create new table and write data (no need to lock old table, can proceed concurrently)
+                        temp_table_name = "TR_Report_new"
+                        cursor.execute("DROP TABLE IF EXISTS " + temp_table_name)
+                        self.sqlite_conn.commit()  # Commit first, release lock
+                        
+                        # Write data to new table (this process does not need to lock old table)
+                        df.to_sql(temp_table_name, self.sqlite_conn, if_exists='replace', index=False)
+                        self.sqlite_conn.commit()  # Commit, release lock
+                        
+                        # Step 3-4: Complete table swap in shortest transaction (lock needed here)
+                        # Use BEGIN IMMEDIATE to quickly acquire lock, then immediately execute delete and rename
+                        cursor.execute("BEGIN IMMEDIATE")
+                        try:
+                            # Delete old table (requires EXCLUSIVE lock, but time is short)
+                            cursor.execute("DROP TABLE IF EXISTS TR_Report")
+                            
+                            # Rename new table (atomic operation, almost instant)
+                            cursor.execute(f"ALTER TABLE {temp_table_name} RENAME TO TR_Report")
+                            
+                            self.sqlite_conn.commit()
+                            return True
+                        except sqlite3.OperationalError as e:
+                            self.sqlite_conn.rollback()
+                            # Clean up temporary table
+                            try:
+                                cursor.execute("DROP TABLE IF EXISTS " + temp_table_name)
+                                self.sqlite_conn.commit()
+                            except:
+                                pass
+                            raise
+                    
+                    try:
+                        # Increase retry count and delay, as backend service may hold connection for long time
+                        self.execute_with_retry(replace_table, max_retries=20, retry_delay=10)
+                        self.logger.info("[OK] Updated using table renaming strategy TR_Report table (no need to stop backend service)")
+                    except Exception as e:
+                        self.logger.error(f"[ERROR] Cannot update table: {e}")
+                        self.logger.error(f"   Reason: Backend service may be using database, cannot acquire write lock")
+                        self.logger.error(f"   Solution:")
+                        self.logger.error(f"   1. Temporarily stop backend service: Stop-Service TR-Backend")
+                        self.logger.error(f"   2. Run update script")
+                        self.logger.error(f"   3. Restart backend service: Start-Service TR-Backend")
+                        raise
+                else:
+                    # No new data, keep existing data
+                    self.logger.warning("[WARNING] No new data retrieved, keeping existing TR_Report table")
+                    self.update_results['TR_Report'] = {'status': 'warning', 'count': existing_count if table_exists else 0, 'message': 'No new data, keeping existing table'}
+                    return True
+                
+                # Use table renaming strategy to write data (avoid exclusive lock, no need to stop backend service)
+                def write_table():
+                    cursor = self.sqlite_conn.cursor()
+                    cursor.execute("BEGIN IMMEDIATE")
+                    try:
+                        # 1. Create temporary table
+                        temp_table_name = "TR_Report_new"
+                        cursor.execute("DROP TABLE IF EXISTS " + temp_table_name)
+                        
+                        # 2. Write data to temporary table
+                        self.logger.info("Writing data to temporary table...")
+                        df.to_sql(temp_table_name, self.sqlite_conn, if_exists='replace', index=False)
+                        
+                        # 3. Drop old table
+                        cursor.execute("DROP TABLE IF EXISTS TR_Report")
+                        
+                        # 4. Rename temporary table (atomic operation, minimize lock time)
+                        cursor.execute(f"ALTER TABLE {temp_table_name} RENAME TO TR_Report")
+                        
+                        self.sqlite_conn.commit()
+                        return True
+                    except sqlite3.OperationalError as e:
+                        self.sqlite_conn.rollback()
+                        # Clean up temporary table
+                        try:
+                            cursor.execute("DROP TABLE IF EXISTS " + temp_table_name)
+                            self.sqlite_conn.commit()
+                        except:
+                            pass
+                        raise
+                
+                self.execute_with_retry(write_table)
+                self.logger.info("[OK] Updated using table renaming strategy TR_Report table (no need to stop backend service)")
+                
+                # Verify
                 verify_count = pd.read_sql("SELECT COUNT(*) as cnt FROM TR_Report", self.sqlite_conn).iloc[0]['cnt']
-                self.logger.info(f"✅ TR_Report 表创建成功: {verify_count:,} 条记录")
+                self.logger.info(f"[OK] TR_Report table created successfully: {verify_count:,} records")
                 
-                # 统计信息
+                # Statistics
                 stats = pd.read_sql("""
                     SELECT 
                         MIN(del_date) as earliest_date,
@@ -753,54 +988,54 @@ class AutoUpdater:
                 """, self.sqlite_conn).iloc[0]
                 
                 self.logger.info("=" * 60)
-                self.logger.info("表统计信息:")
-                self.logger.info(f"  最早日期: {stats['earliest_date']}")
-                self.logger.info(f"  最晚日期: {stats['latest_date']}")
-                self.logger.info(f"  唯一订单数: {stats['unique_orders']:,}")
-                self.logger.info(f"  唯一工地数: {stats['unique_jobsites']:,}")
+                self.logger.info("Table statistics:")
+                self.logger.info(f"  Earliest date: {stats['earliest_date']}")
+                self.logger.info(f"  Latest date: {stats['latest_date']}")
+                self.logger.info(f"  Unique orders: {stats['unique_orders']:,}")
+                self.logger.info(f"  Unique jobsites: {stats['unique_jobsites']:,}")
                 self.logger.info("=" * 60)
                 
                 self.update_results['TR_Report'] = {'status': 'success', 'count': verify_count}
                 return True
                 
         except Exception as e:
-            self.logger.error(f"❌ 创建 TR_Report 表失败: {e}")
+            self.logger.error(f"[ERROR] Failed to create TR_Report table: {e}")
             import traceback
             self.logger.error(traceback.format_exc())
             self.update_results['TR_Report'] = {'status': 'failed', 'error': str(e)}
             return False
-    # ========== 创建 TR_Report_Deduplication 表 ==========
+    # ========== Create TR_Report_Deduplication table ==========
     def create_tr_report_deduplication(self):
-        """创建 TR_Report_Deduplication 表 - 从 TR_Report 表按 Order_No 去重生成"""
+        """Create TR_Report_Deduplication table - Deduplicate from TR_Report table by Order_No"""
         try:
             self.logger.info("=" * 60)
-            self.logger.info("步骤2: 创建 TR_Report_Deduplication 表")
+            self.logger.info("Step 2: Create TR_Report_Deduplication table")
             self.logger.info("=" * 60)
             
             if not self.sqlite_conn:
                 self.create_sqlite_connection()
             
-            # 检查 TR_Report 表是否存在
+            # Check if TR_Report table exists
             cursor = self.sqlite_conn.cursor()
             cursor.execute("""
                 SELECT name FROM sqlite_master 
                 WHERE type='table' AND name='TR_Report'
             """)
             if not cursor.fetchone():
-                self.logger.error("❌ TR_Report 表不存在，请先创建 TR_Report 表")
+                self.logger.error("[ERROR] TR_Report table does not exist, please create TR_Report table first")
                 self.update_results['TR_Report_Deduplication'] = {'status': 'failed', 'error': 'TR_Report table does not exist'}
                 return False
             
-            # 读取 TR_Report 表数据
-            self.logger.info("从 TR_Report 表读取数据...")
+            # Read TR_Report table data
+            self.logger.info("Reading data from TR_Report table...")
             tr_report_df = pd.read_sql("SELECT * FROM TR_Report", self.sqlite_conn)
-            self.logger.info(f"从 TR_Report 读取了 {len(tr_report_df):,} 条记录")
+            self.logger.info(f"Read {len(tr_report_df):,} records from TR_Report")
             
             if tr_report_df.empty:
-                self.logger.warning("⚠️ TR_Report 表为空，TR_Report_Deduplication 也将为空")
+                self.logger.warning("[WARNING] TR_Report table is empty, TR_Report_Deduplication will also be empty")
             
-            # 按 order_no 分组去重
-            self.logger.info("按 order_no 分组并聚合...")
+            # Group by order_no and deduplicate
+            self.logger.info("Grouping by order_no and aggregating...")
             grouped = tr_report_df.groupby('order_no').agg({
                 'Job_No': 'first',
                 'jobsite': 'first',
@@ -810,12 +1045,12 @@ class AutoUpdater:
                 'ref_no': 'first',
                 'bbs_po_no': 'first',
                 'jobsite_type': 'first',
-                'wt_ton': 'sum',  # 累加重量
+                'wt_ton': 'sum',  # Sum weight
                 'grade': 'first',
                 'rm_dn_no': 'first',
             }).reset_index()
             
-            # 重命名列以匹配 TR_Report_Deduplication 的命名风格
+            # Rename columns to match TR_Report_Deduplication naming style
             grouped = grouped.rename(columns={
                 'order_no': 'Order_No',
                 'jobsite': 'Jobsite',
@@ -829,29 +1064,62 @@ class AutoUpdater:
                 'grade': 'Grade',
                 'rm_dn_no': 'rm_dn_no'
             })
-            # Job_No 已经是正确名称，不需要重命名
+            # Job_No is already correct name, no need to rename
             
-            self.logger.info(f"聚合为 {len(grouped):,} 个唯一订单")
+            self.logger.info(f"Aggregated to {len(grouped):,} unique orders")
             
-            # 按 Del_Date 降序排列
-            self.logger.info("按 Del_Date 降序排列...")
+            # Sort by Del_Date descending
+            self.logger.info("Sorting by Del_Date descending...")
             grouped = grouped.sort_values('Del_Date', ascending=False, na_position='last')
             
-            # 如果表已存在，先删除
-            cursor.execute("DROP TABLE IF EXISTS TR_Report_Deduplication")
-            self.sqlite_conn.commit()
-            self.logger.info("已删除旧的 TR_Report_Deduplication 表（如果存在）")
+            # Use table renaming strategy to update table (avoid DROP TABLE requiring exclusive lock)
+            # Key: Create new table and write data first (no lock needed), then complete table swap in shortest transaction
+            def replace_table():
+                cursor = self.sqlite_conn.cursor()
+                
+                # Step 1-2: Create new table and write data (no need to lock old table, can proceed concurrently)
+                temp_table_name = "TR_Report_Deduplication_new"
+                cursor.execute("DROP TABLE IF EXISTS " + temp_table_name)
+                self.sqlite_conn.commit()  # Commit first, release lock
+                
+                # Write data to new table (this process does not need to lock old table)
+                grouped.to_sql(temp_table_name, self.sqlite_conn, if_exists='replace', index=False)
+                self.sqlite_conn.commit()  # Commit, release lock
+                
+                # Step 3-4: Complete table swap in shortest transaction (lock needed here)
+                # Use BEGIN IMMEDIATE to quickly acquire lock, then immediately execute delete and rename
+                cursor.execute("BEGIN IMMEDIATE")
+                try:
+                    # Delete old table (requires EXCLUSIVE lock, but time is short)
+                    cursor.execute("DROP TABLE IF EXISTS TR_Report_Deduplication")
+                    
+                    # Rename new table (atomic operation, almost instant)
+                    cursor.execute(f"ALTER TABLE {temp_table_name} RENAME TO TR_Report_Deduplication")
+                    
+                    self.sqlite_conn.commit()
+                    return True
+                except sqlite3.OperationalError as e:
+                    self.sqlite_conn.rollback()
+                    # Clean up temporary table
+                    try:
+                        cursor.execute("DROP TABLE IF EXISTS " + temp_table_name)
+                        self.sqlite_conn.commit()
+                    except:
+                        pass
+                    raise
             
-            # 写入 SQLite 数据库
-            self.logger.info("写入 TR_Report_Deduplication 表...")
-            grouped.to_sql('TR_Report_Deduplication', self.sqlite_conn, if_exists='replace', index=False)
-            self.sqlite_conn.commit()
+            try:
+                self.execute_with_retry(replace_table, max_retries=15, retry_delay=5)
+                self.logger.info("[OK] Updated using table renaming strategy TR_Report_Deduplication table (no need to stop backend service)")
+            except Exception as e:
+                self.logger.error(f"[ERROR] Cannot update table: {e}")
+                raise
             
-            # 验证数据
+            # Verify data
             verify_count = pd.read_sql("SELECT COUNT(*) as cnt FROM TR_Report_Deduplication", self.sqlite_conn).iloc[0]['cnt']
-            self.logger.info(f"✅ TR_Report_Deduplication 表创建成功: {verify_count:,} 条记录")
+            self.logger.info(f"[OK] TR_Report_Deduplication table created successfully: {verify_count:,} records")
             
-            # 显示统计信息
+            # Display statistics
             stats = pd.read_sql("""
                 SELECT 
                     MIN(Del_Date) as earliest_date,
@@ -864,56 +1132,56 @@ class AutoUpdater:
             """, self.sqlite_conn).iloc[0]
             
             self.logger.info("=" * 60)
-            self.logger.info("表统计信息:")
-            self.logger.info(f"  最早日期: {stats['earliest_date']}")
-            self.logger.info(f"  最晚日期: {stats['latest_date']}")
-            self.logger.info(f"  唯一订单数: {stats['unique_orders']:,}")
-            self.logger.info(f"  唯一工地数: {stats['unique_jobsites']:,}")
-            self.logger.info(f"  总重量: {stats['total_weight']:.2f} 吨")
-            self.logger.info(f"  工地类型数: {stats['unique_jobsite_types']}")
+            self.logger.info("Table statistics:")
+            self.logger.info(f"  Earliest date: {stats['earliest_date']}")
+            self.logger.info(f"  Latest date: {stats['latest_date']}")
+            self.logger.info(f"  Unique orders: {stats['unique_orders']:,}")
+            self.logger.info(f"  Unique jobsites: {stats['unique_jobsites']:,}")
+            self.logger.info(f"  Total weight: {stats['total_weight']:.2f} tons")
+            self.logger.info(f"  Jobsite types: {stats['unique_jobsite_types']}")
             self.logger.info("=" * 60)
             
             self.update_results['TR_Report_Deduplication'] = {'status': 'success', 'count': verify_count}
             return True
             
         except Exception as e:
-            self.logger.error(f"❌ 创建 TR_Report_Deduplication 表失败: {e}")
+            self.logger.error(f"[ERROR] Failed to create TR_Report_Deduplication table: {e}")
             import traceback
             self.logger.error(traceback.format_exc())
             self.update_results['TR_Report_Deduplication'] = {'status': 'failed', 'error': str(e)}
             return False
     
-    # ========== 更新文件索引缓存 ==========
+    # ========== Update file index cache ==========
     def update_file_index(self):
-        """更新文件索引缓存"""
+        """Update file index cache"""
         try:
             self.logger.info("=" * 60)
-            self.logger.info("步骤: 更新文件索引缓存")
+            self.logger.info("Step: Update file index cache")
             self.logger.info("=" * 60)
             
-            # 尝试导入文件索引更新器
+            # Try to import file index updater
             try:
                 from file_index_updater import FileIndexUpdater
             except ImportError as e:
-                self.logger.warning(f"⚠️ 无法导入文件索引更新器: {e}")
-                self.logger.warning("跳过文件索引更新")
-                self.update_results['file_index'] = {'status': 'skipped', 'reason': '模块导入失败'}
+                self.logger.warning(f"[WARNING] Cannot import file index updater: {e}")
+                self.logger.warning("Skipping file index update")
+                self.update_results['file_index'] = {'status': 'skipped', 'reason': 'Module import failed'}
                 return False
             
-            # 获取数据库路径
+            # Get database path
             db_path = SQLITE_DB_PATH
             
-            # 获取基础文件夹路径（从环境变量或使用默认值）
+            # Get base folder path (from environment variable or use default)
             base_folder = os.getenv('STOCKIST_TEST_FOLDER', r'D:\Stockist&Test Report')
             
-            # 检查文件夹是否存在
+            # Check if folder exists
             if not os.path.exists(base_folder):
-                self.logger.warning(f"⚠️ 文件夹不存在: {base_folder}")
-                self.logger.warning("跳过文件索引更新")
-                self.update_results['file_index'] = {'status': 'skipped', 'reason': f'文件夹不存在: {base_folder}'}
+                self.logger.warning(f"[WARNING] Folder does not exist: {base_folder}")
+                self.logger.warning("Skipping file index update")
+                self.update_results['file_index'] = {'status': 'skipped', 'reason': f'Folder does not exist: {base_folder}'}
                 return False
             
-            # 创建更新器并执行更新
+            # Create updater and execute update
             updater = FileIndexUpdater(db_path, base_folder)
             result = updater.update_index()
             
@@ -929,28 +1197,28 @@ class AutoUpdater:
                     'count': stats['files_checked'],
                     'stats': stats
                 }
-                self.logger.info("✅ 文件索引缓存更新成功")
-                self.logger.info(f"  新增: {stats['files_added']}, 更新: {stats['files_updated']}, 删除: {stats['files_deleted']}, 检查: {stats['files_checked']}")
+                self.logger.info("[OK] File index cache update successful")
+                self.logger.info(f"  Added: {stats['files_added']}, Updated: {stats['files_updated']}, Deleted: {stats['files_deleted']}, Checked: {stats['files_checked']}")
                 return True
             else:
-                error_msg = result.get('error', '未知错误')
+                error_msg = result.get('error', 'Unknown error')
                 self.update_results['file_index'] = {'status': 'failed', 'error': error_msg}
-                self.logger.error(f"❌ 文件索引缓存更新失败: {error_msg}")
+                self.logger.error(f"[ERROR] File index cache update failed: {error_msg}")
                 return False
             
         except Exception as e:
-            self.logger.error(f"❌ 文件索引更新异常: {e}")
+            self.logger.error(f"[ERROR] File index update exception: {e}")
             import traceback
             self.logger.error(traceback.format_exc())
             self.update_results['file_index'] = {'status': 'failed', 'error': str(e)}
             return False
     
-    # ========== 创建 bbs_dd 表 ==========
+    # ========== Create bbs_dd table ==========
     def get_bbs_dd_table_structure(self):
-        """获取bbs_dd表的结构，用于判断日期字段"""
+        """Get bbs_dd table structure to determine date fields"""
         try:
             with self.engine.connect() as conn:
-                # 查询表结构
+                # Query table structure
                 query = text("""
                     SELECT COLUMN_NAME, DATA_TYPE 
                     FROM INFORMATION_SCHEMA.COLUMNS 
@@ -960,7 +1228,7 @@ class AutoUpdater:
                 result = conn.execute(query)
                 columns = result.fetchall()
                 
-                self.logger.info("bbs_dd 表结构:")
+                self.logger.info("bbs_dd table structure:")
                 date_columns = []
                 for col in columns:
                     col_name, col_type = col
@@ -970,26 +1238,26 @@ class AutoUpdater:
                 
                 return date_columns
         except Exception as e:
-            self.logger.warning(f"无法获取bbs_dd表结构: {e}")
+            self.logger.warning(f"Cannot get bbs_dd table structure: {e}")
             return []
     
     def create_bbs_dd_table(self):
-        """创建 bbs_dd 表 - 从 SQL Server 查询近3年的数据"""
+        """Create bbs_dd table - Query last 3 years of data from SQL Server"""
         try:
             self.logger.info("=" * 60)
-            self.logger.info("开始创建 bbs_dd 表")
+            self.logger.info("Start creating bbs_dd table")
             self.logger.info("=" * 60)
             
-            # 先获取表结构，查找日期字段
+            # First get table structure, find date fields
             date_columns = self.get_bbs_dd_table_structure()
             
             with self.engine.connect() as conn:
-                # 构建查询SQL
-                # 如果有日期字段，添加近3年的筛选条件
+                # Build query SQL
+                # If there are date fields, add last 3 years filter condition
                 if date_columns:
-                    # 使用第一个日期字段作为筛选条件
+                    # Use first date field as filter condition
                     date_column = date_columns[0]
-                    self.logger.info(f"使用日期字段 '{date_column}' 进行筛选")
+                    self.logger.info(f"Using date field '{date_column}' for filtering")
                     
                     count_sql = text(f"""
                         SELECT COUNT(*) as record_count
@@ -1003,53 +1271,107 @@ class AutoUpdater:
                         WHERE {date_column} >= DATEADD(MONTH, -36, GETDATE())
                     """)
                 else:
-                    # 如果没有日期字段，查询所有数据
-                    self.logger.warning("未找到日期字段，将查询所有数据")
+                    # If no date field, query all data
+                    self.logger.warning("No date field found, will query all data")
                     count_sql = text("SELECT COUNT(*) as record_count FROM bbs_dd")
                     query_sql = text("SELECT * FROM bbs_dd")
                 
-                # 先测试查询，获取数据量
-                self.logger.info("查询数据...")
+                # First test query to get data count
+                self.logger.info("Querying data...")
                 result = conn.execute(count_sql)
                 count = result.fetchone()[0]
-                self.logger.info(f"找到 {count:,} 条记录")
+                self.logger.info(f"Found {count:,} records")
                 
                 if count == 0:
-                    self.logger.warning("⚠️ 没有数据，表将为空")
+                    self.logger.warning("[WARNING] No data, table will be empty")
                 
-                # 查询数据
-                self.logger.info("从 SQL Server 获取数据...")
-                df = pd.read_sql(query_sql, conn)
-                self.logger.info(f"获取了 {len(df):,} 条记录")
+                # Query data
+                self.logger.info("Fetching data from SQL Server...")
+                self.logger.info(f"[WARNING]  Note: Fetching {count:,} records, this may take several minutes, please wait...")
+                self.logger.info("[WARNING]  If network is slow or data volume is large, may take 5-15 minutes")
+                
+                # Use chunksize to read in batches, avoid memory issues (if data volume is large)
+                try:
+                    # Try to read in chunks
+                    chunk_size = 50000  # Read 50,000 records each time
+                    chunks = []
+                    total_read = 0
+                    
+                    for chunk_df in pd.read_sql(query_sql, conn, chunksize=chunk_size):
+                        chunks.append(chunk_df)
+                        total_read += len(chunk_df)
+                        if total_read % 100000 == 0:  # Output progress every 100,000 records
+                            self.logger.info(f"   Read: {total_read:,} / {count:,} records ({total_read*100//count}%)")
+                    
+                    # Merge all chunks
+                    df = pd.concat(chunks, ignore_index=True)
+                    self.logger.info(f"[OK] Retrieved {len(df):,} records (completed)")
+                except Exception as chunk_error:
+                    # If batch read fails, fall back to one-time read
+                    self.logger.warning(f"Batch read failed, using one-time read: {chunk_error}")
+                    df = pd.read_sql(query_sql, conn)
+                    self.logger.info(f"[OK] Retrieved {len(df):,} records")
                 
                 if len(df) == 0:
-                    self.logger.warning("⚠️ 没有获取到数据")
+                    self.logger.warning("[WARNING] No data retrieved")
                     self.update_results['bbs_dd'] = {'status': 'warning', 'count': 0}
                     return False
                 
-                # 连接到 SQLite
+                # Connect to SQLite
                 if not self.sqlite_conn:
                     self.create_sqlite_connection()
                 
-                # 如果表已存在，删除它
-                cursor = self.sqlite_conn.cursor()
-                cursor.execute("DROP TABLE IF EXISTS bbs_dd")
-                self.sqlite_conn.commit()
-                self.logger.info("已删除旧的 bbs_dd 表（如果存在）")
+                # Use table renaming strategy to update table (avoid DROP TABLE requiring exclusive lock, no need to stop backend service)
+                # Key: Create new table and write data first (no lock needed), then complete table swap in shortest transaction
+                def replace_table():
+                    cursor = self.sqlite_conn.cursor()
+                    
+                    # Step 1-2: Create new table and write data (no need to lock old table, can proceed concurrently)
+                    temp_table_name = "bbs_dd_new"
+                    cursor.execute("DROP TABLE IF EXISTS " + temp_table_name)
+                    self.sqlite_conn.commit()  # Commit first, release lock
+                    
+                    # Write data to new table (this process does not need to lock old table)
+                    df.to_sql(temp_table_name, self.sqlite_conn, if_exists='replace', index=False)
+                    self.sqlite_conn.commit()  # Commit, release lock
+                    
+                    # Step 3-4: Complete table swap in shortest transaction (lock needed here)
+                    # Use BEGIN IMMEDIATE to quickly acquire lock, then immediately execute delete and rename
+                    cursor.execute("BEGIN IMMEDIATE")
+                    try:
+                        # Delete old table (requires EXCLUSIVE lock, but time is short)
+                        cursor.execute("DROP TABLE IF EXISTS bbs_dd")
+                        
+                        # Rename new table (atomic operation, almost instant)
+                        cursor.execute(f"ALTER TABLE {temp_table_name} RENAME TO bbs_dd")
+                        
+                        self.sqlite_conn.commit()
+                        return True
+                    except sqlite3.OperationalError as e:
+                        self.sqlite_conn.rollback()
+                        # Clean up temporary table
+                        try:
+                            cursor.execute("DROP TABLE IF EXISTS " + temp_table_name)
+                            self.sqlite_conn.commit()
+                        except:
+                            pass
+                        raise
                 
-                # 将数据写入 SQLite
-                self.logger.info("写入数据到 SQLite...")
-                df.to_sql('bbs_dd', self.sqlite_conn, if_exists='replace', index=False)
-                self.sqlite_conn.commit()
+                try:
+                    self.execute_with_retry(replace_table, max_retries=15, retry_delay=5)
+                    self.logger.info("[OK] Updated using table renaming strategy bbs_dd table (no need to stop backend service)")
+                except Exception as e:
+                    self.logger.error(f"[ERROR] Cannot update table: {e}")
+                    raise
                 
-                # 验证
+                # Verify
                 verify_count = pd.read_sql("SELECT COUNT(*) as cnt FROM bbs_dd", self.sqlite_conn).iloc[0]['cnt']
-                self.logger.info(f"✅ bbs_dd 表创建成功: {verify_count:,} 条记录")
+                self.logger.info(f"[OK] bbs_dd table created successfully: {verify_count:,} records")
                 
-                # 显示表信息
+                # Display table information
                 self.logger.info("=" * 60)
-                self.logger.info("表信息:")
-                self.logger.info(f"  总记录数: {verify_count:,}")
+                self.logger.info("Table information:")
+                self.logger.info(f"  Total records: {verify_count:,}")
                 if date_columns:
                     stats = pd.read_sql(f"""
                         SELECT 
@@ -1057,192 +1379,241 @@ class AutoUpdater:
                             MAX({date_columns[0]}) as latest_date
                         FROM bbs_dd
                     """, self.sqlite_conn).iloc[0]
-                    self.logger.info(f"  最早日期: {stats['earliest_date']}")
-                    self.logger.info(f"  最晚日期: {stats['latest_date']}")
+                    self.logger.info(f"  Earliest date: {stats['earliest_date']}")
+                    self.logger.info(f"  Latest date: {stats['latest_date']}")
                 self.logger.info("=" * 60)
                 
                 self.update_results['bbs_dd'] = {'status': 'success', 'count': verify_count}
                 return True
                 
         except Exception as e:
-            self.logger.error(f"❌ 创建 bbs_dd 表失败: {e}")
+            self.logger.error(f"[ERROR] Failed to create bbs_dd table: {e}")
             import traceback
             self.logger.error(traceback.format_exc())
             self.update_results['bbs_dd'] = {'status': 'failed', 'error': str(e)}
             return False
     
     def send_notification(self, success, message):
-        """发送通知邮件（可选）
-        支持多个收件人：在to_email中使用逗号分隔多个邮箱地址
-        例如：'email1@company.com,email2@company.com' 或 ['email1@company.com', 'email2@company.com']
+        """Send notification email (optional)
+        Supports multiple recipients: Use comma to separate multiple email addresses in to_email
+        Example: 'email1@company.com,email2@company.com' or ['email1@company.com', 'email2@company.com']
         """
         if not EMAIL_CONFIG['username'] or EMAIL_CONFIG['username'] == '':
             return
         
-        # 处理多个收件人
+        # Handle multiple recipients
         to_email = EMAIL_CONFIG['to_email']
         if isinstance(to_email, str):
-            # 如果是字符串，按逗号分隔并去除空格
+            # If string, split by comma and strip spaces
             recipients = [email.strip() for email in to_email.split(',') if email.strip()]
         elif isinstance(to_email, list):
-            # 如果是列表，直接使用
+            # If list, use directly
             recipients = [email.strip() for email in to_email if email.strip()]
         else:
-            self.logger.error("❌ to_email配置格式错误，应为字符串或列表")
+            self.logger.error("[ERROR] to_email configuration format error, should be string or list")
             return
         
         if not recipients:
-            self.logger.warning("⚠️ 没有有效的收件人邮箱地址")
+            self.logger.warning("[WARNING] No valid recipient email addresses")
             return
         
         try:
             msg = MIMEMultipart()
             msg['From'] = EMAIL_CONFIG['username']
-            # 多个收件人用逗号分隔显示在邮件头
+            # Multiple recipients separated by comma in email header
             msg['To'] = ', '.join(recipients)
-            msg['Subject'] = f"TR数据库自动更新{'成功' if success else '失败'}"
+            msg['Subject'] = f"TR Database Auto Update {'Success' if success else 'Failed'}"
             
             body = f"""
-TR数据库自动更新报告
-时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-状态: {'成功' if success else '失败'}
-详情: {message}
+TR Database Auto Update Report
+Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+Status: {'Success' if success else 'Failed'}
+Details: {message}
             
-更新结果:
+Update Results:
 {chr(10).join([f"- {k}: {v}" for k, v in self.update_results.items()])}
             """
             
             msg.attach(MIMEText(body, 'plain'))
             
             server = smtplib.SMTP(EMAIL_CONFIG['smtp_server'], EMAIL_CONFIG['smtp_port'])
-            # 尝试登录（如果服务器支持认证）
-            # 如果不支持认证，会跳过登录，直接发送（适用于内网匿名SMTP服务器）
+            # Try to login (if server supports authentication)
+            # If authentication is not supported, skip login and send directly (for internal anonymous SMTP servers)
             try:
                 if EMAIL_CONFIG.get('password') and EMAIL_CONFIG['password'] != '':
                     server.login(EMAIL_CONFIG['username'], EMAIL_CONFIG['password'])
             except smtplib.SMTPAuthenticationError:
-                # 如果认证失败，尝试匿名发送（某些内网服务器允许）
-                self.logger.warning("⚠️ SMTP认证失败，尝试匿名发送...")
+                # If authentication fails, try anonymous send (some internal servers allow)
+                self.logger.warning("[WARNING] SMTP authentication failed, trying anonymous send...")
             except smtplib.SMTPException as e:
-                # 如果服务器不支持认证，跳过登录
+                # If server does not support authentication, skip login
                 if 'not supported' in str(e).lower() or 'AUTH' in str(e):
-                    self.logger.info("ℹ️ 服务器不支持SMTP认证，使用匿名发送...")
+                    self.logger.info("Server does not support SMTP authentication, using anonymous send...")
                 else:
                     raise
             
-            # 发送给所有收件人
+            # Send to all recipients
             server.send_message(msg, to_addrs=recipients)
             server.quit()
             
-            self.logger.info(f"✅ 通知邮件发送成功，已发送给 {len(recipients)} 个收件人: {', '.join(recipients)}")
+            self.logger.info(f"[OK] Notification email sent successfully, sent to {len(recipients)} recipients: {', '.join(recipients)}")
         except Exception as e:
-            self.logger.error(f"❌ 发送通知邮件失败: {e}")
+            self.logger.error(f"[ERROR] Failed to send notification email: {e}")
+    
+    def check_backend_service(self):
+        """Check backend service status"""
+        try:
+            import subprocess
+            if sys.platform == 'win32':
+                # Windows: Use sc query command
+                result = subprocess.run(
+                    ['sc', 'query', 'TR-Backend'],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if 'RUNNING' in result.stdout:
+                    return True, 'running'
+                elif 'STOPPED' in result.stdout:
+                    return False, 'stopped'
+                else:
+                    return None, 'unknown'
+            else:
+                # Linux/Mac: Use systemctl
+                result = subprocess.run(
+                    ['systemctl', 'is-active', 'TR-Backend'],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if result.returncode == 0:
+                    return True, 'running'
+                else:
+                    return False, 'stopped'
+        except Exception as e:
+            self.logger.warning(f"Cannot check backend service status: {e}")
+            return None, 'unknown'
     
     def run_update(self):
-        """执行更新流程 - 更新 bbs_dd、TR_Report、TR_Report_Deduplication 和文件索引"""
+        """Execute update process - Update bbs_dd, TR_Report, TR_Report_Deduplication and file index"""
         start_time = datetime.now()
         self.logger.info("=" * 80)
-        self.logger.info("开始 bbs_dd、TR_Report、TR_Report_Deduplication 和文件索引自动更新流程")
-        self.logger.info(f"开始时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        self.logger.info("Start bbs_dd, TR_Report, TR_Report_Deduplication and file index auto update process")
+        self.logger.info(f"Start time: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
         self.logger.info("=" * 80)
         
+        # Check backend service status
+        service_running, service_status = self.check_backend_service()
+        if service_running:
+            self.logger.warning("=" * 80)
+            self.logger.warning("[WARNING] Warning: Backend service (TR-Backend) is running")
+            self.logger.warning("[WARNING]  This may cause database update to fail (read-only error)")
+            self.logger.warning("[WARNING]  Suggestion:")
+            self.logger.warning("[WARNING]    1. Temporarily stop backend service: Stop-Service TR-Backend")
+            self.logger.warning("[WARNING]    2. Run update script")
+            self.logger.warning("[WARNING]    3. Restart after update completes: Start-Service TR-Backend")
+            self.logger.warning("[WARNING]  Or wait for system to automatically retry (may take a long time)")
+            self.logger.warning("=" * 80)
+        elif service_running is False:
+            self.logger.info("[OK] Backend service (TR-Backend) is stopped, can safely update database")
+        
         success_count = 0
-        total_tasks = 4  # 增加了文件索引更新
+        total_tasks = 4  # Added file index update
         
         try:
-            # 1. 连接数据库
+            # 1. Connect to database
             if not self.create_database_connection():
-                raise Exception("无法连接源数据库")
+                raise Exception("Cannot connect to source database")
             
             if not self.create_sqlite_connection():
-                raise Exception("无法连接SQLite数据库")
+                raise Exception("Cannot connect to SQLite database")
             
-            # 2. 创建 bbs_dd 表
+            # 2. Create bbs_dd table
             if self.create_bbs_dd_table():
                 success_count += 1
             
-            # 3. 创建 TR_Report 表
+            # 3. Create TR_Report table
             if self.create_tr_report_table():
                 success_count += 1
             
-            # 4. 创建 TR_Report_Deduplication 表
+            # 4. Create TR_Report_Deduplication table
             if self.create_tr_report_deduplication():
                 success_count += 1
             
-            # 5. 更新文件索引缓存
+            # 5. Update file index cache
             if self.update_file_index():
                 success_count += 1
             
-            # 4. 计算执行时间
+            # 4. Calculate execution time
             end_time = datetime.now()
             duration = end_time - start_time
             
-            # 5. 记录结果
+            # 5. Record results
             if success_count == total_tasks:
-                message = f"所有数据更新成功，执行时间: {duration}"
-                self.logger.info("🎉 " + message)
+                message = f"All data update successful, execution time: {duration}"
+                self.logger.info("[SUCCESS] " + message)
                 self.send_notification(True, message)
             else:
-                message = f"部分数据更新失败: {success_count}/{total_tasks}，执行时间: {duration}"
-                self.logger.error(f"❌ {message}")
-                self.logger.error("更新结果详情:")
+                message = f"Partial data update failed: {success_count}/{total_tasks}, execution time: {duration}"
+                self.logger.error(f"[ERROR] {message}")
+                self.logger.error("Update result details:")
                 for table, result in self.update_results.items():
                     self.logger.error(f"  {table}: {result}")
                 self.send_notification(False, message)
             
         except Exception as e:
-            self.logger.error(f"❌ 更新流程失败: {e}")
+            self.logger.error(f"[ERROR] Update process failed: {e}")
             import traceback
             self.logger.error(traceback.format_exc())
-            self.send_notification(False, f"更新流程失败: {str(e)}")
+            self.send_notification(False, f"Update process failed: {str(e)}")
         
         finally:
-            # 关闭连接
+            # Close connection
             if self.engine:
                 self.engine.dispose()
             if self.sqlite_conn:
                 self.sqlite_conn.close()
             
             self.logger.info("=" * 80)
-            self.logger.info("bbs_dd、TR_Report、TR_Report_Deduplication 和文件索引自动更新流程结束")
-            self.logger.info(f"结束时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            self.logger.info("bbs_dd、TR_Report、TR_Report_Deduplication and file index auto update process ended")
+            self.logger.info(f"End time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             self.logger.info("=" * 80)
 
 def main():
-    """主函数"""
+    """Main function"""
     error_log = None
     error_log_path = None
     try:
-        # 尝试创建日志目录（如果尚未创建）
+        # Try to create log directory (if not already created)
         log_dir = os.path.join(os.path.dirname(__file__), 'logs')
         if not os.path.exists(log_dir):
             try:
                 os.makedirs(log_dir)
             except Exception as e:
-                print(f"警告: 无法创建日志目录 {log_dir}: {e}")
+                print(f"Warning: Cannot create log directory {log_dir}: {e}")
         
-        # 创建简单的日志文件用于捕获导入错误
+        # Create simple log file to capture Import error
         try:
             error_log_path = os.path.join(log_dir, f'error_log_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
             error_log = open(error_log_path, 'w', encoding='utf-8')
-            error_log.write(f"脚本启动时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            error_log.write(f"Python版本: {sys.version}\n")
-            error_log.write(f"工作目录: {os.getcwd()}\n")
-            error_log.write(f"脚本路径: {os.path.abspath(__file__)}\n")
+            error_log.write(f"Script start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            error_log.write(f"Python version: {sys.version}\n")
+            error_log.write(f"Working directory: {os.getcwd()}\n")
+            error_log.write(f"Script path: {os.path.abspath(__file__)}\n")
             error_log.write("=" * 80 + "\n")
             error_log.flush()
         except Exception as e:
-            print(f"警告: 无法创建错误日志文件: {e}")
+            print(f"Warning: Cannot create error log file: {e}")
             error_log = None
         
         try:
             updater = AutoUpdater()
             updater.run_update()
             if error_log:
-                error_log.write("脚本执行完成\n")
+                error_log.write("Script execution completed\n")
                 error_log.flush()
         except Exception as e:
-            error_msg = f"执行过程中发生错误: {str(e)}\n"
+            error_msg = f"Error occurred during execution: {str(e)}\n"
             import traceback
             traceback_str = traceback.format_exc()
             if error_log:
@@ -1254,10 +1625,10 @@ def main():
             sys.exit(1)
             
     except ImportError as e:
-        # 处理导入错误（在导入阶段就失败了）
-        error_msg = f"导入错误: {str(e)}\n"
-        error_msg += f"请确保已安装所有必需的依赖包: pandas, sqlalchemy, pyodbc, numpy\n"
-        error_msg += f"安装命令: pip install pandas sqlalchemy pyodbc numpy\n"
+        # Handle Import error (failed during import phase)
+        error_msg = f"Import error: {str(e)}\n"
+        error_msg += f"Please ensure all required dependencies are installed: pandas, sqlalchemy, pyodbc, numpy\n"
+        error_msg += f"Install command: pip install pandas sqlalchemy pyodbc numpy\n"
         import traceback
         traceback_str = traceback.format_exc()
         
@@ -1270,7 +1641,7 @@ def main():
             except:
                 pass
         else:
-            # 如果error_log不存在，尝试创建一个简单的日志文件
+            # If error_log does not exist, try to create a simple log file
             try:
                 log_dir = os.path.join(os.path.dirname(__file__), 'logs')
                 if not os.path.exists(log_dir):
@@ -1286,8 +1657,8 @@ def main():
         print(traceback_str)
         sys.exit(1)
     except Exception as e:
-        # 处理其他所有错误
-        error_msg = f"脚本执行失败: {str(e)}\n"
+        # Handle all other errors
+        error_msg = f"Script execution failed: {str(e)}\n"
         import traceback
         traceback_str = traceback.format_exc()
         error_msg_full = error_msg + traceback_str
@@ -1299,7 +1670,7 @@ def main():
             except:
                 pass
         else:
-            # 如果error_log不存在，尝试创建一个简单的日志文件
+            # If error_log does not exist, try to create a simple log file
             try:
                 log_dir = os.path.join(os.path.dirname(__file__), 'logs')
                 if not os.path.exists(log_dir):

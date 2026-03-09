@@ -1,0 +1,11 @@
+﻿root=D:\Stockist&Test Report\Stockist Cert
+scanned_target=262
+renamed=0
+skip_no_stockist=0
+skip_no_dn=261
+skip_ambiguous=0
+skip_no_date=0
+skip_conflict=1
+skip_same=0
+errors=0
+report=C:\TR-master\TR UI\rename_stockist_ocr_report_20260303_120338.csv

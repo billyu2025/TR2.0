@@ -49,7 +49,7 @@ createApp({
             
             if (!userInfoStr) {
                 // 如果没有登录信息，跳转到登录页面
-                alert('请先登录！');
+                alert('請先登入！');
                 window.location.href = 'login.html';
                 return;
             }
@@ -65,7 +65,7 @@ createApp({
 
         handleLogout() {
             // 确认退出
-            if (confirm('确定要退出登录吗？')) {
+            if (confirm('確定要退出登入嗎？')) {
                 // 清除登录信息
                 sessionStorage.removeItem('userInfo');
                 

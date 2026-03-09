@@ -20,6 +20,58 @@ function buildApiUrl(path) {
     return `${apiBaseUrl}${finalPath}`;
 }
 
+// 带超时的 fetch 包装函数
+async function fetchWithTimeout(url, options = {}, timeout = 300000) { // 5分钟超时
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
+    
+    try {
+        // 合并 signal（如果已有 AbortController）
+        const mergedOptions = { ...options };
+        if (options.signal) {
+            // 如果已有 signal，创建一个组合的 AbortController
+            const combinedController = new AbortController();
+            options.signal.addEventListener('abort', () => combinedController.abort());
+            controller.signal.addEventListener('abort', () => combinedController.abort());
+            mergedOptions.signal = combinedController.signal;
+        } else {
+            mergedOptions.signal = controller.signal;
+        }
+        
+        const response = await fetch(url, mergedOptions);
+        clearTimeout(timeoutId);
+        return response;
+    } catch (error) {
+        clearTimeout(timeoutId);
+        if (error.name === 'AbortError' && !options.signal?.aborted) {
+            throw new Error('请求超时，请检查网络连接');
+        }
+        throw error;
+    }
+}
+
+// 带重试的 fetch 包装函数
+async function fetchWithRetry(url, options = {}, maxRetries = 3, retryDelay = 1000) {
+    let lastError;
+    for (let i = 0; i < maxRetries; i++) {
+        try {
+            return await fetchWithTimeout(url, options);
+        } catch (error) {
+            lastError = error;
+            // 如果是用户取消，不重试
+            if (error.name === 'AbortError' && options.signal?.aborted) {
+                throw error;
+            }
+            if (i < maxRetries - 1) {
+                console.log(`[重试] 请求失败，${retryDelay}ms 后重试 (${i + 1}/${maxRetries})...`, error.message);
+                await new Promise(resolve => setTimeout(resolve, retryDelay));
+                retryDelay *= 2; // 指数退避
+            }
+        }
+    }
+    throw lastError;
+}
+
 async function apiFetch(path, options = {}) {
     const authInfo = getAuthInfo();
     const headers = Object.assign({}, options.headers || {});
@@ -29,18 +81,47 @@ async function apiFetch(path, options = {}) {
     if (options.body && !headers['Content-Type']) {
         headers['Content-Type'] = 'application/json';
     }
-    const response = await fetch(buildApiUrl(path), { ...options, headers });
+    
+    // 使用带超时和重试的 fetch
+    const response = await fetchWithRetry(
+        buildApiUrl(path), 
+        { ...options, headers },
+        300000, // 5分钟超时
+        3,      // 最多重试3次
+        2000    // 初始重试延迟2秒
+    );
+    
+    const result = await response.json().catch(() => ({}));
     if (response.status === 401) {
         sessionStorage.removeItem('authInfo');
         sessionStorage.removeItem('userSettings');
         window.location.href = 'login.html';
-        throw new Error('登入狀態已過期，請重新登入');
+        throw new Error(`${result.error || '登录状态已失效'}，请重新登录`);
     }
-    const result = await response.json().catch(() => ({}));
     if (!response.ok || result.success === false) {
         throw new Error(result.error || `请求失败（${response.status}）`);
     }
     return result;
+}
+
+async function buildHttpError(response, fallbackPrefix = '请求失败') {
+    let errorMessage = `${fallbackPrefix}（HTTP ${response.status}）`;
+    try {
+        const result = await response.json();
+        if (result && result.error) {
+            errorMessage = result.error;
+        }
+    } catch (e) {
+        // Keep fallback message when response is not JSON
+    }
+
+    if (response.status === 401) {
+        sessionStorage.removeItem('authInfo');
+        sessionStorage.removeItem('userSettings');
+        window.location.href = 'login.html';
+        return new Error(`${errorMessage}，请重新登录`);
+    }
+    return new Error(errorMessage);
 }
 
 const { createApp } = Vue;
@@ -56,7 +137,7 @@ createApp({
                 role: '',
                 jobNos: []
             },
-            defaultPageSize: 10,
+            defaultPageSize: 100,
             showSettings: false,
             userSettings: {
                 avatar: 'default',
@@ -83,7 +164,7 @@ createApp({
             records: [],
             filteredRecords: [],
             currentPage: 1,
-            pageSize: 10,
+            pageSize: 100,
             totalPagesComputed: 1,
             selectedRecords: {
                 records: [],      // TR记录管理Tab的选择
@@ -181,6 +262,40 @@ createApp({
         }
     },
     async mounted() {
+        // 页面重新进入时，先清理可能残留的更新状态和轮询
+        if (this.updateCheckInterval) {
+            clearInterval(this.updateCheckInterval);
+            this.updateCheckInterval = null;
+        }
+        this.updateDataLoading = false;
+        this.showUpdateModal = false;
+        this.updateDataStatus = 'running';
+        this.updateDataMessage = '';
+
+        // 添加全局错误处理
+        window.addEventListener('error', (event) => {
+            console.error('[全局错误]', event.error);
+            // 如果是下载相关的错误，显示友好提示
+            if (event.error && event.error.message && 
+                (event.error.message.includes('下载') || 
+                 event.error.message.includes('网络') || 
+                 event.error.message.includes('超时'))) {
+                // 不在这里显示 alert，避免重复提示
+                console.error('下载相关错误:', event.error.message);
+            }
+        });
+
+        // 未处理的 Promise 拒绝
+        window.addEventListener('unhandledrejection', (event) => {
+            console.error('[未处理的 Promise 拒绝]', event.reason);
+            if (event.reason && event.reason.message && 
+                (event.reason.message.includes('下载') || 
+                 event.reason.message.includes('网络') || 
+                 event.reason.message.includes('超时'))) {
+                console.error('下载相关错误:', event.reason.message);
+            }
+        });
+
         // 确保默认显示 TR记录管理，不显示设置弹窗
         this.activeSubTab = 'records';
         this.showSettings = false;
@@ -226,8 +341,8 @@ createApp({
                 role: user.role,
                 jobNos: user.job_nos || []
             };
-            // admin和manager显示100条，user显示10条
-            this.defaultPageSize = (this.userInfo.role === 'admin' || this.userInfo.role === 'manager') ? 100 : 10;
+            // 所有用户统一显示100条
+            this.defaultPageSize = 100;
             this.pageSize = this.defaultPageSize;
             sessionStorage.setItem('authInfo', JSON.stringify({
                 token: authInfo.token,
@@ -265,21 +380,14 @@ createApp({
                 const jobNoTrim = (this.searchQuery.jobNo || '').trim();
                 const dnNoTrim = (this.searchQuery.dnNo || '').trim();
                 const hasDate = !!(this.searchQuery.startDate || this.searchQuery.endDate);
-                // 根据当前Tab决定使用哪个搜索字段
-                const useDnNoSearch = this.activeSubTab === 'stocklist-test';
-                const searchValue = useDnNoSearch ? dnNoTrim : jobNoTrim;
-                const hasCondition = orderNoTrim || searchValue || hasDate;
+                // Stocklist&Test Report 标签页支持 Order No、Job No、DD_No 和日期搜索
+                // TR记录管理标签页支持 Order No、Job No 和日期搜索
+                const hasCondition = orderNoTrim || jobNoTrim || dnNoTrim || hasDate;
 
                 this.isSearching = hasCondition;
 
-                let perPageParam;
-                if (hasCondition) {
-                    const shortQuery = (!searchValue && !hasDate && orderNoTrim.length === 1) ||
-                                       (!orderNoTrim && !hasDate && searchValue.length === 1);
-                    perPageParam = shortQuery ? 200 : 'all';
-                } else {
-                    perPageParam = 1000;
-                }
+                // 日期搜索或Job No搜索时，每页记录上限设置为200；其他情况为100
+                const perPageParam = (hasDate || jobNoTrim) ? 200 : 100;
 
                 const params = new URLSearchParams({
                     page: '1',
@@ -292,11 +400,8 @@ createApp({
                     params.set('tab', 'records');
                 }
                 if (orderNoTrim) params.set('order_no', orderNoTrim);
-                if (useDnNoSearch && dnNoTrim) {
-                    params.set('dn_no', dnNoTrim);
-                } else if (!useDnNoSearch && jobNoTrim) {
-                    params.set('job_no', jobNoTrim);
-                }
+                if (jobNoTrim) params.set('job_no', jobNoTrim);
+                if (dnNoTrim) params.set('dn_no', dnNoTrim);
                 if (this.searchQuery.startDate) params.set('start_date', this.searchQuery.startDate);
                 if (this.searchQuery.endDate) params.set('end_date', this.searchQuery.endDate);
 
@@ -338,16 +443,10 @@ createApp({
 
                 const filtered = this.applyRoleFilter(this.records);
                 this.filteredRecords = filtered;
-                this.pageSize = hasCondition ? (filtered.length || this.defaultPageSize) : this.defaultPageSize;
-                // 如果有搜索条件，使用API返回的总页数；如果没有搜索条件，也使用API返回的总页数
-                // 注意：当per_page='all'时，API返回的total_pages可能不准确，需要基于实际返回的数据计算
-                if (hasCondition && perPageParam === 'all') {
-                    // 搜索时，如果返回所有数据，基于实际返回的记录数计算
-                    this.totalPagesComputed = 1; // 所有结果在一页显示
-                } else {
-                    // 使用API返回的总页数
-                    this.totalPagesComputed = result.pagination.total_pages || Math.max(Math.ceil(filtered.length / this.pageSize), 1);
-                }
+                // 日期搜索或Job No搜索时，每页记录上限设置为200；其他情况为100
+                this.pageSize = perPageParam;
+                // 使用API返回的总页数
+                this.totalPagesComputed = result.pagination.total_pages || Math.max(Math.ceil(filtered.length / this.pageSize), 1);
                 console.log('Search - API返回的分页信息:', {
                     hasCondition,
                     perPageParam,
@@ -361,6 +460,84 @@ createApp({
             } catch (error) {
                 console.error('搜索失败:', error);
                 alert(error.message || '搜索失败，请稍后重试');
+            } finally {
+                this.loading = false;
+            }
+        },
+
+        async loadSearchPage(page = 1) {
+            /** 加载搜索结果的指定页 */
+            this.loading = true;
+            try {
+                const orderNoTrim = (this.searchQuery.orderNo || '').trim();
+                const jobNoTrim = (this.searchQuery.jobNo || '').trim();
+                const dnNoTrim = (this.searchQuery.dnNo || '').trim();
+                const hasDate = !!(this.searchQuery.startDate || this.searchQuery.endDate);
+
+                // 日期搜索或Job No搜索时，每页记录上限设置为200；其他情况为100
+                const perPageParam = (hasDate || jobNoTrim) ? 200 : 100;
+
+                const params = new URLSearchParams({
+                    page: String(page),
+                    per_page: String(perPageParam)
+                });
+                // 根据当前Tab决定使用哪个数据源
+                if (this.activeSubTab === 'stocklist-test') {
+                    params.set('tab', 'stocklist-test');
+                } else {
+                    params.set('tab', 'records');
+                }
+                if (orderNoTrim) params.set('order_no', orderNoTrim);
+                if (jobNoTrim) params.set('job_no', jobNoTrim);
+                if (dnNoTrim) params.set('dn_no', dnNoTrim);
+                if (this.searchQuery.startDate) params.set('start_date', this.searchQuery.startDate);
+                if (this.searchQuery.endDate) params.set('end_date', this.searchQuery.endDate);
+
+                const result = await apiFetch(`/api/orders/list?${params.toString()}`);
+                
+                // 根据当前Tab使用不同的字段映射
+                if (this.activeSubTab === 'stocklist-test') {
+                    // Stocklist&Test Report 标签页：从 bbs_dd 表获取数据
+                    this.records = result.data.map(order => ({
+                        id: order.Order_No,
+                        orderNo: order.Order_No ? order.Order_No.toString() : '',
+                        orderDescription: order.Order_Description || '',
+                        jobNo: order.Job_No ? order.Job_No.toString() : '',
+                        jobsiteType: order.Jobsite_Type || '',
+                        rmDnNo: order.rm_dn_no || '',
+                        delDate: order.Del_Date || '',
+                        status: (order.pdf_status || '').toLowerCase() || 'pending',
+                        pdfPath: order.pdf_path || null,
+                        generatedAt: order.generated_at || null
+                    }));
+                } else {
+                    // TR记录管理标签页：从 TR_Report_Deduplication 表获取数据
+                    this.records = result.data.map(order => ({
+                        id: order.Order_No,
+                        orderNo: order.Order_No ? order.Order_No.toString() : '',
+                        orderDescription: order.Order_Description || '',
+                        jobNo: order.Job_No ? order.Job_No.toString() : '',
+                        client: order.Client || '',
+                        jobsite: order.Jobsite || '',
+                        jobsiteType: order.Jobsite_Type || '',
+                        delDate: order.Del_Date || '',
+                        wt: order.Wt || 0,
+                        rmDnNo: order.rm_dn_no || '',
+                        status: (order.pdf_status || '').toLowerCase() || 'pending',
+                        pdfPath: order.pdf_path || null,
+                        generatedAt: order.generated_at || null
+                    }));
+                }
+
+                const filtered = this.applyRoleFilter(this.records);
+                this.filteredRecords = filtered;
+                // 日期搜索或Job No搜索时，每页记录上限设置为200；其他情况为100
+                this.pageSize = perPageParam;
+                this.totalPagesComputed = result.pagination.total_pages || Math.max(Math.ceil(filtered.length / this.pageSize), 1);
+                this.currentPage = page;
+            } catch (error) {
+                console.error('加载搜索页失败:', error);
+                alert(error.message || '加载失败，请稍后重试');
             } finally {
                 this.loading = false;
             }
@@ -507,26 +684,120 @@ createApp({
                 // 显示生成中状态
                 record.status = 'generating';
                 
+                // 显示进度提示
+                const progressMsg = document.createElement('div');
+                progressMsg.id = 'single-pdf-progress';
+                progressMsg.style.cssText = 'position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.3); z-index: 10000; min-width: 300px; text-align: center;';
+                progressMsg.innerHTML = `
+                    <h4>正在生成PDF...</h4>
+                    <p>Order: ${record.orderNo}</p>
+                    <div style="margin: 10px 0;">
+                        <div style="width: 100%; height: 20px; background: #f0f0f0; border-radius: 10px; overflow: hidden;">
+                            <div id="single-progress-bar" style="width: 0%; height: 100%; background: #4CAF50; transition: width 0.3s;"></div>
+                        </div>
+                    </div>
+                    <p id="single-progress-text" style="margin: 10px 0; color: #666;">提交任务中...</p>
+                `;
+                document.body.appendChild(progressMsg);
+                
+                const updateProgress = (progress, text) => {
+                    const bar = document.getElementById('single-progress-bar');
+                    const textEl = document.getElementById('single-progress-text');
+                    if (bar) bar.style.width = progress + '%';
+                    if (textEl) textEl.textContent = text;
+                };
+                
                 const result = await apiFetch('/api/pdf/generate', {
                     method: 'POST',
                     body: JSON.stringify({ order_no: record.orderNo })
                 });
                 
-                // 确保状态值是小写，与loadOrdersFromAPI和executeSearch保持一致
-                const newStatus = (result.pdf_status || 'generated').toLowerCase();
-                record.status = newStatus;
-                record.pdfPath = result.pdf_path || null;
+                if (!result.success || !result.task_id) {
+                    document.body.removeChild(progressMsg);
+                    throw new Error(result.error || '创建PDF生成任务失败');
+                }
                 
-                alert(`PDF生成成功！\nOrder: ${record.orderNo}\n保存位置: ${result.pdf_path || '未指定路径'}`);
+                const taskId = result.task_id;
+                updateProgress(10, '任务已提交，等待处理...');
                 
-                // 刷新数据以获取最新状态（从数据库读取）
-                if (this.isSearching) {
-                    await this.executeSearch();
-                } else {
-                    await this.loadOrdersFromAPI(this.currentPage);
+                // 轮询任务状态，直到完成或失败
+                const maxAttempts = 120; // 最多轮询120次（4分钟）
+                const pollInterval = 2000; // 每2秒轮询一次
+                let attempts = 0;
+                let taskCompleted = false;
+                
+                while (attempts < maxAttempts && !taskCompleted) {
+                    await new Promise(resolve => setTimeout(resolve, pollInterval));
+                    attempts++;
+                    
+                    try {
+                        const statusResult = await apiFetch(`/api/pdf/task-status/${taskId}`);
+                        
+                        if (statusResult.success) {
+                            const taskStatus = statusResult.status;
+                            const progress = statusResult.progress || 0;
+                            
+                            if (taskStatus === 'completed') {
+                                // 任务完成，更新状态
+                                updateProgress(100, 'PDF生成完成！');
+                                await new Promise(resolve => setTimeout(resolve, 500));
+                                
+                                document.body.removeChild(progressMsg);
+                                record.status = 'generated';
+                                record.pdfPath = statusResult.pdf_path || null;
+                                taskCompleted = true;
+                                
+                                // 刷新数据以获取最新状态（从数据库读取）
+                                if (this.isSearching) {
+                                    await this.executeSearch();
+                                } else {
+                                    await this.loadOrdersFromAPI(this.currentPage);
+                                }
+                                
+                                let successAlert = `PDF生成成功！\nOrder: ${record.orderNo}`;
+                                if (statusResult.has_warning && statusResult.warning_message) {
+                                    successAlert += `\n\n⚠️ ${statusResult.warning_message}`;
+                                }
+                                alert(successAlert);
+                            } else if (taskStatus === 'failed') {
+                                // 任务失败
+                                document.body.removeChild(progressMsg);
+                                record.status = 'pending';
+                                taskCompleted = true;
+                                throw new Error(statusResult.error_message || 'PDF生成失败');
+                            } else if (taskStatus === 'processing') {
+                                // 仍在处理中，更新进度提示
+                                record.status = 'generating';
+                                const progressText = statusResult.message || '正在生成PDF...';
+                                updateProgress(Math.max(20, progress), progressText);
+                            } else if (taskStatus === 'pending') {
+                                updateProgress(15, '任务等待中...');
+                            }
+                        }
+                    } catch (statusError) {
+                        console.error('查询任务状态失败:', statusError);
+                        // 继续轮询，不中断
+                        if (attempts % 5 === 0) {
+                            updateProgress(Math.min(90, 20 + attempts * 2), '正在查询任务状态...');
+                        }
+                    }
+                }
+                
+                if (!taskCompleted) {
+                    // 超时，但可能已经生成，刷新数据检查
+                    document.body.removeChild(progressMsg);
+                    record.status = 'pending';
+                    if (this.isSearching) {
+                        await this.executeSearch();
+                    } else {
+                        await this.loadOrdersFromAPI(this.currentPage);
+                    }
+                    alert('PDF生成超时，请稍后刷新页面查看状态');
                 }
             } catch (error) {
                 // 生成失败时恢复状态
+                const progressMsg = document.getElementById('single-pdf-progress');
+                if (progressMsg) document.body.removeChild(progressMsg);
                 record.status = 'pending';
                 console.error('生成PDF失败:', error);
                 alert(error.message || '生成PDF時發生錯誤，請重試！');
@@ -594,9 +865,22 @@ createApp({
             try {
                 const startTime = performance.now();
                 
+                // 如果在搜索状态下，检查是否有日期搜索或Job No搜索
+                let perPageValue = this.pageSize;
+                if (this.isSearching) {
+                    const hasDate = !!(this.searchQuery.startDate || this.searchQuery.endDate);
+                    const jobNoTrim = (this.searchQuery.jobNo || '').trim();
+                    // 日期搜索或Job No搜索时，每页记录上限设置为200；其他情况为100
+                    if (hasDate || jobNoTrim) {
+                        perPageValue = 200;
+                    } else {
+                        perPageValue = 100;
+                    }
+                }
+                
                 const params = new URLSearchParams({
                     page: String(page),
-                    per_page: String(this.pageSize)
+                    per_page: String(perPageValue)
                 });
                 // 根据当前Tab决定使用哪个数据源
                 if (this.activeSubTab === 'stocklist-test') {
@@ -669,6 +953,11 @@ createApp({
                 await this.$nextTick();
                 this.filteredRecords = filtered;
                 
+                // 如果在搜索状态下，更新 pageSize
+                if (this.isSearching) {
+                    this.pageSize = perPageValue;
+                }
+                
                 const loadTime = performance.now() - startTime;
                 console.log(`[性能] 数据加载耗时: ${loadTime.toFixed(2)}ms`);
                 
@@ -719,14 +1008,24 @@ createApp({
             // 直接使用 totalPagesComputed 作为判断
             if (current < computed) {
                 const targetPage = current + 1;
-                this.pageSize = this.defaultPageSize;
+                // 如果是搜索状态且有日期或Job No搜索，使用200；否则保持当前pageSize
+                if (this.isSearching) {
+                    const hasDate = !!(this.searchQuery.startDate || this.searchQuery.endDate);
+                    const jobNoTrim = (this.searchQuery.jobNo || '').trim();
+                    this.pageSize = (hasDate || jobNoTrim) ? 200 : 100;
+                }
                 // 禁用分页按钮，防止重复点击
                 const nextBtn = document.querySelector('.pagination button:last-child');
                 const prevBtn = document.querySelector('.pagination button:first-child');
                 if (nextBtn) nextBtn.disabled = true;
                 if (prevBtn) prevBtn.disabled = true;
                 
-                await this.loadOrdersFromAPI(targetPage);
+                // 如果是搜索状态，使用搜索分页；否则使用普通分页
+                if (this.isSearching) {
+                    await this.loadSearchPage(targetPage);
+                } else {
+                    await this.loadOrdersFromAPI(targetPage);
+                }
             }
         },
 
@@ -735,14 +1034,24 @@ createApp({
             
             if (current > 1) {
                 const targetPage = current - 1;
-                this.pageSize = this.defaultPageSize;
+                // 如果是搜索状态且有日期或Job No搜索，使用200；否则保持当前pageSize
+                if (this.isSearching) {
+                    const hasDate = !!(this.searchQuery.startDate || this.searchQuery.endDate);
+                    const jobNoTrim = (this.searchQuery.jobNo || '').trim();
+                    this.pageSize = (hasDate || jobNoTrim) ? 200 : 100;
+                }
                 // 禁用分页按钮，防止重复点击
                 const nextBtn = document.querySelector('.pagination button:last-child');
                 const prevBtn = document.querySelector('.pagination button:first-child');
                 if (nextBtn) nextBtn.disabled = true;
                 if (prevBtn) prevBtn.disabled = true;
                 
-                await this.loadOrdersFromAPI(targetPage);
+                // 如果是搜索状态，使用搜索分页；否则使用普通分页
+                if (this.isSearching) {
+                    await this.loadSearchPage(targetPage);
+                } else {
+                    await this.loadOrdersFromAPI(targetPage);
+                }
             }
         },
 
@@ -772,7 +1081,11 @@ createApp({
             this.showSettings = false;
         },
 
-        async startUpdateAllTables() {
+        async startUpdateAllTables(event) {
+            // 仅允许真实用户点击触发，避免程序触发或异常回放导致重复启动
+            if (event && event.isTrusted === false) {
+                return;
+            }
             if (this.updateDataLoading) {
                 return;
             }
@@ -1008,131 +1321,56 @@ createApp({
                     headers['Authorization'] = `Bearer ${authInfo.token}`;
                 }
 
-                let response;
+                let taskId;
                 let zipFilename;
 
                 if (orderNos.length === 1) {
-                    // 单个订单：使用单个下载API
+                    // 单个订单：使用单个下载API（异步任务）
                     const orderNo = orderNos[0];
-                    response = await fetch(buildApiUrl(`/api/stockist-test/download-by-order/${orderNo}`), { 
+                    const response = await fetch(buildApiUrl(`/api/stockist-test/download-by-order/${orderNo}`), { 
+                        method: 'GET',
                         headers,
                         signal: this.currentAbortController.signal
                     });
-                    // fetch调用后，更新状态为下载中
-                    this.updateDownloadProgress(1, total, `正在下载 Order ${orderNo}`, 'downloading', 'count');
+                    
+                    if (!response.ok) {
+                        throw await buildHttpError(response, '创建下载任务失败');
+                    }
+                    
+                    const data = await response.json();
+                    if (!data.success) {
+                        throw new Error(data.error || '创建任务失败');
+                    }
+                    
+                    taskId = data.task_id;
                     zipFilename = `Order_${orderNo}_Stockist_Test_${new Date().getTime()}.zip`;
                 } else {
-                    // 多个订单：使用批量下载API
-                    response = await fetch(buildApiUrl('/api/stockist-test/download-by-order-nos'), {
+                    // 多个订单：使用批量下载API（异步任务）
+                    const response = await fetch(buildApiUrl('/api/stockist-test/download-by-order-nos'), {
                         method: 'POST',
                         headers: headers,
                         body: JSON.stringify({ order_nos: orderNos }),
                         signal: this.currentAbortController.signal
                     });
-                    // fetch调用后，更新状态为下载中
-                    this.updateDownloadProgress(0, total, '正在打包...', 'downloading', 'count');
                     
-                    // 从响应头获取文件名，如果没有则使用默认名称
-                    const contentDisposition = response.headers.get('Content-Disposition');
-                    if (contentDisposition) {
-                        const filenameMatch = contentDisposition.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/);
-                        if (filenameMatch && filenameMatch[1]) {
-                            zipFilename = filenameMatch[1].replace(/['"]/g, '');
-                        }
+                    if (!response.ok) {
+                        throw await buildHttpError(response, '创建批量下载任务失败');
                     }
-                    if (!zipFilename) {
-                        const orderNosStr = orderNos.length <= 3 
-                            ? orderNos.join('_') 
-                            : `${orderNos.slice(0, 3).join('_')}_...`;
-                        zipFilename = `${orderNosStr}_Stockist_Test_${new Date().getTime()}.zip`;
-                    }
-                }
-
-                if (!response.ok) {
-                    // 检查是否是因为取消导致的
-                    if (this.isCancelling) {
-                        throw new Error('下载已取消');
-                    }
-                    this.hideDownloadProgress();
-                    let errorMsg = `下载失败：HTTP ${response.status}`;
-                    try {
-                        const data = await response.json();
-                        if (data && data.error) {
-                            errorMsg = `下载失败：${data.error}`;
-                        }
-                    } catch (_) {
-                        try {
-                            const text = await response.text();
-                            if (text) errorMsg += `\n${text}`;
-                        } catch (_) {}
-                    }
-                    alert(errorMsg);
-                    return;
-                }
-
-                // 模拟下载进度
-                const reader = response.body.getReader();
-                const contentLength = +response.headers.get('Content-Length');
-                let receivedLength = 0;
-                const chunks = [];
-
-                while (true) {
-                    // 检查是否被取消
-                    if (this.isCancelling) {
-                        reader.cancel();
-                        throw new Error('下载已取消');
-                    }
-
-                    const { done, value } = await reader.read();
-                    if (done) break;
                     
-                    // 再次检查是否被取消
-                    if (this.isCancelling) {
-                        reader.cancel();
-                        throw new Error('下载已取消');
+                    const data = await response.json();
+                    if (!data.success) {
+                        throw new Error(data.error || '创建任务失败');
                     }
-
-                    chunks.push(value);
-                    receivedLength += value.length;
                     
-                    // 更新进度：基于已下载的数据量
-                    if (contentLength > 0) {
-                        const progress = Math.min(Math.floor((receivedLength / contentLength) * total), total);
-                        this.updateDownloadProgress(progress, total, `正在下载`, 'downloading', 'count');
-                    } else {
-                        // 如果没有Content-Length，使用简单的进度模拟
-                        const progress = Math.min(Math.floor((receivedLength / (contentLength || 1000000)) * total), total);
-                        this.updateDownloadProgress(progress, total, `正在下载`, 'downloading', 'count');
-                    }
+                    taskId = data.task_id;
+                    const orderNosStr = orderNos.length <= 3 
+                        ? orderNos.join('_') 
+                        : `${orderNos.slice(0, 3).join('_')}_...`;
+                    zipFilename = `${orderNosStr}_Stockist_Test_${new Date().getTime()}.zip`;
                 }
 
-                const blob = new Blob(chunks);
-                if (blob.size === 0) {
-                    this.hideDownloadProgress();
-                    alert('下载失败：服务器返回了空文件');
-                    return;
-                }
-
-                // 完成进度
-                this.updateDownloadProgress(total, total, '下载完成', 'complete', 'count');
-
-                const url = window.URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = zipFilename;
-                a.style.display = 'none';
-                document.body.appendChild(a);
-                a.click();
-                await new Promise(resolve => setTimeout(resolve, 200));
-                document.body.removeChild(a);
-                setTimeout(() => {
-                    window.URL.revokeObjectURL(url);
-                }, 2000);
-
-                // 延迟隐藏进度条
-                setTimeout(() => {
-                    this.hideDownloadProgress();
-                }, 1000);
+                // 轮询任务状态
+                await this.pollTaskStatus(taskId, zipFilename, total);
 
                 const successMsg = orderNos.length === 1
                     ? `Order ${orderNos[0]} 的 Stockist&Test Report 文件下载完成！`
@@ -1142,6 +1380,98 @@ createApp({
 
             } catch (error) {
                 // 处理取消错误
+                if (error.name === 'AbortError' || error.message === '下载已取消' || this.isCancelling) {
+                    console.log('下载已取消');
+                    this.updateDownloadProgress(0, total, '下载已取消', 'failed', 'count');
+                    setTimeout(() => {
+                        this.hideDownloadProgress();
+                    }, 1000);
+                    alert('下载已取消');
+                } else {
+                    this.hideDownloadProgress();
+                    console.error('下载失败:', error);
+                    alert(error.message || '下载时发生错误，请重试！');
+                }
+            } finally {
+                this.isCancelling = false;
+                this.currentAbortController = null;
+            }
+        },
+
+        async downloadAllStockistNoFiles() {
+            const currentSelected = this.currentSelectedRecords;
+            if (currentSelected.length === 0) {
+                alert('请至少选择一个订单！');
+                return;
+            }
+
+            const orderNos = currentSelected
+                .map(id => {
+                    const orderNo = typeof id === 'number' ? id : parseInt(id);
+                    return isNaN(orderNo) ? null : orderNo;
+                })
+                .filter(no => no != null && no > 0);
+
+            if (orderNos.length === 0) {
+                alert('选中的记录中没有有效的订单号！');
+                return;
+            }
+
+            const orderNosStr = orderNos.length <= 3
+                ? orderNos.join(', ')
+                : `${orderNos.slice(0, 3).join(', ')} 等 ${orderNos.length} 个`;
+
+            if (!confirm(`确定要下载 ${orderNosStr} 的全部 Stockist No 文件吗？\n（系统会自动去重，不按 Item 分类）`)) {
+                return;
+            }
+
+            const total = orderNos.length;
+            this.showDownloadProgress(total);
+            this.updateDownloadProgress(0, total, '准备中......', '准备中', 'count');
+
+            this.isCancelling = false;
+            this.currentAbortController = new AbortController();
+
+            try {
+                const authInfo = getAuthInfo();
+                const headers = {
+                    'Content-Type': 'application/json'
+                };
+                if (authInfo.token) {
+                    headers['Authorization'] = `Bearer ${authInfo.token}`;
+                }
+
+                const response = await fetch(buildApiUrl('/api/stockist-test/download-all-stockist-nos'), {
+                    method: 'POST',
+                    headers: headers,
+                    body: JSON.stringify({ order_nos: orderNos }),
+                    signal: this.currentAbortController.signal
+                });
+
+                if (!response.ok) {
+                    throw await buildHttpError(response, '创建扁平Stockist下载任务失败');
+                }
+
+                const data = await response.json();
+                if (!data.success) {
+                    throw new Error(data.error || '创建任务失败');
+                }
+
+                const taskId = data.task_id;
+                const orderNosFileTag = orderNos.length <= 3
+                    ? orderNos.join('_')
+                    : `${orderNos.slice(0, 3).join('_')}_...`;
+                const zipFilename = `${orderNosFileTag}_All_Stockist_No_${new Date().getTime()}.zip`;
+
+                await this.pollTaskStatus(taskId, zipFilename, total);
+
+                const successMsg = orderNos.length === 1
+                    ? `Order ${orderNos[0]} 的全部 Stockist No 文件下载完成！`
+                    : `${orderNos.length} 个 Order 的全部 Stockist No 文件下载完成！`;
+                alert(successMsg);
+                this.clearSelection();
+
+            } catch (error) {
                 if (error.name === 'AbortError' || error.message === '下载已取消' || this.isCancelling) {
                     console.log('下载已取消');
                     this.updateDownloadProgress(0, total, '下载已取消', 'failed', 'count');
@@ -1207,113 +1537,31 @@ createApp({
                     headers['Authorization'] = `Bearer ${authInfo.token}`;
                 }
 
-                // 使用批量按 DD_No 下载 API
+                // 使用批量按 DD_No 下载API（异步任务）
                 const response = await fetch(buildApiUrl('/api/stockist-test/download-by-order-nos-grouped-by-dd-no'), {
                     method: 'POST',
                     headers: headers,
                     body: JSON.stringify({ order_nos: orderNos }),
                     signal: this.currentAbortController.signal
                 });
-                // fetch调用后，更新状态为下载中
-                this.updateDownloadProgress(0, total, '正在打包...', 'downloading', 'count');
 
                 if (!response.ok) {
-                    this.hideDownloadProgress();
-                    let errorMsg = `下载失败：HTTP ${response.status}`;
-                    try {
-                        const data = await response.json();
-                        if (data && data.error) {
-                            errorMsg = `下载失败：${data.error}`;
-                        }
-                    } catch (_) {
-                        try {
-                            const text = await response.text();
-                            if (text) errorMsg += `\n${text}`;
-                        } catch (_) {}
-                    }
-                    alert(errorMsg);
-                    return;
+                    throw await buildHttpError(response, '创建按DD_No分组下载任务失败');
                 }
 
-                // 模拟下载进度
-                const reader = response.body.getReader();
-                const contentLength = +response.headers.get('Content-Length');
-                let receivedLength = 0;
-                const chunks = [];
-
-                while (true) {
-                    // 检查是否被取消
-                    if (this.isCancelling) {
-                        reader.cancel();
-                        throw new Error('下载已取消');
-                    }
-
-                    const { done, value } = await reader.read();
-                    if (done) break;
-                    
-                    // 再次检查是否被取消
-                    if (this.isCancelling) {
-                        reader.cancel();
-                        throw new Error('下载已取消');
-                    }
-
-                    chunks.push(value);
-                    receivedLength += value.length;
-                    
-                    // 更新进度：基于已下载的数据量
-                    if (contentLength > 0) {
-                        const progress = Math.min(Math.floor((receivedLength / contentLength) * total), total);
-                        this.updateDownloadProgress(progress, total, `正在下载`, 'downloading', 'count');
-                    } else {
-                        // 如果没有Content-Length，使用简单的进度模拟
-                        const progress = Math.min(Math.floor((receivedLength / (contentLength || 1000000)) * total), total);
-                        this.updateDownloadProgress(progress, total, `正在下载`, 'downloading', 'count');
-                    }
+                const data = await response.json();
+                if (!data.success) {
+                    throw new Error(data.error || '创建任务失败');
                 }
 
-                const blob = new Blob(chunks);
-                if (blob.size === 0) {
-                    this.hideDownloadProgress();
-                    alert('下载失败：服务器返回了空文件');
-                    return;
-                }
+                const taskId = data.task_id;
+                const orderNosStr = orderNos.length <= 3 
+                    ? orderNos.join('_') 
+                    : `${orderNos.slice(0, 3).join('_')}_...`;
+                const zipFilename = `${orderNosStr}_DD_No_Stockist_Test_${new Date().getTime()}.zip`;
 
-                // 完成进度
-                this.updateDownloadProgress(total, total, '下载完成', 'complete', 'count');
-
-                // 从响应头获取文件名，如果没有则使用默认名称
-                let zipFilename;
-                const contentDisposition = response.headers.get('Content-Disposition');
-                if (contentDisposition) {
-                    const filenameMatch = contentDisposition.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/);
-                    if (filenameMatch && filenameMatch[1]) {
-                        zipFilename = filenameMatch[1].replace(/['"]/g, '');
-                    }
-                }
-                if (!zipFilename) {
-                    const orderNosStr = orderNos.length <= 3 
-                        ? orderNos.join('_') 
-                        : `${orderNos.slice(0, 3).join('_')}_...`;
-                    zipFilename = `${orderNosStr}_DD_No_Stockist_Test_${new Date().getTime()}.zip`;
-                }
-
-                const url = window.URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = zipFilename;
-                a.style.display = 'none';
-                document.body.appendChild(a);
-                a.click();
-                await new Promise(resolve => setTimeout(resolve, 200));
-                document.body.removeChild(a);
-                setTimeout(() => {
-                    window.URL.revokeObjectURL(url);
-                }, 2000);
-
-                // 延迟隐藏进度条
-                setTimeout(() => {
-                    this.hideDownloadProgress();
-                }, 1000);
+                // 轮询任务状态
+                await this.pollTaskStatus(taskId, zipFilename, total);
 
                 const successMsg = orderNos.length === 1
                     ? `Order ${orderNos[0]} 对应的 DD_No 的 Stockist&Test Report 文件下载完成！`
@@ -1400,19 +1648,7 @@ createApp({
                 });
 
                 if (!dateCountResponse.ok) {
-                    let errorMsg = `获取日期数量失败：HTTP ${dateCountResponse.status}`;
-                    if (dateCountResponse.status === 401) {
-                        errorMsg = '认证失败，请重新登录！';
-                    } else {
-                        try {
-                            const errorData = await dateCountResponse.json();
-                            if (errorData && errorData.error) {
-                                errorMsg = `获取日期数量失败：${errorData.error}`;
-                            }
-                        } catch (_) {}
-                    }
-                    alert(errorMsg);
-                    return;
+                    throw await buildHttpError(dateCountResponse, '获取日期数量失败');
                 }
 
                 const dateCountData = await dateCountResponse.json();
@@ -1424,7 +1660,7 @@ createApp({
                 this.showDownloadProgress(total);
                 this.updateDownloadProgress(0, total, '准备中......', '准备中', 'count');
 
-                // 使用批量按日期下载 API
+                // 使用批量按日期下载API（异步任务）
                 const response = await fetch(buildApiUrl('/api/stockist-test/download-by-order-nos-grouped-by-date'), {
                     method: 'POST',
                     headers: headers,
@@ -1433,130 +1669,25 @@ createApp({
                 });
 
                 if (!response.ok) {
-                    // 检查是否是因为取消导致的
-                    if (this.isCancelling) {
-                        throw new Error('下载已取消');
-                    }
-                    this.hideDownloadProgress();
-                    let errorMsg = `下载失败：HTTP ${response.status}`;
-                    try {
-                        const data = await response.json();
-                        if (data && data.error) {
-                            errorMsg = `下载失败：${data.error}`;
-                        }
-                    } catch (_) {
-                        try {
-                            const text = await response.text();
-                            if (text) errorMsg += `\n${text}`;
-                        } catch (_) {}
-                    }
-                    alert(errorMsg);
-                    return;
+                    throw await buildHttpError(response, '创建按日期分组下载任务失败');
                 }
 
-                // 检查是否被取消（在开始读取响应体之前）
-                if (this.isCancelling) {
-                    throw new Error('下载已取消');
+                const data = await response.json();
+                if (!data.success) {
+                    throw new Error(data.error || '创建任务失败');
                 }
 
-                // 响应返回后，更新进度条为正在下载
-                this.updateDownloadProgress(0, total, '正在下载...', 'downloading', 'count');
+                const taskId = data.task_id;
+                const orderNosStr = orderNos.length <= 3 
+                    ? orderNos.join('_') 
+                    : `${orderNos.slice(0, 3).join('_')}_...`;
+                const zipFilename = `${orderNosStr}_Date_Stockist_Test_${new Date().getTime()}.zip`;
 
-                // 模拟下载进度（基于日期数量）
-                const reader = response.body.getReader();
-                const contentLength = +response.headers.get('Content-Length');
-                let receivedLength = 0;
-                const chunks = [];
-
-                while (true) {
-                    // 检查是否被取消
-                    if (this.isCancelling) {
-                        reader.cancel();
-                        throw new Error('下载已取消');
-                    }
-
-                    let readResult;
-                    try {
-                        readResult = await reader.read();
-                    } catch (readError) {
-                        // 如果读取时出错（可能是被取消），检查是否是取消
-                        if (readError.name === 'AbortError' || this.isCancelling) {
-                            reader.cancel();
-                            throw new Error('下载已取消');
-                        }
-                        throw readError;
-                    }
-                    
-                    const { done, value } = readResult;
-                    if (done) break;
-                    
-                    // 再次检查是否被取消
-                    if (this.isCancelling) {
-                        reader.cancel();
-                        throw new Error('下载已取消');
-                    }
-
-                    chunks.push(value);
-                    receivedLength += value.length;
-                    
-                    // 更新进度：基于已下载的数据量计算当前日期进度
-                    if (contentLength > 0) {
-                        const progress = Math.min(Math.floor((receivedLength / contentLength) * total), total);
-                        this.updateDownloadProgress(progress, total, '批量下载中', 'downloading', 'count');
-                    } else {
-                        // 如果没有Content-Length，使用简单的进度模拟
-                        const estimatedTotal = contentLength || 1000000;
-                        const progress = Math.min(Math.floor((receivedLength / estimatedTotal) * total), total);
-                        this.updateDownloadProgress(progress, total, '批量下载中', 'downloading', 'count');
-                    }
-                }
-
-                const blob = new Blob(chunks);
-                if (blob.size === 0) {
-                    this.hideDownloadProgress();
-                    alert('下载失败：服务器返回了空文件');
-                    return;
-                }
-
-                // 完成进度
-                this.updateDownloadProgress(total, total, '下载完成', 'complete', 'count');
-
-                // 从响应头获取文件名，如果没有则使用默认名称
-                let zipFilename;
-                const contentDisposition = response.headers.get('Content-Disposition');
-                if (contentDisposition) {
-                    const filenameMatch = contentDisposition.match(/filename[^;=\n]*=((['"]).*?\2|[^;\n]*)/);
-                    if (filenameMatch && filenameMatch[1]) {
-                        zipFilename = filenameMatch[1].replace(/['"]/g, '');
-                    }
-                }
-                if (!zipFilename) {
-                    const orderNosStr = orderNos.length <= 3 
-                        ? orderNos.join('_') 
-                        : `${orderNos.slice(0, 3).join('_')}_...`;
-                    zipFilename = `${orderNosStr}_Date_Stockist_Test_${new Date().getTime()}.zip`;
-                }
-
-                const url = window.URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = zipFilename;
-                a.style.display = 'none';
-                document.body.appendChild(a);
-                a.click();
-                await new Promise(resolve => setTimeout(resolve, 200));
-                document.body.removeChild(a);
-                setTimeout(() => {
-                    window.URL.revokeObjectURL(url);
-                }, 2000);
-
-                // 延迟隐藏进度条
-                setTimeout(() => {
-                    this.hideDownloadProgress();
-                }, 1000);
+                // 轮询任务状态
+                await this.pollTaskStatus(taskId, zipFilename, total);
 
                 const successMsg = orderNos.length === 1
-                    ? `Order ${orderNos[0]} 对应的日期的 Stockist&Test Report 文件下载完成！`
+                    ? `Order ${orderNos[0]} 对应的所有日期的 Stockist&Test Report 文件下载完成！`
                     : `${orderNos.length} 个 Order 对应的所有日期的 Stockist&Test Report 文件下载完成！`;
                 alert(successMsg);
                 this.clearSelection();
@@ -1787,6 +1918,227 @@ createApp({
             this.downloadProgressVisible = true;
         },
 
+        async pollTaskStatus(taskId, zipFilename, total) {
+            const authInfo = getAuthInfo();
+            const headers = {
+                'Content-Type': 'application/json'
+            };
+            if (authInfo.token) {
+                headers['Authorization'] = `Bearer ${authInfo.token}`;
+            }
+
+            const maxAttempts = 2400; // 最多轮询20分钟（每200毫秒一次，或更短）
+            let attempts = 0;
+            let pollInterval;
+            let lastProgress = 0;
+            let currentPollInterval = 200; // 初始轮询间隔：200ms（更快响应）
+
+            return new Promise((resolve, reject) => {
+                // 立即执行第一次查询，不等待
+                const checkStatus = async () => {
+                    attempts++;
+                    
+                    // 检查是否被取消
+                    if (this.isCancelling) {
+                        clearInterval(pollInterval);
+                        reject(new Error('下载已取消'));
+                        return;
+                    }
+
+                    try {
+                        // 使用带超时和重试的 fetch
+                        const response = await fetchWithRetry(
+                            buildApiUrl(`/api/download/task-status/${taskId}`),
+                            {
+                                headers,
+                                signal: this.currentAbortController.signal
+                            },
+                            30000, // 30秒超时（轮询请求应该快速响应）
+                            2,     // 最多重试2次
+                            2000   // 初始重试延迟2秒
+                        );
+
+                        if (!response.ok) {
+                            throw await buildHttpError(response, '查询下载任务状态失败');
+                        }
+
+                        const data = await response.json();
+                        if (!data.success) {
+                            throw new Error(data.error || '查询任务状态失败');
+                        }
+
+                        const status = data.status;
+                        const progress = data.progress || 0;
+                        const processedFiles = data.processed_files || 0;
+                        const totalFiles = data.total_files || total;
+
+                        // 更新进度显示
+                        if (status === 'processing') {
+                            const progressText = totalFiles > 0 
+                                ? `正在处理: ${processedFiles}/${totalFiles} 个文件`
+                                : `正在处理...`;
+                            this.updateDownloadProgress(
+                                Math.max(processedFiles, Math.floor(progress * total / 100)), 
+                                totalFiles || total, 
+                                progressText, 
+                                'downloading', 
+                                'count'
+                            );
+                            
+                            // 动态调整轮询间隔：进度越高，检查越频繁
+                            let newInterval = 200; // 默认200ms
+                            if (progress > 95) {
+                                newInterval = 100; // 95%以上：100ms
+                            } else if (progress > 80) {
+                                newInterval = 150; // 80-95%：150ms
+                            } else if (progress > 50) {
+                                newInterval = 200; // 50-80%：200ms
+                            } else {
+                                newInterval = 300; // 0-50%：300ms（可以稍慢）
+                            }
+                            
+                            // 如果间隔改变，重新设置定时器
+                            if (newInterval !== currentPollInterval) {
+                                clearInterval(pollInterval);
+                                currentPollInterval = newInterval;
+                                pollInterval = setInterval(checkStatus, currentPollInterval);
+                            }
+                            
+                            lastProgress = progress;
+                        } else if (status === 'completed') {
+                            clearInterval(pollInterval);
+                            const warningMessage = data.has_warning ? (data.warning_message || '') : '';
+                            
+                            // 立即开始下载，不等待任何UI更新
+                            const downloadUrl = buildApiUrl(`/api/download/download/${taskId}`);
+                            console.log('[下载] 任务完成，立即开始下载:', downloadUrl);
+                            
+                            // 使用带超时和重试的 fetch（大文件下载需要更长时间）
+                            const downloadPromise = fetchWithRetry(
+                                downloadUrl,
+                                {
+                                    headers,
+                                    signal: this.currentAbortController.signal
+                                },
+                                1800000, // 30分钟超时（大文件下载）
+                                3,       // 最多重试3次
+                                5000     // 初始重试延迟5秒
+                            ).then(async downloadResponse => {
+                                // 在获取响应后立即更新UI
+                                this.updateDownloadProgress(totalFiles || total, totalFiles || total, '正在下载...', 'downloading', 'count');
+                                
+                                if (!downloadResponse.ok) {
+                                    throw await buildHttpError(downloadResponse, '下载文件失败');
+                                }
+                                
+                                // 获取blob
+                                return downloadResponse.blob();
+                            }).then(blob => {
+                                console.log('[下载] 文件大小:', blob.size, 'bytes');
+                                
+                                if (blob.size === 0) {
+                                    throw new Error('下载的文件为空');
+                                }
+
+                                // 立即触发浏览器下载
+                                const url = window.URL.createObjectURL(blob);
+                                const a = document.createElement('a');
+                                a.href = url;
+                                a.download = zipFilename;
+                                a.style.display = 'none';
+                                document.body.appendChild(a);
+                                a.click();
+                                console.log('[下载] 触发下载:', zipFilename);
+                                
+                                // 立即清理DOM元素，异步清理URL
+                                document.body.removeChild(a);
+                                setTimeout(() => {
+                                    window.URL.revokeObjectURL(url);
+                                }, 100);
+
+                                // 更新进度为完成
+                                this.updateDownloadProgress(totalFiles || total, totalFiles || total, '下载完成', 'complete', 'count');
+
+                                if (warningMessage) {
+                                    alert(`下载完成，但检测到以下缺失：\n${warningMessage}`);
+                                }
+
+                                // 延迟隐藏进度条
+                                setTimeout(() => {
+                                    this.hideDownloadProgress();
+                                }, 1000);
+
+                                resolve();
+                            }).catch(downloadError => {
+                                console.error('[下载] 下载文件时出错:', downloadError);
+                                this.updateDownloadProgress(0, total, `下载失败: ${downloadError.message}`, 'failed', 'count');
+                                setTimeout(() => {
+                                    this.hideDownloadProgress();
+                                }, 2000);
+                                reject(downloadError);
+                            });
+                            
+                            // 在开始 fetch 的同时更新UI为"处理完成，准备下载"
+                            this.updateDownloadProgress(totalFiles || total, totalFiles || total, '处理完成，准备下载...', 'complete', 'count');
+                            
+                            // 不等待 fetch 完成，直接返回（让 Promise 在 fetch 完成后 resolve）
+                            return;
+                        } else if (status === 'failed') {
+                            clearInterval(pollInterval);
+                            const errorMsg = data.error_message || '任务处理失败';
+                            this.updateDownloadProgress(0, total, `失败: ${errorMsg}`, 'failed', 'count');
+                            setTimeout(() => {
+                                this.hideDownloadProgress();
+                            }, 2000);
+                            reject(new Error(errorMsg));
+                        } else if (status === 'pending') {
+                            // 任务还在等待处理
+                            this.updateDownloadProgress(0, total, '等待处理...', 'pending', 'count');
+                        }
+
+                        // 检查是否超过最大尝试次数
+                        if (attempts >= maxAttempts) {
+                            clearInterval(pollInterval);
+                            reject(new Error('任务处理超时，请稍后重试'));
+                        }
+                    } catch (error) {
+                        // 处理取消错误
+                        if (error.name === 'AbortError' || this.isCancelling) {
+                            clearInterval(pollInterval);
+                            reject(new Error('下载已取消'));
+                            return;
+                        }
+                        
+                        // 如果达到最大尝试次数，停止轮询
+                        if (attempts >= maxAttempts) {
+                            clearInterval(pollInterval);
+                            let errorMsg = `查询任务状态超时：已尝试 ${attempts} 次`;
+                            if (error.message) {
+                                errorMsg += ` (${error.message})`;
+                            }
+                            reject(new Error(errorMsg));
+                            return;
+                        }
+                        
+                        // 网络错误：记录并继续轮询（可能是临时网络问题）
+                        console.error(`[轮询错误] 第 ${attempts} 次查询失败:`, error);
+                        
+                        // 如果是网络超时或连接错误，等待更长时间后重试
+                        if (error.message && (error.message.includes('超时') || error.message.includes('网络') || error.message.includes('连接'))) {
+                            // 等待5秒后继续（不增加 attempts，因为这是网络问题）
+                            await new Promise(resolve => setTimeout(resolve, 5000));
+                        }
+                    }
+                };
+                
+                // 立即执行第一次查询
+                checkStatus();
+                
+                // 然后每200毫秒轮询一次（更快响应）
+                pollInterval = setInterval(checkStatus, currentPollInterval);
+            });
+        },
+
         updateDownloadProgress(current, total, currentRecord, status = 'downloading', progressType = 'count') {
             const progressFill = document.querySelector('.progress-fill');
             const progressText = document.querySelector('.progress-text');
@@ -1903,6 +2255,7 @@ createApp({
                 let successCount = 0;
                 let failCount = 0;
                 const failedOrders = [];
+                const warningOrders = new Set();
 
                 for (let i = 0; i < selectedPendingRecords.length; i++) {
                     if (this.isCancelling) {
@@ -1919,17 +2272,88 @@ createApp({
                     }
 
                     const record = selectedPendingRecords[i];
+                    record.status = 'generating';
                     this.updateGenerateProgress(i, selectedPendingRecords.length, record.orderNo, 'processing');
 
                     try {
+                        // 提交生成任务
                         const resp = await apiFetch('/api/pdf/generate', {
                             method: 'POST',
                             body: JSON.stringify({ order_no: record.orderNo }),
                             signal: this.currentAbortController.signal
                         });
-                        successCount++;
-                        record.status = 'generated';
-                        this.updateGenerateProgress(i + 1, selectedPendingRecords.length, record.orderNo, 'completed');
+                        
+                        if (!resp.success || !resp.task_id) {
+                            throw new Error(resp.error || '创建PDF生成任务失败');
+                        }
+                        
+                        const taskId = resp.task_id;
+                        this.updateGenerateProgress(i, selectedPendingRecords.length, record.orderNo, 'processing', `任务已提交，等待处理...`);
+                        
+                        // 轮询任务状态，直到完成或失败
+                        const maxAttempts = 120; // 最多轮询120次（4分钟）
+                        const pollInterval = 2000; // 每2秒轮询一次
+                        let attempts = 0;
+                        let taskCompleted = false;
+                        
+                        while (attempts < maxAttempts && !taskCompleted && !this.isCancelling) {
+                            await new Promise(resolve => setTimeout(resolve, pollInterval));
+                            attempts++;
+                            
+                            try {
+                                const statusResult = await apiFetch(`/api/pdf/task-status/${taskId}`, {
+                                    signal: this.currentAbortController.signal
+                                });
+                                
+                                if (statusResult.success) {
+                                    const taskStatus = statusResult.status;
+                                    const progress = statusResult.progress || 0;
+                                    
+                                    if (taskStatus === 'completed') {
+                                        // 任务完成
+                                        record.status = 'generated';
+                                        record.pdfPath = statusResult.pdf_path || null;
+                                        taskCompleted = true;
+                                        successCount++;
+                                        if (statusResult.has_warning) {
+                                            warningOrders.add(record.orderNo);
+                                        }
+                                        this.updateGenerateProgress(i + 1, selectedPendingRecords.length, record.orderNo, 'completed', 'PDF生成完成');
+                                    } else if (taskStatus === 'failed') {
+                                        // 任务失败
+                                        record.status = 'pending';
+                                        taskCompleted = true;
+                                        failCount++;
+                                        failedOrders.push(record.orderNo);
+                                        this.updateGenerateProgress(i + 1, selectedPendingRecords.length, record.orderNo, 'failed', statusResult.error_message || 'PDF生成失败');
+                                    } else if (taskStatus === 'processing') {
+                                        // 仍在处理中
+                                        record.status = 'generating';
+                                        const progressText = statusResult.message || `正在生成PDF... (${progress}%)`;
+                                        this.updateGenerateProgress(i, selectedPendingRecords.length, record.orderNo, 'processing', progressText);
+                                    } else if (taskStatus === 'pending') {
+                                        this.updateGenerateProgress(i, selectedPendingRecords.length, record.orderNo, 'processing', '任务等待中...');
+                                    }
+                                }
+                            } catch (statusError) {
+                                if (statusError.name === 'AbortError' || this.isCancelling) {
+                                    throw statusError;
+                                }
+                                console.error('查询任务状态失败:', statusError);
+                                // 继续轮询，不中断
+                                if (attempts % 5 === 0) {
+                                    this.updateGenerateProgress(i, selectedPendingRecords.length, record.orderNo, 'processing', '正在查询任务状态...');
+                                }
+                            }
+                        }
+                        
+                        if (!taskCompleted && !this.isCancelling) {
+                            // 超时，但可能已经生成
+                            record.status = 'pending';
+                            failCount++;
+                            failedOrders.push(record.orderNo);
+                            this.updateGenerateProgress(i + 1, selectedPendingRecords.length, record.orderNo, 'failed', '生成超时');
+                        }
                     } catch (e) {
                         if (e.name === 'AbortError' || this.isCancelling) {
                             console.log('生成被取消');
@@ -1961,10 +2385,14 @@ createApp({
                     await this.loadOrdersFromAPI(this.currentPage);
                 }
 
+                const warningList = Array.from(warningOrders);
+                const warningText = warningList.length > 0
+                    ? `\n存在空數據的訂單: ${warningList.join('、')}`
+                    : '';
                 if (failCount === 0) {
-                    alert(`批量生成完成！成功生成 ${successCount} 個PDF。`);
+                    alert(`批量生成完成！成功生成 ${successCount} 個PDF。${warningText}`);
                 } else {
-                    alert(`批量生成結束！\n成功: ${successCount} 個\n失敗: ${failCount} 個\n失敗的訂單: ${failedOrders.join(', ')}`);
+                    alert(`批量生成結束！\n成功: ${successCount} 個\n失敗: ${failCount} 個\n失敗的訂單: ${failedOrders.join(', ')}${warningText}`);
                 }
 
                 this.clearSelection();
@@ -1993,7 +2421,7 @@ createApp({
             const currentSelected = this.currentSelectedRecords;
             const selectedGeneratedRecords = currentSelected
                 .map(id => this.records.find(r => r.id === id))
-                .filter(record => record && record.status === 'generated');
+                .filter(record => record && (record.status === 'generated' || record.status === 'pending'));
 
             if (selectedGeneratedRecords.length === 0) {
                 alert('没有可重新生成的记录！请选择状态为"已生成"的记录。');
@@ -2012,6 +2440,7 @@ createApp({
                 let successCount = 0;
                 let failCount = 0;
                 const failedOrders = [];
+                const warningOrders = new Set();
 
                 for (let i = 0; i < selectedGeneratedRecords.length; i++) {
                     if (this.isCancelling) {
@@ -2028,30 +2457,88 @@ createApp({
                     }
 
                     const record = selectedGeneratedRecords[i];
+                    record.status = 'generating';
                     // 更新进度：显示正在处理
-                    this.updateGenerateProgress(i, selectedGeneratedRecords.length, record.orderNo, 'processing', true);
+                    this.updateGenerateProgress(i, selectedGeneratedRecords.length, record.orderNo, 'processing', '', true);
 
                     try {
-                        // 更新状态为生成中
-                        record.status = 'generating';
-                        
+                        // 提交重新生成任务
                         const result = await apiFetch('/api/pdf/generate', {
                             method: 'POST',
                             body: JSON.stringify({ order_no: record.orderNo }),
                             signal: this.currentAbortController.signal
                         });
 
-                        if (result.success) {
-                            successCount++;
-                            record.status = 'generated';
-                            // 更新进度：显示完成
-                            this.updateGenerateProgress(i + 1, selectedGeneratedRecords.length, record.orderNo, 'completed', true);
-                        } else {
+                        if (!result.success || !result.task_id) {
+                            throw new Error(result.error || '创建PDF生成任务失败');
+                        }
+                        
+                        const taskId = result.task_id;
+                        this.updateGenerateProgress(i, selectedGeneratedRecords.length, record.orderNo, 'processing', '任务已提交，等待处理...', true);
+                        
+                        // 轮询任务状态，直到完成或失败
+                        const maxAttempts = 120; // 最多轮询120次（4分钟）
+                        const pollInterval = 2000; // 每2秒轮询一次
+                        let attempts = 0;
+                        let taskCompleted = false;
+                        
+                        while (attempts < maxAttempts && !taskCompleted && !this.isCancelling) {
+                            await new Promise(resolve => setTimeout(resolve, pollInterval));
+                            attempts++;
+                            
+                            try {
+                                const statusResult = await apiFetch(`/api/pdf/task-status/${taskId}`, {
+                                    signal: this.currentAbortController.signal
+                                });
+                                
+                                if (statusResult.success) {
+                                    const taskStatus = statusResult.status;
+                                    const progress = statusResult.progress || 0;
+                                    
+                                    if (taskStatus === 'completed') {
+                                        // 任务完成
+                                        record.status = 'generated';
+                                        record.pdfPath = statusResult.pdf_path || null;
+                                        taskCompleted = true;
+                                        successCount++;
+                                        if (statusResult.has_warning) {
+                                            warningOrders.add(record.orderNo);
+                                        }
+                                        this.updateGenerateProgress(i + 1, selectedGeneratedRecords.length, record.orderNo, 'completed', 'PDF重新生成完成', true);
+                                    } else if (taskStatus === 'failed') {
+                                        // 任务失败
+                                        record.status = 'pending';
+                                        taskCompleted = true;
+                                        failCount++;
+                                        failedOrders.push(record.orderNo);
+                                        this.updateGenerateProgress(i + 1, selectedGeneratedRecords.length, record.orderNo, 'failed', statusResult.error_message || 'PDF重新生成失败', true);
+                                    } else if (taskStatus === 'processing') {
+                                        // 仍在处理中
+                                        record.status = 'generating';
+                                        const progressText = statusResult.message || `正在重新生成PDF... (${progress}%)`;
+                                        this.updateGenerateProgress(i, selectedGeneratedRecords.length, record.orderNo, 'processing', progressText, true);
+                                    } else if (taskStatus === 'pending') {
+                                        this.updateGenerateProgress(i, selectedGeneratedRecords.length, record.orderNo, 'processing', '任务等待中...', true);
+                                    }
+                                }
+                            } catch (statusError) {
+                                if (statusError.name === 'AbortError' || this.isCancelling) {
+                                    throw statusError;
+                                }
+                                console.error('查询任务状态失败:', statusError);
+                                // 继续轮询，不中断
+                                if (attempts % 5 === 0) {
+                                    this.updateGenerateProgress(i, selectedGeneratedRecords.length, record.orderNo, 'processing', '正在查询任务状态...', true);
+                                }
+                            }
+                        }
+                        
+                        if (!taskCompleted && !this.isCancelling) {
+                            // 超时，但可能已经生成
+                            record.status = 'pending';
                             failCount++;
                             failedOrders.push(record.orderNo);
-                            record.status = 'generated'; // 恢复状态
-                            // 更新进度：显示失败
-                            this.updateGenerateProgress(i + 1, selectedGeneratedRecords.length, record.orderNo, 'failed', true);
+                            this.updateGenerateProgress(i + 1, selectedGeneratedRecords.length, record.orderNo, 'failed', '重新生成超时', true);
                         }
                     } catch (error) {
                         if (error.name === 'AbortError' || this.isCancelling) {
@@ -2059,9 +2546,9 @@ createApp({
                         }
                         failCount++;
                         failedOrders.push(record.orderNo);
-                        record.status = 'generated'; // 恢复状态
+                        record.status = 'pending';
                         // 更新进度：显示失败
-                        this.updateGenerateProgress(i + 1, selectedGeneratedRecords.length, record.orderNo, 'failed', true);
+                        this.updateGenerateProgress(i + 1, selectedGeneratedRecords.length, record.orderNo, 'failed', error.message || '重新生成失败', true);
                         console.error(`重新生成 Order ${record.orderNo} 失败:`, error);
                     }
 
@@ -2083,10 +2570,14 @@ createApp({
                     await this.loadOrdersFromAPI(this.currentPage);
                 }
 
+                const warningList = Array.from(warningOrders);
+                const warningText = warningList.length > 0
+                    ? `\n存在空數據的訂單: ${warningList.join('、')}`
+                    : '';
                 if (failCount === 0) {
-                    alert(`批量重新生成完成！成功重新生成 ${successCount} 個PDF。`);
+                    alert(`批量重新生成完成！成功重新生成 ${successCount} 個PDF。${warningText}`);
                 } else {
-                    alert(`批量重新生成結束！\n成功: ${successCount} 個\n失敗: ${failCount} 個\n失敗的訂單: ${failedOrders.join(', ')}`);
+                    alert(`批量重新生成結束！\n成功: ${successCount} 個\n失敗: ${failCount} 個\n失敗的訂單: ${failedOrders.join(', ')}${warningText}`);
                 }
 
                 this.clearSelection();
@@ -2129,7 +2620,7 @@ createApp({
             }
         },
 
-        updateGenerateProgress(current, total, currentRecord, status = 'processing', isRegenerate = false) {
+        updateGenerateProgress(current, total, currentRecord, status = 'processing', statusMessage = '', isRegenerate = false) {
             const overlay = document.getElementById('generate-progress') || document.getElementById('download-progress');
             const progressFill = overlay ? overlay.querySelector('.progress-fill') : null;
             const progressText = overlay ? overlay.querySelector('.progress-text') : null;
@@ -2143,6 +2634,14 @@ createApp({
                 }
                 progressFill.style.width = `${percentage}%`;
                 if (percentage === 100) progressFill.classList.add('complete');
+                
+                // 更新状态消息
+                if (statusMessage) {
+                    progressDetails.textContent = `当前: Order ${currentRecord} - ${statusMessage}`;
+                } else {
+                    const statusText = status === 'completed' ? '完成' : status === 'failed' ? '失败' : status === 'processing' ? '处理中' : '等待中';
+                    progressDetails.textContent = `当前: Order ${currentRecord} - ${statusText}`;
+                }
                 
                 const actionText = isRegenerate ? '重新生成' : '生成';
                 

@@ -2,6 +2,7 @@
 // 直接使用 window.API_BASE_URL，避免重复声明错误
 
 const { createApp } = Vue;
+const KNOWN_PASSWORDS_KEY = 'knownUserPasswords';
 
 function getAuthInfo() {
     try {
@@ -83,7 +84,8 @@ createApp({
                     jobNos: [''],
                     active: true
                 }
-            }
+            },
+            knownUserPasswords: {}
         };
     },
     computed: {
@@ -106,12 +108,13 @@ createApp({
     },
     async mounted() {
         try {
+            this.loadKnownPasswords();
             await this.bootstrapUser();
             this.loadUserSettings();
             await this.fetchUsers();
         } catch (error) {
-            console.error('初始化失败:', error);
-            alert(error.message || '初始化失败，请重新登录');
+            console.error('初始化失敗:', error);
+            alert(error.message || '初始化失敗，請重新登入');
             sessionStorage.removeItem('authInfo');
             window.location.href = 'login.html';
         }
@@ -125,9 +128,9 @@ createApp({
             const profile = await apiFetch('/api/auth/me');
             const user = profile.user;
             if (user.role !== 'admin') {
-                alert('只有管理账号可以访问账号管理页面！');
+                alert('只有管理帳號可以訪問帳號管理頁面！');
                 window.location.href = 'tr-records.html';
-                throw new Error('无权限');
+                throw new Error('無權限');
             }
             this.userInfo = {
                 username: user.username,
@@ -151,13 +154,14 @@ createApp({
                     username: user.username,
                     role: user.role,
                     active: user.active,
+                    currentPassword: user.current_password || '',
                     jobNos: user.job_nos || [],
                     createdAt: user.created_at,
                     updatedAt: user.updated_at
                 }));
             } catch (error) {
-                console.error('加载用户列表失败:', error);
-                alert(error.message || '加载用户列表失败，请稍后重试');
+                console.error('載入用戶列表失敗:', error);
+                alert(error.message || '載入用戶列表失敗，請稍後重試');
             } finally {
                 this.loading = false;
             }
@@ -182,9 +186,10 @@ createApp({
 
         openEditModal(user) {
             this.modal.mode = 'edit';
+            const knownPwd = user.currentPassword || this.knownUserPasswords[user.username] || '';
             this.modal.form = {
                 username: user.username,
-                password: '',
+                password: knownPwd,
                 role: user.role || 'user',
                 jobNos: user.jobNos.length ? [...user.jobNos] : [''],
                 active: user.active
@@ -207,18 +212,18 @@ createApp({
         async submitModal() {
             const form = this.modal.form;
             if (!form.username.trim()) {
-                alert('用户名不能为空');
+                alert('用戶名不能為空');
                 return;
             }
             if (this.modal.mode === 'create' && !form.password.trim()) {
-                alert('请设置初始密码');
+                alert('請設置初始密碼');
                 return;
             }
             const jobNos = form.jobNos
                 .map(job => job.trim())
                 .filter(job => job.length > 0);
             if (jobNos.some(job => !/^\d+$/.test(job))) {
-                alert('Job No 只能填写数字');
+                alert('Job No 只能填寫數字');
                 return;
             }
             try {
@@ -237,8 +242,10 @@ createApp({
                         method: 'POST',
                         body: JSON.stringify(payload)
                     });
-                    const roleName = form.role === 'manager' ? '管理账号' : '普通账号';
-                    alert(`已创建${roleName}`);
+                    this.knownUserPasswords[payload.username] = payload.password;
+                    this.persistKnownPasswords();
+                    const roleName = form.role === 'manager' ? '管理帳號' : '普通帳號';
+                    alert(`已創建${roleName}`);
                 } else {
                     const payload = {
                         active: form.active
@@ -254,15 +261,19 @@ createApp({
                         method: 'PUT',
                         body: JSON.stringify(payload)
                     });
-                    alert('账号信息已更新');
+                    if (payload.password) {
+                        this.knownUserPasswords[form.username] = payload.password;
+                        this.persistKnownPasswords();
+                    }
+                    alert('帳號資訊已更新');
                 }
                 this.modal.visible = false;
                 await this.fetchUsers();
             } catch (error) {
-                console.error('保存用户信息失败:', error);
-                console.error('错误详情:', error.stack);
-                const errorMsg = error.message || '保存用户信息失败';
-                alert(`保存用户信息失败: ${errorMsg}\n\n请检查：\n1. 后端服务器是否运行（http://127.0.0.1:5000）\n2. 浏览器控制台是否有更多错误信息`);
+                console.error('保存用戶資訊失敗:', error);
+                console.error('錯誤詳情:', error.stack);
+                const errorMsg = error.message || '保存用戶資訊失敗';
+                alert(`保存用戶資訊失敗: ${errorMsg}\n\n請檢查：\n1. 後端伺服器是否運行（http://127.0.0.1:5000）\n2. 瀏覽器控制台是否有更多錯誤資訊`);
             }
         },
 
@@ -274,8 +285,8 @@ createApp({
                 });
                 user.active = !user.active;
             } catch (error) {
-                console.error('更新状态失败:', error);
-                alert(error.message || '更新状态失败');
+                console.error('更新狀態失敗:', error);
+                alert(error.message || '更新狀態失敗');
             }
         },
 
@@ -287,9 +298,9 @@ createApp({
             };
             return roleMap[role] || role;
         },
-        
+
         async deleteUser(user) {
-            if (!confirm(`确定要删除用户 ${user.username} 吗？`)) {
+            if (!confirm(`確定要刪除用戶 ${user.username} 嗎？`)) {
                 return;
             }
             try {
@@ -297,10 +308,10 @@ createApp({
                     method: 'DELETE'
                 });
                 this.users = this.users.filter(item => item.username !== user.username);
-                alert('用户已删除');
+                alert('用戶已刪除');
             } catch (error) {
-                console.error('删除用户失败:', error);
-                alert(error.message || '删除用户失败');
+                console.error('刪除用戶失敗:', error);
+                alert(error.message || '刪除用戶失敗');
             }
         },
 
@@ -314,10 +325,12 @@ createApp({
                     method: 'PUT',
                     body: JSON.stringify({ password: newPassword.trim() })
                 });
-                alert('密码已更新');
+                this.knownUserPasswords[user.username] = newPassword.trim();
+                this.persistKnownPasswords();
+                alert('密碼已更新');
             } catch (error) {
-                console.error('重置密码失败:', error);
-                alert(error.message || '重置密码失败');
+                console.error('重置密碼失敗:', error);
+                alert(error.message || '重置密碼失敗');
             }
         },
 
@@ -338,7 +351,7 @@ createApp({
             try {
                 await apiFetch('/api/auth/logout', { method: 'POST' });
             } catch (error) {
-                console.warn('注销失败:', error);
+                console.warn('註銷失敗:', error);
             } finally {
                 sessionStorage.removeItem('authInfo');
                 sessionStorage.removeItem('userSettings');
@@ -356,7 +369,7 @@ createApp({
                 try {
                     this.userSettings = JSON.parse(savedSettings);
                 } catch (error) {
-                    console.error('解析用户设置失败:', error);
+                    console.error('解析用戶設置失敗:', error);
                 }
             } else {
                 this.userSettings = {
@@ -370,13 +383,25 @@ createApp({
             }
         },
 
+        loadKnownPasswords() {
+            try {
+                this.knownUserPasswords = JSON.parse(sessionStorage.getItem(KNOWN_PASSWORDS_KEY) || '{}');
+            } catch (error) {
+                this.knownUserPasswords = {};
+            }
+        },
+
+        persistKnownPasswords() {
+            sessionStorage.setItem(KNOWN_PASSWORDS_KEY, JSON.stringify(this.knownUserPasswords));
+        },
+
         saveSettings() {
             if (!this.userSettings.name) {
-                alert('用户名为必填项！');
+                alert('用戶名為必填項！');
                 return;
             }
             sessionStorage.setItem('userSettings', JSON.stringify(this.userSettings));
-            alert('设置已保存！');
+            alert('設置已保存！');
             this.closeSettings();
         }
     }

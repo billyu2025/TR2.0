@@ -249,12 +249,14 @@ class FileIndexUpdater:
                                 SET file_size = ?,
                                     modified_time = ?,
                                     extracted_keywords = ?,
+                                    identifiers = ?,
                                     last_checked = CURRENT_TIMESTAMP
                                 WHERE file_path = ?
                             """, (
                                 file_info['file_size'],
                                 file_info['modified_time'],
                                 file_info['extracted_keywords'],
+                                file_info.get('identifiers', ''),
                                 file_path
                             ))
                             updated_count += 1

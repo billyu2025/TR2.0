@@ -34,6 +34,8 @@ class StockistTestDownloader:
         """
         self.db_path = db_path
         self.base_folder = base_folder
+        # 可选：强制索引命中优先（不回退全盘扫描），用于高并发场景降低磁盘压力
+        self.force_index_only = os.getenv('DOWNLOAD_INDEX_FORCE_HIT', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
         # 注意：实际文件夹名称是 "Stockist       Cert"（有多个空格）
         self.stockist_folder = os.path.join(base_folder, "Stockist Cert")
         # 文件夹名称：Private Formal（不是 Fomal）
@@ -558,17 +560,57 @@ class StockistTestDownloader:
                         )
                     else:
                         # 只搜索子文件夹（用于IAT Formal等）
-                        found_files = self.index_query.find_files_in_subfolder(
-                            folder_path=folder,
-                            keywords=keywords
-                        )
+                        # 对于 IAT Formal，我们需要找到包含关键词的子文件夹，然后下载该文件夹中的所有文件
+                        # 先找到匹配的子文件夹
+                        matching_subfolders = []
+                        try:
+                            items = os.listdir(folder)
+                            for item in items:
+                                item_path = os.path.join(folder, item)
+                                if os.path.isdir(item_path):
+                                    item_lower = item.lower()
+                                    for keyword in keywords:
+                                        keyword_lower = keyword.lower() if keyword else ''
+                                        if keyword and keyword_lower in item_lower:
+                                            matching_subfolders.append(item_path)
+                                            print(f"[索引查询] 找到匹配的子文件夹: {item}")
+                                            break
+                        except Exception as e:
+                            print(f"[索引查询] 读取文件夹失败: {e}")
+                        
+                        # 如果找到匹配的子文件夹，使用索引查询该文件夹中的所有文件
+                        if matching_subfolders:
+                            found_files = []
+                            for subfolder in matching_subfolders:
+                                # 使用索引查询该子文件夹中的所有 PDF 文件
+                                subfolder_files = self.index_query.find_files_in_subfolder(
+                                    folder_path=subfolder,
+                                    keywords=[]  # 不限制关键词，获取所有文件
+                                )
+                                found_files.extend(subfolder_files)
+                                print(f"[索引查询] 子文件夹 {os.path.basename(subfolder)}: 找到 {len(subfolder_files)} 个 PDF 文件")
+                        else:
+                            # 如果没有找到匹配的子文件夹，使用原来的逻辑
+                            found_files = self.index_query.find_files_in_subfolder(
+                                folder_path=folder,
+                                keywords=keywords
+                            )
                     
                     if found_files:
                         print(f"[索引查询] {folder}: 找到 {len(found_files)} 个匹配的 PDF")
                     return found_files
+                if self.force_index_only:
+                    print(f"[索引查询] 强制索引模式开启，未识别 folder_type，跳过全盘扫描: {folder}")
+                    return []
             except Exception as e:
                 print(f"[警告] 索引查询失败，回退到文件系统遍历: {e}")
                 # 继续执行文件系统遍历
+                if self.force_index_only:
+                    print(f"[索引查询] 强制索引模式开启，索引异常后不回退扫描: {folder}")
+                    return []
+        elif self.force_index_only:
+            print(f"[索引查询] 强制索引模式开启，索引不可用，跳过全盘扫描: {folder}")
+            return []
         
         # 回退到原始的文件系统遍历方法
         found_files = []
@@ -607,6 +649,7 @@ class StockistTestDownloader:
             subfolders = []
             try:
                 items = os.listdir(folder)
+                print(f"[搜索] {folder}: 扫描 {len(items)} 个项目")
                 
                 for item in items:
                     item_path = os.path.join(folder, item)
@@ -617,6 +660,7 @@ class StockistTestDownloader:
                             keyword_lower = keyword.lower() if keyword else ''
                             if keyword and keyword_lower in item_lower:
                                 subfolders.append(item_path)
+                                print(f"[搜索] 找到匹配的子文件夹: {item} (包含关键词: {keyword})")
                                 break
             except Exception as e:
                 print(f"[错误] 读取文件夹失败 {folder}: {e}")
@@ -626,12 +670,16 @@ class StockistTestDownloader:
             # 如果找到匹配的文件夹，下载该文件夹中的所有PDF
             for subfolder in subfolders:
                 pdf_count = 0
+                print(f"[搜索] 扫描子文件夹: {subfolder}")
                 for root, dirs, files in os.walk(subfolder):
                     for file in files:
                         if file.lower().endswith('.pdf'):
                             file_path = os.path.join(root, file)
                             found_files.append(file_path)
                             pdf_count += 1
+                            print(f"[搜索]   找到 PDF: {file}")
+                
+                print(f"[搜索] 子文件夹 {os.path.basename(subfolder)}: 共找到 {pdf_count} 个 PDF 文件")
             
             # 只打印统计信息
             if subfolders or found_files:
@@ -759,77 +807,68 @@ class StockistTestDownloader:
         
         if is_iat:
             # IAT 类型
+            print(f"[IAT下载] Order {order_no}: 开始查找 IAT Formal 文件")
+            print(f"[IAT下载] 关键词列表: {all_keywords}")
+            
             # 先查找 IAT Formal（只搜索子文件夹，不需要递归搜索所有文件）
+            # 对于 IAT 类型，找到匹配的子文件夹后，直接下载该文件夹中的所有文件
             iat_formal_files = self.find_files_by_keywords(self.iat_formal_folder, all_keywords, search_subfolders=False)
-            
-            # 将 IAT Formal 中找到的文件按 stockist_cert 分组
-            formal_files_by_cert = {}
-            for file_path in iat_formal_files:
-                file_name = os.path.basename(file_path)
-                matched_cert = self.match_file_to_stockist_cert(
-                    file_name, file_path, stockist_certs, rm_dn_nos, rm_dn_to_stockist_map
-                )
-                if matched_cert:
-                    if matched_cert not in formal_files_by_cert:
-                        formal_files_by_cert[matched_cert] = []
-                    formal_files_by_cert[matched_cert].append(file_path)
-            
-            # 找出哪些 stockist_cert 在 IAT Formal 中没有文件
-            missing_certs = [cert for cert in stockist_certs if cert and cert not in formal_files_by_cert]
+            print(f"[IAT下载] IAT Formal 找到 {len(iat_formal_files)} 个文件: {[os.path.basename(f) for f in iat_formal_files]}")
             
             if iat_formal_files:
                 found_formal = True
                 additional_files.extend(iat_formal_files)
-                
+                print(f"[IAT下载] ✅ 已添加 {len(iat_formal_files)} 个 IAT Formal 文件到下载列表")
+                # 按 stockist_cert 判断是否已在 IAT Formal 覆盖
+                formal_files_by_cert = {}
+                for file_path in iat_formal_files:
+                    file_name = os.path.basename(file_path)
+                    matched_cert = self.match_file_to_stockist_cert(
+                        file_name, file_path, stockist_certs, rm_dn_nos, rm_dn_to_stockist_map
+                    )
+                    if matched_cert:
+                        formal_files_by_cert.setdefault(matched_cert, []).append(file_path)
+
+                missing_certs = [cert for cert in stockist_certs if cert and cert not in formal_files_by_cert]
                 if missing_certs:
-                    # 为缺失的 stockist_cert 构建关键词（只包含这些 cert 和对应的 rm_dn_no）
+                    print(f"[IAT下载] 规则命中：IAT Formal 对部分 cert 缺失 {missing_certs}，回退 IAT Prelim 递归补齐")
                     missing_keywords = []
                     for cert in missing_certs:
                         missing_keywords.append(cert)
-                        # 查找该 cert 对应的 rm_dn_no
                         for rm_dn_no, mapped_cert in rm_dn_to_stockist_map.items():
                             if mapped_cert == cert:
                                 missing_keywords.append(rm_dn_no)
-                    
+
                     if missing_keywords:
-                        # 查找 IAT Prelim（只搜索子文件夹）
-                        iat_prelim_files = self.find_files_by_keywords(self.iat_prelim_folder, missing_keywords, search_subfolders=False)
-                        
+                        iat_prelim_files = self.find_files_by_keywords(
+                            self.iat_prelim_folder,
+                            missing_keywords,
+                            search_subfolders=True
+                        )
                         if iat_prelim_files:
-                            # 验证这些文件确实属于缺失的 stockist_cert
-                            prelim_files_by_cert = {}
+                            valid_prelim_files = []
                             for file_path in iat_prelim_files:
                                 file_name = os.path.basename(file_path)
                                 matched_cert = self.match_file_to_stockist_cert(
                                     file_name, file_path, missing_certs, rm_dn_nos, rm_dn_to_stockist_map
                                 )
                                 if matched_cert and matched_cert in missing_certs:
-                                    prelim_files_by_cert[matched_cert] = prelim_files_by_cert.get(matched_cert, []) + [file_path]
-                            
-                            if prelim_files_by_cert:
-                                # 只添加属于缺失 stockist_cert 的文件
-                                valid_prelim_files = []
-                                for file_path in iat_prelim_files:
-                                    file_name = os.path.basename(file_path)
-                                    matched_cert = self.match_file_to_stockist_cert(
-                                        file_name, file_path, missing_certs, rm_dn_nos, rm_dn_to_stockist_map
-                                    )
-                                    if matched_cert and matched_cert in missing_certs:
-                                        valid_prelim_files.append(file_path)
-                                
+                                    valid_prelim_files.append(file_path)
+                            if valid_prelim_files:
                                 additional_files.extend(valid_prelim_files)
-                        else:
-                            pass  # IAT Prelim 中没有找到匹配的文件
-                    else:
-                        pass  # 无法为缺失的 stockist_cert 构建关键词，跳过 IAT Prelim 搜索
+                                print(f"[IAT下载] ✅ 已补齐 {len(valid_prelim_files)} 个 IAT Prelim 文件")
                 else:
-                    pass  # 所有 stockist_cert 在 IAT Formal 中都有文件，不需要查找 IAT Prelim
+                    print(f"[IAT下载] 规则命中：IAT Formal 已覆盖全部 cert，跳过 IAT Prelim 搜索")
             else:
                 # IAT Formal 中没有文件，查找 IAT Prelim
-                iat_prelim_files = self.find_files_by_keywords(self.iat_prelim_folder, all_keywords, search_subfolders=False)
+                print(f"[IAT下载] IAT Formal 中没有找到文件，查找 IAT Prelim")
+                print(f"[IAT下载] 规则命中：IAT Formal 无对应文件夹或文件夹为空，回退 IAT Prelim 递归搜索")
+                # IAT Prelim 常见是文件名直接含 DN（不按子文件夹命名），因此需要递归按文件名搜索
+                iat_prelim_files = self.find_files_by_keywords(self.iat_prelim_folder, all_keywords, search_subfolders=True)
                 
                 if iat_prelim_files:
                     additional_files.extend(iat_prelim_files)
+                    print(f"[IAT下载] ✅ 已添加 {len(iat_prelim_files)} 个 IAT Prelim 文件到下载列表")
         
         elif is_private:
             # Private 类型
@@ -913,15 +952,23 @@ class StockistTestDownloader:
             if iat_formal_files:
                 found_formal = True
                 additional_files.extend(iat_formal_files)
+                print(f"[IAT下载] 规则命中：IAT Formal 已有文件，跳过 IAT Prelim 搜索")
             else:
-                # 查找 IAT Prelim（只搜索子文件夹）
-                iat_prelim_files = self.find_files_by_keywords(self.iat_prelim_folder, all_keywords, search_subfolders=False)
+                print(f"[IAT下载] 规则命中：IAT Formal 无对应文件夹或文件夹为空，回退 IAT Prelim 递归搜索")
+                # IAT Prelim 常见是文件名直接含 DN（不按子文件夹命名），因此需要递归按文件名搜索
+                iat_prelim_files = self.find_files_by_keywords(self.iat_prelim_folder, all_keywords, search_subfolders=True)
                 
                 if iat_prelim_files:
                     additional_files.extend(iat_prelim_files)
         
         # 5. 合并所有文件
         all_files = stockist_files + additional_files
+        
+        print(f"[文件汇总] Stockist 文件: {len(stockist_files)} 个")
+        print(f"[文件汇总] Additional 文件: {len(additional_files)} 个")
+        print(f"[文件汇总] 总计: {len(all_files)} 个文件")
+        for f in all_files:
+            print(f"[文件汇总]   - {os.path.basename(f)}")
         
         if not all_files:
             raise ValueError(f"No PDF files found for order {order_no} with keywords: {all_keywords}")
@@ -935,20 +982,231 @@ class StockistTestDownloader:
             if stockist_cert:
                 files_by_stockist_cert[stockist_cert] = []
         
+        # 用于存储无法匹配到 stockist_cert 的文件（这些文件仍然需要被下载）
+        unmatched_files = []
+        
         # 将所有文件按照 stockist_cert 分类
+        print(f"[文件匹配] 开始匹配 {len(all_files)} 个文件到 stockist_cert")
+        print(f"[文件匹配] stockist_certs: {stockist_certs}")
+        print(f"[文件匹配] rm_dn_nos: {rm_dn_nos}")
+        
+        # 对于 IAT 类型，IAT Formal/Prelim 文件夹中的文件根据文件夹名称（stockist_cert）进行分配
+        iat_formal_normalized = os.path.normpath(self.iat_formal_folder)
+        iat_prelim_normalized = os.path.normpath(self.iat_prelim_folder)
+        
         for file_path in all_files:
             file_name = os.path.basename(file_path)
+            normalized_path = os.path.normpath(file_path)
             
-            # 使用通用匹配方法
-            matched_stockist_cert = self.match_file_to_stockist_cert(
-                file_name, file_path, stockist_certs, rm_dn_nos, rm_dn_to_stockist_map
-            )
+            # 检查是否来自 IAT Formal 或 IAT Prelim
+            is_iat_formal = normalized_path.startswith(iat_formal_normalized)
+            is_iat_prelim = normalized_path.startswith(iat_prelim_normalized)
             
-            if matched_stockist_cert:
-                # 确保 matched_stockist_cert 在 files_by_stockist_cert 中
-                if matched_stockist_cert not in files_by_stockist_cert:
-                    files_by_stockist_cert[matched_stockist_cert] = []
-                files_by_stockist_cert[matched_stockist_cert].append(file_path)
+            if is_iat and (is_iat_formal or is_iat_prelim):
+                # 对于 IAT 类型，根据文件所在子文件夹的名称（stockist_cert）进行分配
+                # 由于子文件夹是通过 stockist_certs 查找的，所以文件夹名称一定在 stockist_certs 列表中
+                # 获取文件相对于 IAT Formal 或 IAT Prelim 的路径
+                if is_iat_formal:
+                    base_folder = iat_formal_normalized
+                else:
+                    base_folder = iat_prelim_normalized
+                
+                # 获取相对路径
+                try:
+                    rel_path = os.path.relpath(normalized_path, base_folder)
+                    # 获取第一层文件夹名称（即 stockist_cert）
+                    path_parts = rel_path.split(os.path.sep)
+                    if path_parts:
+                        folder_name = path_parts[0]  # 子文件夹名称，即 stockist_cert
+                        
+                        # 在 stockist_certs 列表中查找匹配的 stockist_cert（大小写不敏感）
+                        matched_cert = None
+                        for cert in stockist_certs:
+                            if cert and cert.upper() == folder_name.upper():
+                                matched_cert = cert
+                                break
+                        
+                        if matched_cert:
+                            if matched_cert not in files_by_stockist_cert:
+                                files_by_stockist_cert[matched_cert] = []
+                            files_by_stockist_cert[matched_cert].append(file_path)
+                            print(f"[文件匹配] ✅ IAT 文件 {file_name} -> {matched_cert} (根据文件夹名称: {folder_name})")
+                        else:
+                            # 理论上不应该发生，因为文件夹是通过 stockist_certs 查找的
+                            # 但如果发生了，记录警告并添加到未匹配列表
+                            unmatched_files.append(file_path)
+                            print(f"[文件匹配] ⚠️ IAT 文件 {file_name} 的文件夹名称 {folder_name} 不在 stockist_certs 中（异常情况）")
+                    else:
+                        # 无法获取文件夹名称（异常情况）
+                        unmatched_files.append(file_path)
+                        print(f"[文件匹配] ⚠️ IAT 文件 {file_name} 无法获取文件夹名称（异常情况）")
+                except ValueError:
+                    # 如果 relpath 失败（不同驱动器），尝试从路径中提取
+                    # 路径格式：D:\Stockist&Test Report\IAT Formal\HL2310\...
+                    path_parts = normalized_path.split(os.path.sep)
+                    # 查找 IAT Formal 或 IAT Prelim 在路径中的位置
+                    base_folder_name = os.path.basename(base_folder)
+                    base_index = -1
+                    for i, part in enumerate(path_parts):
+                        if part == base_folder_name or base_folder_name in part:
+                            base_index = i
+                            break
+                    
+                    if base_index >= 0 and base_index + 1 < len(path_parts):
+                        folder_name = path_parts[base_index + 1]  # 子文件夹名称
+                        
+                        # 在 stockist_certs 列表中查找匹配的 stockist_cert（大小写不敏感）
+                        matched_cert = None
+                        for cert in stockist_certs:
+                            if cert and cert.upper() == folder_name.upper():
+                                matched_cert = cert
+                                break
+                        
+                        if matched_cert:
+                            if matched_cert not in files_by_stockist_cert:
+                                files_by_stockist_cert[matched_cert] = []
+                            files_by_stockist_cert[matched_cert].append(file_path)
+                            print(f"[文件匹配] ✅ IAT 文件 {file_name} -> {matched_cert} (根据文件夹名称: {folder_name})")
+                        else:
+                            # 理论上不应该发生
+                            unmatched_files.append(file_path)
+                            print(f"[文件匹配] ⚠️ IAT 文件 {file_name} 的文件夹名称 {folder_name} 不在 stockist_certs 中（异常情况）")
+                    else:
+                        # 无法提取文件夹名称（异常情况）
+                        unmatched_files.append(file_path)
+                        print(f"[文件匹配] ⚠️ IAT 文件 {file_name} 无法提取文件夹名称（异常情况）")
+            else:
+                # 对于其他文件（Stockist Cert、Private 等），使用正常匹配逻辑
+                matched_stockist_cert = self.match_file_to_stockist_cert(
+                    file_name, file_path, stockist_certs, rm_dn_nos, rm_dn_to_stockist_map
+                )
+                
+                if matched_stockist_cert:
+                    # 确保 matched_stockist_cert 在 files_by_stockist_cert 中
+                    if matched_stockist_cert not in files_by_stockist_cert:
+                        files_by_stockist_cert[matched_stockist_cert] = []
+                    files_by_stockist_cert[matched_stockist_cert].append(file_path)
+                    print(f"[文件匹配] ✅ {file_name} -> {matched_stockist_cert}")
+                else:
+                    # 如果无法匹配到 stockist_cert
+                    unmatched_files.append(file_path)
+                    print(f"[文件匹配] ❌ 文件无法匹配到 stockist_cert: {file_name} (路径: {file_path})")
+        
+        # 7. 处理无法匹配的文件：如果它们在同一个子文件夹中，分配给该文件夹中已匹配文件的 stockist_cert
+        # 对于 IAT 类型，如果文件在同一个子文件夹中（如 HL2310），应该属于同一个订单
+        if unmatched_files:
+            print(f"[文件匹配] 发现 {len(unmatched_files)} 个无法匹配到 stockist_cert 的文件")
+            for file_path in unmatched_files:
+                print(f"[文件匹配] 未匹配文件: {os.path.basename(file_path)} (路径: {file_path})")
+            
+            if is_iat:
+                # 按文件夹分组未匹配的文件
+                # 对于 IAT 类型，我们需要找到文件的直接父文件夹（子文件夹，如 HL2310）
+                unmatched_by_folder = {}
+                for file_path in unmatched_files:
+                    # 获取文件的完整路径并标准化
+                    normalized_path = os.path.normpath(file_path)
+                    # 获取文件的直接父文件夹
+                    folder_path = os.path.dirname(normalized_path)
+                    # 对于 IAT Formal，我们需要找到子文件夹（如 IAT Formal/HL2310）
+                    # 检查是否在 IAT Formal 或 IAT Prelim 文件夹中
+                    iat_formal_normalized = os.path.normpath(self.iat_formal_folder)
+                    iat_prelim_normalized = os.path.normpath(self.iat_prelim_folder)
+                    
+                    # 找到子文件夹路径（相对于 IAT Formal 或 IAT Prelim 的直接子文件夹）
+                    if folder_path.startswith(iat_formal_normalized):
+                        # 获取相对于 IAT Formal 的路径
+                        rel_path = os.path.relpath(folder_path, iat_formal_normalized)
+                        # 如果是直接子文件夹，使用完整路径；否则使用子文件夹路径
+                        if os.path.sep not in rel_path:
+                            # 直接子文件夹（如 HL2310）
+                            subfolder_path = folder_path
+                        else:
+                            # 在子文件夹的子目录中，找到子文件夹路径
+                            parts = rel_path.split(os.path.sep)
+                            subfolder_path = os.path.join(iat_formal_normalized, parts[0])
+                    elif folder_path.startswith(iat_prelim_normalized):
+                        rel_path = os.path.relpath(folder_path, iat_prelim_normalized)
+                        if os.path.sep not in rel_path:
+                            subfolder_path = folder_path
+                        else:
+                            parts = rel_path.split(os.path.sep)
+                            subfolder_path = os.path.join(iat_prelim_normalized, parts[0])
+                    else:
+                        # 不在 IAT 文件夹中，使用直接父文件夹
+                        subfolder_path = folder_path
+                    
+                    if subfolder_path not in unmatched_by_folder:
+                        unmatched_by_folder[subfolder_path] = []
+                    unmatched_by_folder[subfolder_path].append(file_path)
+                
+                print(f"[文件匹配] 按文件夹分组: {len(unmatched_by_folder)} 个文件夹")
+                for folder_path, files in unmatched_by_folder.items():
+                    print(f"[文件匹配] 文件夹 {os.path.basename(folder_path)}: {len(files)} 个文件")
+                
+                # 对于每个未匹配文件的文件夹，查找同一文件夹中已匹配的文件
+                for folder_path, files in unmatched_by_folder.items():
+                    # 标准化文件夹路径
+                    folder_path_normalized = os.path.normpath(folder_path)
+                    
+                    # 查找同一文件夹中已匹配的文件
+                    matched_files_in_folder = []
+                    for stockist_cert, matched_files in files_by_stockist_cert.items():
+                        for matched_file in matched_files:
+                            matched_file_dir = os.path.normpath(os.path.dirname(matched_file))
+                            # 检查是否在同一个子文件夹中
+                            if matched_file_dir == folder_path_normalized:
+                                matched_files_in_folder.append((stockist_cert, matched_file))
+                                break
+                            # 或者检查是否在同一个子文件夹的子目录中（对于 IAT，子文件夹内的所有文件都应该属于同一个订单）
+                            elif (matched_file_dir.startswith(folder_path_normalized) or 
+                                  folder_path_normalized.startswith(matched_file_dir)):
+                                # 进一步检查：如果文件在子文件夹的子目录中，也认为是同一个文件夹
+                                matched_file_rel = os.path.relpath(matched_file_dir, folder_path_normalized)
+                                if not matched_file_rel.startswith('..'):
+                                    matched_files_in_folder.append((stockist_cert, matched_file))
+                                    break
+                    
+                    # 如果找到已匹配的文件，将未匹配的文件分配给同一个 stockist_cert
+                    if matched_files_in_folder:
+                        # 使用第一个匹配的 stockist_cert
+                        target_cert = matched_files_in_folder[0][0]
+                        print(f"[修复] ✅ 将文件夹 {os.path.basename(folder_path)} 中的 {len(files)} 个未匹配文件分配给 {target_cert}")
+                        for file_path in files:
+                            files_by_stockist_cert[target_cert].append(file_path)
+                            print(f"[修复]   添加文件: {os.path.basename(file_path)} -> {target_cert}")
+                    else:
+                        # 如果文件夹中没有已匹配的文件，分配给第一个 stockist_cert（如果有的话）
+                        if stockist_certs:
+                            target_cert = stockist_certs[0]
+                            print(f"[修复] ✅ 将文件夹 {os.path.basename(folder_path)} 中的 {len(files)} 个未匹配文件分配给第一个 stockist_cert: {target_cert}")
+                            for file_path in files:
+                                if target_cert not in files_by_stockist_cert:
+                                    files_by_stockist_cert[target_cert] = []
+                                files_by_stockist_cert[target_cert].append(file_path)
+                                print(f"[修复]   添加文件: {os.path.basename(file_path)} -> {target_cert}")
+                        else:
+                            # 如果没有 stockist_cert，仍然添加到第一个（如果有的话）
+                            print(f"[警告] ❌ 文件夹 {os.path.basename(folder_path)} 中的 {len(files)} 个未匹配文件无法分配，因为没有 stockist_cert")
+            else:
+                # 对于非 IAT 类型，也尝试分配未匹配的文件
+                if stockist_certs:
+                    target_cert = stockist_certs[0]
+                    print(f"[修复] 将 {len(unmatched_files)} 个未匹配文件分配给第一个 stockist_cert: {target_cert}")
+                    for file_path in unmatched_files:
+                        if target_cert not in files_by_stockist_cert:
+                            files_by_stockist_cert[target_cert] = []
+                        files_by_stockist_cert[target_cert].append(file_path)
+        
+        # 8. 打印最终文件分配情况
+        print(f"[文件分配] 最终文件分配情况:")
+        total_files_in_zip = 0
+        for stockist_cert, files in files_by_stockist_cert.items():
+            print(f"[文件分配] {stockist_cert}: {len(files)} 个文件")
+            for file_path in files:
+                print(f"[文件分配]   - {os.path.basename(file_path)}")
+            total_files_in_zip += len(files)
+        print(f"[文件分配] 总计: {total_files_in_zip} 个文件将被添加到 ZIP")
         
         # 7. 创建 ZIP 文件
         temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
@@ -958,6 +1216,7 @@ class StockistTestDownloader:
         try:
             with zipfile.ZipFile(temp_zip_path, 'w', zipfile.ZIP_STORED) as zipf:
                 # 为每个 stockist_cert 创建文件夹并添加对应的文件
+                files_added_count = 0
                 for stockist_cert, files in files_by_stockist_cert.items():
                     if not files:
                         continue
@@ -1020,6 +1279,8 @@ class StockistTestDownloader:
                                 zip_path = f"{stockist_cert}/{file_name}"
                             
                             zipf.write(file_path, zip_path)
+                            files_added_count += 1
+                            print(f"[ZIP创建] 已添加文件: {file_name} -> {zip_path}")
                         except ValueError:
                             # 如果 relpath 失败（不同驱动器），使用文件名
                             if preserve_folder_structure:
@@ -1028,9 +1289,17 @@ class StockistTestDownloader:
                                 # 其他文件夹直接放在 stockist_cert 文件夹下
                                 zip_path = f"{stockist_cert}/{file_name}"
                             zipf.write(file_path, zip_path)
+                            files_added_count += 1
+                            print(f"[ZIP创建] 已添加文件: {file_name} -> {zip_path}")
+                        except Exception as e:
+                            print(f"[ZIP创建] 添加文件失败: {file_name}, 错误: {e}")
+                            import traceback
+                            traceback.print_exc()
             
-            print(f"[下载] 成功创建 ZIP 文件: {temp_zip_path}, 包含 {len(all_files)} 个文件")
-            return temp_zip_path, len(all_files)
+            print(f"[下载] 成功创建 ZIP 文件: {temp_zip_path}")
+            print(f"[下载] 实际添加到 ZIP 的文件数: {files_added_count}")
+            print(f"[下载] 原始找到的文件数: {len(all_files)}")
+            return temp_zip_path, files_added_count
             
         except Exception as e:
             # 如果创建 ZIP 失败，清理临时文件
@@ -1145,54 +1414,13 @@ class StockistTestDownloader:
                     # IAT 类型
                     iat_formal_files = self.find_files_by_keywords(self.iat_formal_folder, all_keywords, search_subfolders=False)
                     
-                    # 将 IAT Formal 中找到的文件按 stockist_cert 分组
-                    formal_files_by_cert = {}
-                    for file_path in iat_formal_files:
-                        file_name = os.path.basename(file_path)
-                        matched_cert = self.match_file_to_stockist_cert(
-                            file_name, file_path, stockist_certs, rm_dn_nos, order_rm_dn_map
-                        )
-                        if matched_cert:
-                            if matched_cert not in formal_files_by_cert:
-                                formal_files_by_cert[matched_cert] = []
-                            formal_files_by_cert[matched_cert].append(file_path)
-                    
-                    # 找出哪些 stockist_cert 在 IAT Formal 中没有文件
-                    missing_certs = [cert for cert in stockist_certs if cert and cert not in formal_files_by_cert]
-                    
                     if iat_formal_files:
                         additional_files.extend(iat_formal_files)
-                        
-                        if missing_certs:
-                            # 为缺失的 stockist_cert 构建关键词（只包含这些 cert 和对应的 rm_dn_no）
-                            missing_keywords = []
-                            for cert in missing_certs:
-                                missing_keywords.append(cert)
-                                # 查找该 cert 对应的 rm_dn_no
-                                for rm_dn_no, mapped_cert in order_rm_dn_map.items():
-                                    if mapped_cert == cert:
-                                        missing_keywords.append(rm_dn_no)
-                            
-                            if missing_keywords:
-                                # 查找 IAT Prelim（只搜索子文件夹）
-                                iat_prelim_files = self.find_files_by_keywords(self.iat_prelim_folder, missing_keywords, search_subfolders=False)
-                                
-                                if iat_prelim_files:
-                                    # 验证这些文件确实属于缺失的 stockist_cert
-                                    valid_prelim_files = []
-                                    for file_path in iat_prelim_files:
-                                        file_name = os.path.basename(file_path)
-                                        matched_cert = self.match_file_to_stockist_cert(
-                                            file_name, file_path, missing_certs, rm_dn_nos, order_rm_dn_map
-                                        )
-                                        if matched_cert and matched_cert in missing_certs:
-                                            valid_prelim_files.append(file_path)
-                                    
-                                    if valid_prelim_files:
-                                        additional_files.extend(valid_prelim_files)
+                        print(f"[IAT下载] Order {order_no}: IAT Formal 已有文件，跳过 IAT Prelim 搜索")
                     else:
-                        # IAT Formal 中没有文件，查找 IAT Prelim
-                        iat_prelim_files = self.find_files_by_keywords(self.iat_prelim_folder, all_keywords, search_subfolders=False)
+                        # IAT Formal 没有对应文件夹或文件夹为空，回退到 IAT Prelim 递归文件搜索
+                        print(f"[IAT下载] Order {order_no}: IAT Formal 无对应文件夹或文件夹为空，回退 IAT Prelim 递归搜索")
+                        iat_prelim_files = self.find_files_by_keywords(self.iat_prelim_folder, all_keywords, search_subfolders=True)
                         if iat_prelim_files:
                             additional_files.extend(iat_prelim_files)
                             
@@ -1306,10 +1534,13 @@ class StockistTestDownloader:
         try:
             with zipfile.ZipFile(temp_zip_path, 'w', zipfile.ZIP_STORED) as zipf:
                 # 为每个 stockist_cert 创建文件夹并添加对应的文件
+                files_added_count = 0
                 for stockist_cert, files in files_by_stockist_cert.items():
                     if not files:
+                        print(f"[ZIP创建] 跳过空的 stockist_cert: {stockist_cert}")
                         continue
                     
+                    print(f"[ZIP创建] 处理 stockist_cert: {stockist_cert}, {len(files)} 个文件")
                     for file_path in files:
                         abs_file_path = os.path.abspath(file_path)
                         file_name = os.path.basename(file_path)
@@ -1462,48 +1693,13 @@ class StockistTestDownloader:
                     # IAT 类型
                     iat_formal_files = self.find_files_by_keywords(self.iat_formal_folder, all_keywords, search_subfolders=False)
                     
-                    # 将 IAT Formal 中找到的文件按 stockist_cert 分组
-                    formal_files_by_cert = {}
-                    for file_path in iat_formal_files:
-                        file_name = os.path.basename(file_path)
-                        matched_cert = self.match_file_to_stockist_cert(
-                            file_name, file_path, stockist_certs, rm_dn_nos, rm_dn_to_stockist_map
-                        )
-                        if matched_cert:
-                            if matched_cert not in formal_files_by_cert:
-                                formal_files_by_cert[matched_cert] = []
-                            formal_files_by_cert[matched_cert].append(file_path)
-                    
-                    # 找出哪些 stockist_cert 在 IAT Formal 中没有文件
-                    missing_certs = [cert for cert in stockist_certs if cert and cert not in formal_files_by_cert]
-                    
                     if iat_formal_files:
                         additional_files.extend(iat_formal_files)
-                        
-                        if missing_certs:
-                            # 为缺失的 stockist_cert 构建关键词
-                            missing_keywords = []
-                            for cert in missing_certs:
-                                missing_keywords.append(cert)
-                                for rm_dn_no, mapped_cert in rm_dn_to_stockist_map.items():
-                                    if mapped_cert == cert:
-                                        missing_keywords.append(rm_dn_no)
-                            
-                            if missing_keywords:
-                                iat_prelim_files = self.find_files_by_keywords(self.iat_prelim_folder, missing_keywords, search_subfolders=False)
-                                if iat_prelim_files:
-                                    # 只添加属于缺失 stockist_cert 的文件
-                                    valid_prelim_files = []
-                                    for file_path in iat_prelim_files:
-                                        file_name = os.path.basename(file_path)
-                                        matched_cert = self.match_file_to_stockist_cert(
-                                            file_name, file_path, missing_certs, rm_dn_nos, rm_dn_to_stockist_map
-                                        )
-                                        if matched_cert and matched_cert in missing_certs:
-                                            valid_prelim_files.append(file_path)
-                                    additional_files.extend(valid_prelim_files)
+                        print(f"[IAT下载] Order {order_no}: IAT Formal 已有文件，跳过 IAT Prelim 搜索")
                     else:
-                        iat_prelim_files = self.find_files_by_keywords(self.iat_prelim_folder, all_keywords, search_subfolders=False)
+                        # IAT Formal 没有对应文件夹或文件夹为空，回退到 IAT Prelim 递归文件搜索
+                        print(f"[IAT下载] Order {order_no}: IAT Formal 无对应文件夹或文件夹为空，回退 IAT Prelim 递归搜索")
+                        iat_prelim_files = self.find_files_by_keywords(self.iat_prelim_folder, all_keywords, search_subfolders=True)
                         if iat_prelim_files:
                             additional_files.extend(iat_prelim_files)
                             
@@ -1887,8 +2083,47 @@ class StockistTestDownloader:
                         iat_formal_files = self.find_files_by_keywords(self.iat_formal_folder, all_keywords, search_subfolders=False)
                         if iat_formal_files:
                             additional_files.extend(iat_formal_files)
+                            # 按 stockist_cert 判断 IAT Formal 是否已覆盖，缺失的再到 IAT Prelim 补齐
+                            formal_files_by_cert = {}
+                            for file_path in iat_formal_files:
+                                file_name = os.path.basename(file_path)
+                                matched_cert = self.match_file_to_stockist_cert(
+                                    file_name, file_path, stockist_certs, rm_dn_nos, order_rm_dn_map
+                                )
+                                if matched_cert:
+                                    formal_files_by_cert.setdefault(matched_cert, []).append(file_path)
+
+                            missing_certs = [cert for cert in stockist_certs if cert and cert not in formal_files_by_cert]
+                            if missing_certs:
+                                print(f"[IAT下载] Order {order_no}: IAT Formal 对部分 cert 缺失 {missing_certs}，回退 IAT Prelim 递归补齐")
+                                missing_keywords = []
+                                for cert in missing_certs:
+                                    missing_keywords.append(cert)
+                                    for rm_dn_no, mapped_cert in order_rm_dn_map.items():
+                                        if mapped_cert == cert:
+                                            missing_keywords.append(rm_dn_no)
+
+                                if missing_keywords:
+                                    iat_prelim_files = self.find_files_by_keywords(
+                                        self.iat_prelim_folder, missing_keywords, search_subfolders=True
+                                    )
+                                    if iat_prelim_files:
+                                        valid_prelim_files = []
+                                        for file_path in iat_prelim_files:
+                                            file_name = os.path.basename(file_path)
+                                            matched_cert = self.match_file_to_stockist_cert(
+                                                file_name, file_path, missing_certs, rm_dn_nos, order_rm_dn_map
+                                            )
+                                            if matched_cert and matched_cert in missing_certs:
+                                                valid_prelim_files.append(file_path)
+                                        if valid_prelim_files:
+                                            additional_files.extend(valid_prelim_files)
+                                            print(f"[IAT下载] Order {order_no}: 已补齐 {len(valid_prelim_files)} 个 IAT Prelim 文件")
+                            else:
+                                print(f"[IAT下载] Order {order_no}: IAT Formal 已覆盖全部 cert，跳过 IAT Prelim 搜索")
                         else:
-                            iat_prelim_files = self.find_files_by_keywords(self.iat_prelim_folder, all_keywords, search_subfolders=False)
+                            print(f"[IAT下载] Order {order_no}: IAT Formal 无对应文件夹或文件夹为空，回退 IAT Prelim 递归搜索")
+                            iat_prelim_files = self.find_files_by_keywords(self.iat_prelim_folder, all_keywords, search_subfolders=True)
                             if iat_prelim_files:
                                 additional_files.extend(iat_prelim_files)
                     elif is_private:
@@ -2208,8 +2443,47 @@ class StockistTestDownloader:
                         iat_formal_files = self.find_files_by_keywords(self.iat_formal_folder, all_keywords, search_subfolders=False)
                         if iat_formal_files:
                             additional_files.extend(iat_formal_files)
+                            # 按 stockist_cert 判断 IAT Formal 是否已覆盖，缺失的再到 IAT Prelim 补齐
+                            formal_files_by_cert = {}
+                            for file_path in iat_formal_files:
+                                file_name = os.path.basename(file_path)
+                                matched_cert = self.match_file_to_stockist_cert(
+                                    file_name, file_path, stockist_certs, rm_dn_nos, order_rm_dn_map
+                                )
+                                if matched_cert:
+                                    formal_files_by_cert.setdefault(matched_cert, []).append(file_path)
+
+                            missing_certs = [cert for cert in stockist_certs if cert and cert not in formal_files_by_cert]
+                            if missing_certs:
+                                print(f"[IAT下载] Order {order_no}: IAT Formal 对部分 cert 缺失 {missing_certs}，回退 IAT Prelim 递归补齐")
+                                missing_keywords = []
+                                for cert in missing_certs:
+                                    missing_keywords.append(cert)
+                                    for rm_dn_no, mapped_cert in order_rm_dn_map.items():
+                                        if mapped_cert == cert:
+                                            missing_keywords.append(rm_dn_no)
+
+                                if missing_keywords:
+                                    iat_prelim_files = self.find_files_by_keywords(
+                                        self.iat_prelim_folder, missing_keywords, search_subfolders=True
+                                    )
+                                    if iat_prelim_files:
+                                        valid_prelim_files = []
+                                        for file_path in iat_prelim_files:
+                                            file_name = os.path.basename(file_path)
+                                            matched_cert = self.match_file_to_stockist_cert(
+                                                file_name, file_path, missing_certs, rm_dn_nos, order_rm_dn_map
+                                            )
+                                            if matched_cert and matched_cert in missing_certs:
+                                                valid_prelim_files.append(file_path)
+                                        if valid_prelim_files:
+                                            additional_files.extend(valid_prelim_files)
+                                            print(f"[IAT下载] Order {order_no}: 已补齐 {len(valid_prelim_files)} 个 IAT Prelim 文件")
+                            else:
+                                print(f"[IAT下载] Order {order_no}: IAT Formal 已覆盖全部 cert，跳过 IAT Prelim 搜索")
                         else:
-                            iat_prelim_files = self.find_files_by_keywords(self.iat_prelim_folder, all_keywords, search_subfolders=False)
+                            print(f"[IAT下载] Order {order_no}: IAT Formal 无对应文件夹或文件夹为空，回退 IAT Prelim 递归搜索")
+                            iat_prelim_files = self.find_files_by_keywords(self.iat_prelim_folder, all_keywords, search_subfolders=True)
                             if iat_prelim_files:
                                 additional_files.extend(iat_prelim_files)
                     elif is_private:

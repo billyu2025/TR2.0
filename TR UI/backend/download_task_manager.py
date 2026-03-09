@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-下载任务管理器
-功能：管理异步下载任务，包括创建、更新进度、处理任务
+Download Task Manager
+Manages asynchronous download tasks, including creation, progress updates, and task processing
 """
 
 import os
@@ -11,49 +11,385 @@ import uuid
 import json
 import threading
 import time
+from queue import Queue, Empty, Full
 from datetime import datetime, timedelta
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 import zipfile
 import tempfile
 
 
 class DownloadTaskManager:
-    """下载任务管理器"""
+    """Download Task Manager"""
     
     def __init__(self, db_path: str, base_folder: str = None):
         """
-        初始化任务管理器
+        Initialize task manager
         
         Args:
-            db_path: SQLite 数据库路径
-            base_folder: Stockist&Test Report 文件夹的基础路径
+            db_path: SQLite database path
+            base_folder: Base path for Stockist&Test Report folder
         """
         self.db_path = db_path
         self.base_folder = base_folder
-        self.download_cache_dir = os.path.join(os.path.dirname(db_path), 'downloads', 'cache')
-        # 确保缓存目录存在
-        os.makedirs(self.download_cache_dir, exist_ok=True)
+        self.worker_count = max(1, int(os.getenv('DOWNLOAD_TASK_WORKERS', '4')))
+        self.queue_maxsize = max(1, int(os.getenv('DOWNLOAD_TASK_QUEUE_MAXSIZE', '200')))
+        self.task_queue = Queue(maxsize=self.queue_maxsize)
+        self._workers_started = False
+        self._workers_lock = threading.Lock()
+        self._workers = []
+
+    def _ensure_workers_started(self):
+        """Start fixed-size worker pool once per manager instance."""
+        if self._workers_started:
+            return
+        with self._workers_lock:
+            if self._workers_started:
+                return
+            for idx in range(self.worker_count):
+                worker = threading.Thread(
+                    target=self._worker_loop,
+                    name=f"download-task-worker-{idx + 1}",
+                    daemon=True
+                )
+                worker.start()
+                self._workers.append(worker)
+            self._workers_started = True
+            try:
+                print(f"[Download Task] Worker pool started: workers={self.worker_count}, queue_maxsize={self.queue_maxsize}")
+            except (UnicodeEncodeError, UnicodeDecodeError, Exception):
+                pass
+
+    def _worker_loop(self):
+        """Consume tasks from queue and process in background workers."""
+        while True:
+            try:
+                task = self.task_queue.get(timeout=1.0)
+            except Empty:
+                continue
+            try:
+                task_id, task_type, request_params = task
+                self.process_task(task_id, task_type, request_params)
+            except Exception:
+                # process_task already handles and persists task failure
+                pass
+            finally:
+                self.task_queue.task_done()
+
+    def enqueue_task(self, task_id: str, task_type: str, request_params: Dict):
+        """Enqueue an existing task id for background processing."""
+        self._ensure_workers_started()
+        try:
+            self.task_queue.put_nowait((task_id, task_type, request_params))
+            try:
+                print(f"[Download Task] Queued task: {task_id}, type={task_type}, queue_size={self.task_queue.qsize()}")
+            except (UnicodeEncodeError, UnicodeDecodeError, Exception):
+                pass
+        except Full:
+            # Keep task state explicit so caller can return meaningful error immediately.
+            self.update_status(
+                task_id,
+                'failed',
+                error_message='Task queue is full, please retry later',
+                completed_at=datetime.now().isoformat()
+            )
+            raise RuntimeError('Task queue is full, please retry later')
     
     def _get_connection(self):
-        """获取数据库连接"""
+        """Get database connection"""
         conn = sqlite3.connect(self.db_path, timeout=30.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA busy_timeout=30000")
         return conn
+
+    def _is_path_under_folder(self, file_path: str, folder_path: str) -> bool:
+        """Check whether file_path is under folder_path (case-insensitive on Windows)."""
+        if not file_path or not folder_path:
+            return False
+        abs_file = os.path.abspath(file_path).lower()
+        abs_folder = os.path.abspath(folder_path).lower()
+        if not abs_folder.endswith(os.sep):
+            abs_folder = abs_folder + os.sep
+        return abs_file.startswith(abs_folder)
+
+    def _append_warning_file_to_zip(self, zip_path: str, warning_message: Optional[str], task_type: str) -> str:
+        """Write warning message into ZIP as a text file and return the internal file path."""
+        if not zip_path or not warning_message or not os.path.exists(zip_path):
+            return ""
+
+        warning_filename_map = {
+            'order': 'missing_summary_by_order.txt',
+            'order_stockist_flat': 'missing_summary_by_order.txt',
+            'dd_no': 'missing_summary_by_dd_no.txt',
+            'date': 'missing_summary_by_date.txt'
+        }
+        warning_filename = warning_filename_map.get(task_type, 'missing_summary.txt')
+
+        lines = [
+            "TR Stockist & Test Report Missing Summary",
+            f"Task Type: {task_type}",
+            f"Generated At: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "",
+            warning_message
+        ]
+        warning_content = "\n".join(lines)
+
+        with zipfile.ZipFile(zip_path, 'a', zipfile.ZIP_STORED) as zipf:
+            zipf.writestr(warning_filename, warning_content.encode('utf-8-sig'))
+
+        return warning_filename
+
+    def _format_missing_summary_by_order(
+        self,
+        cert_presence: Dict,
+        order_to_group: Optional[Dict[int, str]] = None,
+        group_title: str = "DD No",
+        unmatched_group_label: str = "未匹配DD No"
+    ) -> str:
+        """Build warning summary grouped by group title then order number."""
+        if not cert_presence:
+            return ""
+
+        order_to_issues = {}
+        for (order_no, cert), presence in cert_presence.items():
+            if not cert:
+                continue
+            entry = order_to_issues.setdefault(order_no, {
+                'missing_stockist_files': [],
+                'missing_stockist_cert_content': [],
+                'missing_test_report_content': []
+            })
+            if not presence.get('has_any_file'):
+                entry['missing_stockist_files'].append(cert)
+            else:
+                if not presence.get('has_stockist_cert'):
+                    entry['missing_stockist_cert_content'].append(cert)
+                if not presence.get('has_test_report'):
+                    entry['missing_test_report_content'].append(cert)
+
+        lines = []
+        if not order_to_group:
+            for order_no in sorted(order_to_issues.keys()):
+                issues = order_to_issues[order_no]
+                msf = sorted(set(issues['missing_stockist_files']))
+                msc = sorted(set(issues['missing_stockist_cert_content']))
+                mtr = sorted(set(issues['missing_test_report_content']))
+                if not msf and not msc and not mtr:
+                    continue
+                lines.append(f"Order {order_no}:")
+                if msf:
+                    lines.append("  - 缺失Stockist文件：" + "、".join(msf))
+                if msc:
+                    lines.append("  - 缺少Stockist Cert内容：" + "、".join(msc))
+                if mtr:
+                    lines.append("  - 缺少Test Report内容：" + "、".join(mtr))
+            return "\n".join(lines)
+
+        dd_to_orders = {}
+        for order_no in order_to_issues.keys():
+            group_value = order_to_group.get(order_no)
+            dd_key = str(group_value).strip() if group_value else unmatched_group_label
+            dd_to_orders.setdefault(dd_key, []).append(order_no)
+
+        def _dd_sort_key(dd_key: str):
+            if dd_key == unmatched_group_label:
+                return (1, dd_key)
+            return (0, dd_key)
+
+        for dd_key in sorted(dd_to_orders.keys(), key=_dd_sort_key):
+            valid_order_lines = []
+            for order_no in sorted(dd_to_orders[dd_key]):
+                issues = order_to_issues[order_no]
+                msf = sorted(set(issues['missing_stockist_files']))
+                msc = sorted(set(issues['missing_stockist_cert_content']))
+                mtr = sorted(set(issues['missing_test_report_content']))
+                if not msf and not msc and not mtr:
+                    continue
+                valid_order_lines.append(f"  Order {order_no}:")
+                if msf:
+                    valid_order_lines.append("    - 缺失Stockist文件：" + "、".join(msf))
+                if msc:
+                    valid_order_lines.append("    - 缺少Stockist Cert内容：" + "、".join(msc))
+                if mtr:
+                    valid_order_lines.append("    - 缺少Test Report内容：" + "、".join(mtr))
+
+            if valid_order_lines:
+                lines.append(f"{group_title} {dd_key}:")
+                lines.extend(valid_order_lines)
+
+        return "\n".join(lines)
+
+    def _collect_warning_for_selected_orders(
+        self,
+        downloader,
+        order_nos: list,
+        order_to_group: Optional[Dict[int, str]] = None,
+        group_title: str = "DD No",
+        unmatched_group_label: str = "未匹配DD No"
+    ) -> Optional[str]:
+        """
+        Collect missing warnings for exactly the selected orders.
+        Note: Do not expand to all orders under the same DD_No; scope follows user selection.
+        """
+        if not order_nos:
+            return None
+
+        orders_info = downloader.get_orders_info_batch(order_nos)
+        cert_dn_values = downloader.get_all_cert_dn_values_batch(order_nos)
+        rm_dn_maps = downloader.get_rm_dn_to_stockist_cert_map_batch(order_nos)
+        cert_presence = {}
+
+        for order_no in order_nos:
+            try:
+                order_info = orders_info.get(order_no)
+                if not order_info:
+                    continue
+
+                cert_dn = cert_dn_values.get(order_no)
+                if not cert_dn:
+                    continue
+                stockist_certs, rm_dn_nos = cert_dn
+                expected_certs = [cert for cert in stockist_certs if cert]
+                if not expected_certs:
+                    continue
+
+                for cert in expected_certs:
+                    cert_presence.setdefault((order_no, cert), {
+                        'has_any_file': False,
+                        'has_stockist_cert': False,
+                        'has_test_report': False
+                    })
+
+                rm_dn_to_stockist_map = rm_dn_maps.get(order_no, {})
+                all_keywords = [k for k in (stockist_certs + rm_dn_nos) if k]
+                if not all_keywords:
+                    continue
+
+                stockist_files = downloader.find_files_by_keywords(downloader.stockist_folder, all_keywords)
+
+                jobsite_type = order_info['jobsite_type'] or ''
+                is_iat, is_private = downloader.check_jobsite_type(jobsite_type)
+                additional_files = []
+
+                if is_iat:
+                    iat_formal_files = downloader.find_files_by_keywords(downloader.iat_formal_folder, all_keywords, search_subfolders=False)
+                    if iat_formal_files:
+                        additional_files.extend(iat_formal_files)
+                        formal_files_by_cert = {}
+                        for file_path in iat_formal_files:
+                            file_name = os.path.basename(file_path)
+                            matched_cert = downloader.match_file_to_stockist_cert(
+                                file_name, file_path, stockist_certs, rm_dn_nos, rm_dn_to_stockist_map
+                            )
+                            if matched_cert:
+                                formal_files_by_cert.setdefault(matched_cert, []).append(file_path)
+
+                        missing_certs = [cert for cert in stockist_certs if cert and cert not in formal_files_by_cert]
+                        if missing_certs:
+                            missing_keywords = []
+                            for cert in missing_certs:
+                                missing_keywords.append(cert)
+                                for rm_dn_no, mapped_cert in rm_dn_to_stockist_map.items():
+                                    if mapped_cert == cert:
+                                        missing_keywords.append(rm_dn_no)
+                            if missing_keywords:
+                                iat_prelim_files = downloader.find_files_by_keywords(
+                                    downloader.iat_prelim_folder, missing_keywords, search_subfolders=True
+                                )
+                                if iat_prelim_files:
+                                    valid_prelim_files = []
+                                    for file_path in iat_prelim_files:
+                                        file_name = os.path.basename(file_path)
+                                        matched_cert = downloader.match_file_to_stockist_cert(
+                                            file_name, file_path, missing_certs, rm_dn_nos, rm_dn_to_stockist_map
+                                        )
+                                        if matched_cert and matched_cert in missing_certs:
+                                            valid_prelim_files.append(file_path)
+                                    additional_files.extend(valid_prelim_files)
+                    else:
+                        iat_prelim_files = downloader.find_files_by_keywords(
+                            downloader.iat_prelim_folder, all_keywords, search_subfolders=True
+                        )
+                        if iat_prelim_files:
+                            additional_files.extend(iat_prelim_files)
+                elif is_private:
+                    private_formal_files = downloader.find_files_by_keywords(downloader.private_formal_folder, all_keywords, search_subfolders=True)
+                    if private_formal_files:
+                        additional_files.extend(private_formal_files)
+                    else:
+                        private_prelim_files = downloader.find_files_by_keywords(downloader.private_prelim_folder, all_keywords, search_subfolders=True)
+                        if private_prelim_files:
+                            additional_files.extend(private_prelim_files)
+
+                order_files = stockist_files + additional_files
+                for file_path in order_files:
+                    file_name = os.path.basename(file_path)
+                    matched_stockist_cert = downloader.match_file_to_stockist_cert(
+                        file_name, file_path, stockist_certs, rm_dn_nos, rm_dn_to_stockist_map
+                    )
+                    if not matched_stockist_cert:
+                        continue
+
+                    key = (order_no, matched_stockist_cert)
+                    presence = cert_presence.setdefault(key, {
+                        'has_any_file': False,
+                        'has_stockist_cert': False,
+                        'has_test_report': False
+                    })
+                    presence['has_any_file'] = True
+                    if self._is_path_under_folder(file_path, downloader.stockist_folder):
+                        presence['has_stockist_cert'] = True
+                    if (
+                        self._is_path_under_folder(file_path, downloader.iat_formal_folder) or
+                        self._is_path_under_folder(file_path, downloader.iat_prelim_folder) or
+                        self._is_path_under_folder(file_path, downloader.private_formal_folder) or
+                        self._is_path_under_folder(file_path, downloader.private_prelim_folder)
+                    ):
+                        presence['has_test_report'] = True
+            except Exception:
+                continue
+
+        warning_message = self._format_missing_summary_by_order(
+            cert_presence,
+            order_to_group=order_to_group,
+            group_title=group_title,
+            unmatched_group_label=unmatched_group_label
+        )
+        return warning_message or None
+
+    def _build_order_to_date_map(self, downloader, order_nos: list) -> Dict[int, str]:
+        """Build normalized order -> date map for selected orders only."""
+        result = {}
+        if not order_nos:
+            return result
+
+        orders_info = downloader.get_orders_info_batch(order_nos)
+        for order_no in order_nos:
+            info = orders_info.get(order_no)
+            if not info:
+                continue
+            del_date = info.get('del_date')
+            if not del_date:
+                continue
+            date_str = str(del_date).strip()
+            if ' ' in date_str:
+                date_str = date_str.split(' ')[0]
+            date_str = date_str.replace('/', '-')
+            result[order_no] = date_str
+        return result
     
     def create_task(self, user_id: int, task_type: str, request_params: Dict) -> str:
         """
-        创建下载任务
+        Create download task
         
         Args:
-            user_id: 用户ID
-            task_type: 任务类型（'order', 'dd_no', 'date'）
-            request_params: 请求参数
+            user_id: User ID
+            task_type: Task type ('order', 'dd_no', 'date')
+            request_params: Request parameters
             
         Returns:
-            任务ID
+            Task ID
         """
         task_id = str(uuid.uuid4())
         expires_at = (datetime.now() + timedelta(days=7)).isoformat()
@@ -76,19 +412,24 @@ class DownloadTaskManager:
         conn.commit()
         conn.close()
         
-        print(f"[下载任务] 创建任务: {task_id}, 类型: {task_type}, 用户: {user_id}")
+        # Use safe output method to avoid encoding errors
+        try:
+            msg = "[Download Task] Created task: " + str(task_id) + ", Type: " + str(task_type) + ", User: " + str(user_id)
+            print(msg)
+        except (UnicodeEncodeError, UnicodeDecodeError, Exception):
+            pass
         return task_id
     
     def get_task_status(self, task_id: str, user_id: int) -> Optional[Dict]:
         """
-        获取任务状态
+        Get task status
         
         Args:
-            task_id: 任务ID
-            user_id: 用户ID（用于权限验证）
+            task_id: Task ID
+            user_id: User ID (for permission verification)
             
         Returns:
-            任务状态字典，如果任务不存在或无权访问返回None
+            Task status dictionary, or None if task doesn't exist or user has no access
         """
         conn = self._get_connection()
         cursor = conn.cursor()
@@ -108,13 +449,13 @@ class DownloadTaskManager:
     
     def update_progress(self, task_id: str, progress: int, processed_files: int, total_files: int = None):
         """
-        更新任务进度
+        Update task progress
         
         Args:
-            task_id: 任务ID
-            progress: 进度百分比（0-100）
-            processed_files: 已处理文件数
-            total_files: 总文件数（可选，如果提供则更新）
+            task_id: Task ID
+            progress: Progress percentage (0-100)
+            processed_files: Number of processed files
+            total_files: Total number of files (optional, updated if provided)
         """
         conn = self._get_connection()
         cursor = conn.cursor()
@@ -137,12 +478,12 @@ class DownloadTaskManager:
     
     def update_status(self, task_id: str, status: str, **kwargs):
         """
-        更新任务状态
+        Update task status
         
         Args:
-            task_id: 任务ID
-            status: 新状态
-            **kwargs: 其他要更新的字段（如zip_path, zip_size, error_message等）
+            task_id: Task ID
+            status: New status
+            **kwargs: Other fields to update (e.g., zip_path, zip_size, error_message)
         """
         conn = self._get_connection()
         cursor = conn.cursor()
@@ -157,7 +498,7 @@ class DownloadTaskManager:
             kwargs['completed_at'] = datetime.now().isoformat()
         
         for key, value in kwargs.items():
-            if key in ['zip_path', 'zip_size', 'error_message', 'started_at', 'completed_at', 'total_files']:
+            if key in ['zip_path', 'zip_size', 'error_message', 'warning_message', 'started_at', 'completed_at', 'total_files']:
                 updates.append(f"{key} = ?")
                 params.append(value)
         
@@ -174,15 +515,19 @@ class DownloadTaskManager:
     
     def process_task(self, task_id: str, task_type: str, request_params: Dict):
         """
-        处理下载任务（在后台线程中调用）
+        Process download task (called in background thread)
         
         Args:
-            task_id: 任务ID
-            task_type: 任务类型
-            request_params: 请求参数
+            task_id: Task ID
+            task_type: Task type
+            request_params: Request parameters
         """
         try:
-            print(f"[下载任务] 开始处理任务: {task_id}")
+            try:
+                msg = "[Download Task] Processing task: " + str(task_id)
+                print(msg)
+            except (UnicodeEncodeError, UnicodeDecodeError, Exception):
+                pass
             self.update_status(task_id, 'processing', started_at=datetime.now().isoformat())
             
             from stockist_test_download import StockistTestDownloader
@@ -194,25 +539,33 @@ class DownloadTaskManager:
             downloader = StockistTestDownloader(self.db_path, base_folder)
             
             # 根据任务类型调用不同的下载方法
+            warning_message = None
+
             if task_type == 'order':
                 order_nos = request_params.get('order_nos', [])
-                zip_path, file_count = self._process_order_download(
+                zip_path, file_count, warning_message = self._process_order_download(
                     task_id, downloader, order_nos
+                )
+            elif task_type == 'order_stockist_flat':
+                order_nos = request_params.get('order_nos', [])
+                zip_path, file_count, warning_message = self._process_order_download(
+                    task_id, downloader, order_nos, flat_by_stockist=True
                 )
             elif task_type == 'dd_no':
                 order_nos = request_params.get('order_nos', [])
-                zip_path, file_count = self._process_dd_no_download(
+                zip_path, file_count, warning_message = self._process_dd_no_download(
                     task_id, downloader, order_nos
                 )
             elif task_type == 'date':
                 order_nos = request_params.get('order_nos', [])
-                zip_path, file_count = self._process_date_download(
+                zip_path, file_count, warning_message = self._process_date_download(
                     task_id, downloader, order_nos
                 )
             else:
-                raise ValueError(f"未知的任务类型: {task_type}")
+                raise ValueError(f"Unknown task type: {task_type}")
             
             # 获取文件大小
+            warning_file_in_zip = self._append_warning_file_to_zip(zip_path, warning_message, task_type)
             zip_size = os.path.getsize(zip_path) if os.path.exists(zip_path) else 0
             
             # 更新任务为完成状态
@@ -224,14 +577,27 @@ class DownloadTaskManager:
                 completed_at=datetime.now().isoformat(),
                 progress=100,
                 processed_files=file_count,
-                total_files=file_count
+                total_files=file_count,
+                warning_message=warning_message
             )
             
-            print(f"[下载任务] 任务完成: {task_id}, 文件数: {file_count}, 大小: {zip_size} bytes")
+            try:
+                msg1 = "[Download Task] Task completed: " + str(task_id) + ", Files: " + str(file_count) + ", Size: " + str(zip_size) + " bytes, ZIP path: " + str(zip_path)
+                print(msg1)
+                if warning_file_in_zip:
+                    print("[Download Task] Warning summary written to ZIP: " + warning_file_in_zip)
+                msg2 = "[Download Task] ZIP file exists: " + str(os.path.exists(zip_path))
+                print(msg2)
+            except (UnicodeEncodeError, UnicodeDecodeError, Exception):
+                pass
             
         except Exception as e:
             error_msg = str(e)
-            print(f"[下载任务] 任务失败: {task_id}, 错误: {error_msg}")
+            try:
+                msg = "[Download Task] Task failed: " + str(task_id) + ", Error: " + str(error_msg)
+                print(msg)
+            except (UnicodeEncodeError, UnicodeDecodeError, Exception):
+                pass
             import traceback
             traceback.print_exc()
             
@@ -242,8 +608,8 @@ class DownloadTaskManager:
                 completed_at=datetime.now().isoformat()
             )
     
-    def _process_order_download(self, task_id: str, downloader, order_nos: list) -> Tuple[str, int]:
-        """处理按Order下载"""
+    def _process_order_download(self, task_id: str, downloader, order_nos: list, flat_by_stockist: bool = False) -> Tuple[str, int, Optional[str]]:
+        """Process download by Order"""
         # 使用订单数量作为进度单位（每个订单算一个处理单位）
         total_orders = len(order_nos)
         self.update_status(task_id, 'processing', total_files=total_orders)
@@ -258,6 +624,7 @@ class DownloadTaskManager:
         files_by_order_and_cert = {}
         all_files_set = set()
         processed_orders = 0
+        cert_presence = {}
         
         for idx, order_no in enumerate(order_nos):
             try:
@@ -280,6 +647,13 @@ class DownloadTaskManager:
                 if not cert_dn:
                     continue
                 stockist_certs, rm_dn_nos = cert_dn
+                expected_certs = [cert for cert in stockist_certs if cert]
+                for cert in expected_certs:
+                    cert_presence.setdefault((order_no, cert), {
+                        'has_any_file': False,
+                        'has_stockist_cert': False,
+                        'has_test_report': False
+                    })
                 
                 # 从批量查询结果中获取 rm_dn_no 到 stockist_cert 映射
                 rm_dn_to_stockist_map = rm_dn_maps.get(order_no, {})
@@ -303,38 +677,36 @@ class DownloadTaskManager:
                 if is_iat:
                     # IAT 类型
                     iat_formal_files = downloader.find_files_by_keywords(downloader.iat_formal_folder, all_keywords, search_subfolders=False)
-                    
-                    # 将 IAT Formal 中找到的文件按 stockist_cert 分组
-                    formal_files_by_cert = {}
-                    for file_path in iat_formal_files:
-                        file_name = os.path.basename(file_path)
-                        matched_cert = downloader.match_file_to_stockist_cert(
-                            file_name, file_path, stockist_certs, rm_dn_nos, rm_dn_to_stockist_map
-                        )
-                        if matched_cert:
-                            if matched_cert not in formal_files_by_cert:
-                                formal_files_by_cert[matched_cert] = []
-                            formal_files_by_cert[matched_cert].append(file_path)
-                    
-                    # 找出哪些 stockist_cert 在 IAT Formal 中没有文件
-                    missing_certs = [cert for cert in stockist_certs if cert and cert not in formal_files_by_cert]
-                    
+
                     if iat_formal_files:
                         additional_files.extend(iat_formal_files)
-                        
+                        # 按 stockist_cert 判断是否已在 IAT Formal 覆盖
+                        formal_files_by_cert = {}
+                        for file_path in iat_formal_files:
+                            file_name = os.path.basename(file_path)
+                            matched_cert = downloader.match_file_to_stockist_cert(
+                                file_name, file_path, stockist_certs, rm_dn_nos, rm_dn_to_stockist_map
+                            )
+                            if matched_cert:
+                                formal_files_by_cert.setdefault(matched_cert, []).append(file_path)
+
+                        missing_certs = [cert for cert in stockist_certs if cert and cert not in formal_files_by_cert]
                         if missing_certs:
-                            # 为缺失的 stockist_cert 构建关键词
+                            print(f"[Download Task][IAT] Order {order_no}: IAT Formal 对部分 cert 缺失 {missing_certs}，回退 IAT Prelim 递归补齐")
                             missing_keywords = []
                             for cert in missing_certs:
                                 missing_keywords.append(cert)
                                 for rm_dn_no, mapped_cert in rm_dn_to_stockist_map.items():
                                     if mapped_cert == cert:
                                         missing_keywords.append(rm_dn_no)
-                            
+
                             if missing_keywords:
-                                iat_prelim_files = downloader.find_files_by_keywords(downloader.iat_prelim_folder, missing_keywords, search_subfolders=False)
+                                iat_prelim_files = downloader.find_files_by_keywords(
+                                    downloader.iat_prelim_folder,
+                                    missing_keywords,
+                                    search_subfolders=True
+                                )
                                 if iat_prelim_files:
-                                    # 只添加属于缺失 stockist_cert 的文件
                                     valid_prelim_files = []
                                     for file_path in iat_prelim_files:
                                         file_name = os.path.basename(file_path)
@@ -343,9 +715,16 @@ class DownloadTaskManager:
                                         )
                                         if matched_cert and matched_cert in missing_certs:
                                             valid_prelim_files.append(file_path)
-                                    additional_files.extend(valid_prelim_files)
+                                    if valid_prelim_files:
+                                        additional_files.extend(valid_prelim_files)
+                                        print(f"[Download Task][IAT] Order {order_no}: 已补齐 {len(valid_prelim_files)} 个 IAT Prelim 文件")
+                        else:
+                            print(f"[Download Task][IAT] Order {order_no}: IAT Formal 已覆盖全部 cert，跳过 IAT Prelim 搜索")
                     else:
-                        iat_prelim_files = downloader.find_files_by_keywords(downloader.iat_prelim_folder, all_keywords, search_subfolders=False)
+                        # IAT Formal 没有对应文件夹或文件夹为空，回退到 IAT Prelim 递归文件搜索
+                        print(f"[Download Task][IAT] Order {order_no}: IAT Formal 无对应文件夹或文件夹为空，回退 IAT Prelim 递归搜索")
+                        # IAT Prelim 常见是文件名直接含 DN（不按子文件夹命名），因此需要递归按文件名搜索
+                        iat_prelim_files = downloader.find_files_by_keywords(downloader.iat_prelim_folder, all_keywords, search_subfolders=True)
                         if iat_prelim_files:
                             additional_files.extend(iat_prelim_files)
                             
@@ -416,33 +795,118 @@ class DownloadTaskManager:
                             files_by_order_and_cert[key] = []
                         files_by_order_and_cert[key].append(file_path)
                         all_files_set.add(file_path)  # 用于统计总文件数
+                        presence = cert_presence.setdefault(key, {
+                            'has_any_file': False,
+                            'has_stockist_cert': False,
+                            'has_test_report': False
+                        })
+                        presence['has_any_file'] = True
+                        if self._is_path_under_folder(file_path, downloader.stockist_folder):
+                            presence['has_stockist_cert'] = True
+                        if (
+                            self._is_path_under_folder(file_path, downloader.iat_formal_folder) or
+                            self._is_path_under_folder(file_path, downloader.iat_prelim_folder) or
+                            self._is_path_under_folder(file_path, downloader.private_formal_folder) or
+                            self._is_path_under_folder(file_path, downloader.private_prelim_folder)
+                        ):
+                            presence['has_test_report'] = True
                 
             except Exception as e:
-                print(f"[下载任务] Order {order_no} 处理失败: {e}")
+                try:
+                    msg = "[Download Task] Order " + str(order_no) + " processing failed: " + str(e)
+                    print(msg)
+                except (UnicodeEncodeError, UnicodeDecodeError, Exception):
+                    pass
                 import traceback
                 traceback.print_exc()
                 continue
         
         if not files_by_order_and_cert:
-            raise ValueError(f"所有 Order {order_nos} 都没有找到相关 PDF 文件")
+            raise ValueError(f"All Orders {order_nos} have no related PDF files found")
+
+        # 生成缺失提示（不中断下载），按 Order 分组
+        warning_message = self._format_missing_summary_by_order(cert_presence)
         
         # 更新进度：90% - 文件收集完成，开始打包
         self.update_progress(task_id, 90, total_orders, total_orders)
         
         # 创建ZIP文件
-        zip_path = self._create_zip_from_files(files_by_order_and_cert, order_nos)
+        if flat_by_stockist:
+            zip_path = self._create_zip_from_files_flat_by_stockist(files_by_order_and_cert)
+        else:
+            zip_path = self._create_zip_from_files(files_by_order_and_cert, order_nos)
         file_count = len(all_files_set)
         
         # 更新进度：100% - 完成
         self.update_progress(task_id, 100, total_orders, total_orders)
         
-        # 将ZIP文件移动到缓存目录
-        cached_zip_path = self._move_to_cache(zip_path, task_id)
-        
-        return cached_zip_path, file_count
+        # 直接返回ZIP文件路径（不移动到缓存）
+        return zip_path, file_count, (warning_message or None)
+
+    def _create_zip_from_files_flat_by_stockist(self, files_by_order_and_cert: Dict) -> str:
+        """
+        Create ZIP file flattened by Stockist No.
+
+        ZIP structure:
+        - Stockist_No_1/file1.pdf
+        - Stockist_No_1/file2.pdf
+        - Stockist_No_2/file3.pdf
+        """
+        import tempfile
+        import zipfile
+
+        temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
+        temp_zip_path = temp_zip.name
+        temp_zip.close()
+
+        try:
+            # Aggregate and deduplicate by (stockist_cert, file_path)
+            files_by_cert = {}
+            for (_, stockist_cert), files in files_by_order_and_cert.items():
+                if not stockist_cert or not files:
+                    continue
+                cert_files = files_by_cert.setdefault(stockist_cert, set())
+                for file_path in files:
+                    if file_path and os.path.exists(file_path):
+                        cert_files.add(file_path)
+
+            with zipfile.ZipFile(temp_zip_path, 'w', zipfile.ZIP_STORED) as zipf:
+                written_paths = set()
+                for stockist_cert, file_paths in files_by_cert.items():
+                    used_names = set()
+                    for file_path in sorted(file_paths):
+                        file_name = os.path.basename(file_path)
+                        if not file_name:
+                            continue
+
+                        # Ensure unique filename inside the same stockist folder
+                        base_name, ext = os.path.splitext(file_name)
+                        candidate_name = file_name
+                        counter = 1
+                        while candidate_name.lower() in used_names:
+                            candidate_name = f"{base_name}_dup{counter}{ext}"
+                            counter += 1
+                        used_names.add(candidate_name.lower())
+
+                        zip_path = f"{stockist_cert}/{candidate_name}"
+                        zip_path_key = zip_path.lower()
+                        if zip_path_key in written_paths:
+                            continue
+                        written_paths.add(zip_path_key)
+                        zipf.write(file_path, zip_path)
+
+            return temp_zip_path
+
+        except Exception as e:
+            if os.path.exists(temp_zip_path):
+                try:
+                    os.remove(temp_zip_path)
+                except:
+                    pass
+            raise e
     
     def _create_zip_from_files(self, files_by_order_and_cert: Dict, order_nos: list) -> str:
-        """从文件字典创建ZIP文件（与原始逻辑保持一致）"""
+        """Create ZIP file from file dictionary (consistent with original logic)"""
         import tempfile
         import zipfile
         
@@ -547,49 +1011,75 @@ class DownloadTaskManager:
                     pass
             raise e
     
-    def _process_dd_no_download(self, task_id: str, downloader, order_nos: list) -> Tuple[str, int]:
-        """处理按DD_No下载"""
-        estimated_files = len(order_nos) * 10
-        self.update_status(task_id, 'processing', total_files=estimated_files)
-        
-        zip_path, file_count = downloader.download_by_order_nos_grouped_by_dd_no(order_nos)
-        
-        # 更新实际文件数
-        self.update_status(task_id, 'processing', total_files=file_count)
-        self.update_progress(task_id, 100, file_count, file_count)
-        
-        cached_zip_path = self._move_to_cache(zip_path, task_id)
-        
-        return cached_zip_path, file_count
-    
-    def _process_date_download(self, task_id: str, downloader, order_nos: list) -> Tuple[str, int]:
-        """处理按日期下载"""
+    def _process_dd_no_download(self, task_id: str, downloader, order_nos: list) -> Tuple[str, int, Optional[str]]:
+        """Process download by DD_No"""
         # 使用订单数量作为进度单位
         total_orders = len(order_nos)
         self.update_status(task_id, 'processing', total_files=total_orders)
         self.update_progress(task_id, 0, 0, total_orders)
         
-        # 调用下载方法（暂时使用同步方式，后续可以优化为带进度回调）
-        zip_path, file_count = downloader.download_by_order_nos_grouped_by_date(order_nos)
+        # 更新进度：50% - 开始处理
+        self.update_progress(task_id, 50, total_orders // 2, total_orders)
+        
+        zip_path, file_count = downloader.download_by_order_nos_grouped_by_dd_no(order_nos)
+        order_to_dd_no = downloader.get_dd_no_by_orders_batch(order_nos)
+        warning_message = self._collect_warning_for_selected_orders(
+            downloader,
+            order_nos,
+            order_to_group=order_to_dd_no,
+            group_title="DD No",
+            unmatched_group_label="未匹配DD No"
+        )
+        
+        # 更新进度：90% - 文件收集完成，开始打包
+        self.update_progress(task_id, 90, total_orders, total_orders)
         
         # 更新进度：100% - 完成
         self.update_progress(task_id, 100, total_orders, total_orders)
+        
+        # 直接返回ZIP文件路径（不移动到缓存）
+        return zip_path, file_count, warning_message
+    
+    def _process_date_download(self, task_id: str, downloader, order_nos: list) -> Tuple[str, int, Optional[str]]:
+        """Process download by date"""
+        # 使用订单数量作为进度单位
+        total_orders = len(order_nos)
         self.update_status(task_id, 'processing', total_files=total_orders)
+        self.update_progress(task_id, 0, 0, total_orders)
         
-        cached_zip_path = self._move_to_cache(zip_path, task_id)
+        # 更新进度：50% - 开始处理
+        self.update_progress(task_id, 50, total_orders // 2, total_orders)
         
-        return cached_zip_path, file_count
+        # 调用下载方法
+        zip_path, file_count = downloader.download_by_order_nos_grouped_by_date(order_nos)
+        order_to_date = self._build_order_to_date_map(downloader, order_nos)
+        warning_message = self._collect_warning_for_selected_orders(
+            downloader,
+            order_nos,
+            order_to_group=order_to_date,
+            group_title="Date",
+            unmatched_group_label="未匹配Date"
+        )
+        
+        # 更新进度：90% - 文件收集完成，开始打包
+        self.update_progress(task_id, 90, total_orders, total_orders)
+        
+        # 更新进度：100% - 完成
+        self.update_progress(task_id, 100, total_orders, total_orders)
+        
+        # 直接返回ZIP文件路径（不移动到缓存）
+        return zip_path, file_count, warning_message
     
     def _move_to_cache(self, zip_path: str, task_id: str) -> str:
         """
-        将ZIP文件移动到缓存目录
+        Move ZIP file to cache directory
         
         Args:
-            zip_path: 原始ZIP文件路径
-            task_id: 任务ID
+            zip_path: Original ZIP file path
+            task_id: Task ID
             
         Returns:
-            新的ZIP文件路径
+            New ZIP file path
         """
         # 按日期组织缓存目录
         date_dir = datetime.now().strftime('%Y%m%d')
@@ -608,7 +1098,7 @@ class DownloadTaskManager:
             return zip_path
     
     def cleanup_expired_tasks(self):
-        """清理过期的任务和文件"""
+        """Clean up expired tasks and files"""
         conn = self._get_connection()
         cursor = conn.cursor()
         
@@ -628,7 +1118,11 @@ class DownloadTaskManager:
                 try:
                     os.remove(task['zip_path'])
                 except Exception as e:
-                    print(f"[清理] 删除文件失败 {task['zip_path']}: {e}")
+                    try:
+                        msg = "[Cleanup] Failed to delete file " + str(task.get('zip_path', '')) + ": " + str(e)
+                        print(msg)
+                    except (UnicodeEncodeError, UnicodeDecodeError, Exception):
+                        pass
             
             # 删除任务记录
             cursor.execute("DELETE FROM download_tasks WHERE task_id = ?", (task['task_id'],))
@@ -638,6 +1132,10 @@ class DownloadTaskManager:
         conn.close()
         
         if deleted_count > 0:
-            print(f"[清理] 清理了 {deleted_count} 个过期任务")
+            try:
+                msg = "[Cleanup] Cleaned " + str(deleted_count) + " expired tasks"
+                print(msg)
+            except (UnicodeEncodeError, UnicodeDecodeError, Exception):
+                pass
         
         return deleted_count

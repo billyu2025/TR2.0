@@ -2,10 +2,10 @@
 # -*- coding: utf-8 -*-
 """
 TR Fill In API Server
-功能：处理前端TR Fill In页面的数据同步请求
+Handles data synchronization requests from the frontend TR Fill In page
 """
 
-from flask import Flask, request, jsonify, send_file, g
+from flask import Flask, request, jsonify, send_file, g, after_this_request, Response
 from flask_cors import CORS
 import sqlite3
 import os
@@ -18,12 +18,38 @@ import hashlib
 import hmac
 import subprocess
 import threading
+import secrets
+import string
+import traceback
+import time
 from datetime import datetime, timedelta
 from functools import wraps
 from dotenv import load_dotenv
 
 # 加载环境变量
 load_dotenv()
+
+# 導入統一日誌系統
+from logger_config import init_logger, get_logger, get_access_logger
+
+# Import task managers at module level to avoid encoding issues during function-level imports
+try:
+    from pdf_task_manager import PDFTaskManager
+except ImportError as e:
+    PDFTaskManager = None
+    try:
+        logger.warning(f"Failed to import PDFTaskManager: {e}")
+    except:
+        pass
+
+try:
+    from download_task_manager import DownloadTaskManager
+except ImportError as e:
+    DownloadTaskManager = None
+    try:
+        logger.warning(f"Failed to import DownloadTaskManager: {e}")
+    except:
+        pass
 
 app = Flask(__name__)
 # 允许跨域请求，包括 file:// 协议
@@ -52,24 +78,327 @@ DEBUG_MODE = os.getenv('DEBUG', 'False').lower() == 'true'
 # 安全配置
 SESSION_TTL_HOURS = int(os.getenv('SESSION_TTL_HOURS', '24'))
 PASSWORD_ITERATIONS = int(os.getenv('PASSWORD_ITERATIONS', '120000'))
+PASSWORD_EXPIRY_DAYS = 180  # 普通账户密码有效期（天）
 
+# 初始化統一日誌系統
+logger = init_logger(debug_mode=DEBUG_MODE)
+access_logger = get_access_logger()
+
+# 下载任务管理器单例：避免每个请求各自创建线程池/队列
+_download_task_manager = None
+_download_task_manager_lock = threading.Lock()
+
+
+def get_download_task_manager():
+    """Get singleton DownloadTaskManager with fixed worker queue."""
+    global _download_task_manager
+    if _download_task_manager is not None:
+        return _download_task_manager
+    with _download_task_manager_lock:
+        if _download_task_manager is None:
+            if DownloadTaskManager is None:
+                raise RuntimeError('Download task manager not available')
+            base_folder = os.getenv('STOCKIST_TEST_FOLDER', r'D:\Stockist&Test Report')
+            _download_task_manager = DownloadTaskManager(DB_PATH, base_folder)
+    return _download_task_manager
+
+# 初始化緩存系統
+from cache_manager import init_cache, get_cache
+cache = init_cache(default_ttl=300)  # 默認5分鐘
+
+# 初始化請求限流系統
+try:
+    from flask_limiter import Limiter
+    from flask_limiter.util import get_remote_address
+    
+    # 初始化限流器（使用內存存儲，簡單場景）
+    limiter = Limiter(
+        app=app,
+        key_func=get_remote_address,  # 根據 IP 地址限流
+        default_limits=["200 per day", "50 per hour"],  # 全局默認限制
+        storage_uri="memory://"  # 使用內存存儲
+    )
+    try:
+        logger.info("Rate limiting system enabled")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        logger.info("Rate limiting system enabled")
+except ImportError:
+    limiter = None
+    try:
+        logger.warning("flask-limiter not installed, rate limiting disabled")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        logger.warning("flask-limiter not installed, rate limiting disabled")
+
+
+# ============================================================================
+# 全局錯誤處理器
+# ============================================================================
+
+@app.errorhandler(404)
+def not_found(error):
+    """處理 404 錯誤（資源不存在）"""
+    logger.warning(f"404 Not Found: {request.path} - {request.remote_addr}")
+    return jsonify({
+        'success': False,
+        'error': '資源不存在',
+        'code': 404,
+        'path': request.path
+    }), 404
+
+
+@app.errorhandler(400)
+def bad_request(error):
+    """處理 400 錯誤（請求格式錯誤）"""
+    logger.warning(f"400 Bad Request: {request.path} - {request.remote_addr}")
+    return jsonify({
+        'success': False,
+        'error': '請求格式錯誤',
+        'code': 400
+    }), 400
+
+
+@app.errorhandler(401)
+def unauthorized(error):
+    """處理 401 錯誤（未授權）"""
+    logger.warning(f"401 Unauthorized: {request.path} - {request.remote_addr}")
+    return jsonify({
+        'success': False,
+        'error': '未授權，請先登入',
+        'code': 401
+    }), 401
+
+
+@app.errorhandler(403)
+def forbidden(error):
+    """處理 403 錯誤（禁止訪問）"""
+    logger.warning(f"403 Forbidden: {request.path} - {request.remote_addr}")
+    return jsonify({
+        'success': False,
+        'error': '無權限訪問此資源',
+        'code': 403
+    }), 403
+
+
+@app.errorhandler(500)
+def internal_error(error):
+    """處理 500 錯誤（服務器內部錯誤）"""
+    logger.error(f"500 Internal Server Error: {request.path} - {request.remote_addr}", exc_info=True)
+    
+    # 根據調試模式決定是否返回詳細錯誤信息
+    error_response = {
+        'success': False,
+        'error': 'Internal server error',
+        'code': 500
+    }
+    
+    # 僅在調試模式下返回詳細錯誤信息
+    if DEBUG_MODE:
+        error_response['detail'] = str(error)
+        error_response['traceback'] = traceback.format_exc()
+    
+    return jsonify(error_response), 500
+
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    """處理所有未捕獲的異常（最後防線）"""
+    # 記錄詳細錯誤信息
+    logger.error(
+        f"Unhandled Exception: {type(e).__name__} - {str(e)} - "
+        f"Path: {request.path} - Method: {request.method} - "
+        f"Remote: {request.remote_addr}",
+        exc_info=True
+    )
+    
+    # 根據錯誤類型返回不同的響應
+    error_response = {
+        'success': False,
+        'error': 'Unexpected error occurred',
+        'code': 500
+    }
+    
+    # 僅在調試模式下返回詳細錯誤信息
+    import traceback
+    if DEBUG_MODE:
+        error_response['detail'] = str(e)
+        error_response['type'] = type(e).__name__
+        error_response['traceback'] = traceback.format_exc()
+    else:
+        # 生產環境：記錄詳細信息但不返回給用戶
+        try:
+            logger.error(f"Detailed error info (logged only, not returned to user): {traceback.format_exc()}")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            logger.error(f"Error occurred: {type(e).__name__}: {str(e)}")
+    
+    return jsonify(error_response), 500
+
+
+# ============================================================================
+# 數據庫連接函數（使用連接池）
+# ============================================================================
+
+# 導入連接池模組
+from db_pool import init_pool, get_pool
+import threading
+
+# 初始化連接池（最大連接數20）
+_pool_initialized = False
+_pool_lock = threading.Lock()
+
+# 線程本地存儲：用於跟蹤每個線程的連接和上下文管理器
+_thread_local = threading.local()
+
+def _ensure_pool_initialized():
+    """確保連接池已初始化"""
+    global _pool_initialized
+    with _pool_lock:
+        if not _pool_initialized:
+            try:
+                init_pool(DB_PATH, max_connections=20)
+                _pool_initialized = True
+                try:
+                    logger.info(f"[Connection Pool] Database connection pool initialized: max_connections=20")
+                except (UnicodeEncodeError, UnicodeDecodeError):
+                    logger.info("[Connection Pool] Database connection pool initialized: max_connections=20")
+            except Exception as e:
+                try:
+                    logger.error(f"[Connection Pool] Failed to initialize connection pool: {e}")
+                except (UnicodeEncodeError, UnicodeDecodeError):
+                    logger.error(f"[Connection Pool] Failed to initialize connection pool: {e}")
+                _pool_initialized = False
+
+# 包裝類：讓連接池的連接行為像普通連接
+class PooledConnection:
+    """連接池連接包裝類，保持與原有代碼的兼容性"""
+    
+    def __init__(self, conn, context_manager):
+        """
+        Args:
+            conn: 實際的數據庫連接對象
+            context_manager: 連接池上下文管理器（用於歸還連接）
+        """
+        self._conn = conn
+        self._context_manager = context_manager
+        self._closed = False
+    
+    def __getattr__(self, name):
+        """代理所有屬性訪問到實際連接"""
+        if self._closed:
+            raise RuntimeError("連接已關閉")
+        return getattr(self._conn, name)
+    
+    def close(self):
+        """關閉連接（實際上是歸還到連接池）"""
+        if not self._closed:
+            try:
+                # 歸還連接到池中（通過退出上下文管理器）
+                # __exit__ 需要三個參數：exc_type, exc_val, exc_tb
+                self._context_manager.__exit__(None, None, None)
+            except Exception as e:
+                try:
+                    logger.warning(f"[Connection Pool] Error returning connection: {e}")
+                except (UnicodeEncodeError, UnicodeDecodeError):
+                    logger.warning(f"[Connection Pool] Error returning connection: {e}")
+            finally:
+                self._conn = None
+                self._closed = True
+                # 清除線程本地存儲
+                if hasattr(_thread_local, 'current_connection'):
+                    delattr(_thread_local, 'current_connection')
+                if hasattr(_thread_local, 'current_context'):
+                    delattr(_thread_local, 'current_context')
+    
+    def __del__(self):
+        """析構函數：確保連接被歸還"""
+        if not self._closed:
+            try:
+                self.close()
+            except:
+                pass
 
 def get_db_connection():
-    """获取数据库连接"""
-    # 添加超时设置（30秒）
-    conn = sqlite3.connect(DB_PATH, timeout=30.0)
-    conn.row_factory = sqlite3.Row  # 返回字典格式的结果
+    """
+    获取数据库连接（使用连接池）
+    
+    注意：為了保持兼容性，返回的連接對象在調用 close() 時會自動歸還到連接池。
+    建議使用 with 語句，但手動 close() 也可以正常工作。
+    """
+    _ensure_pool_initialized()
+    
     try:
-        # 启用 WAL 模式以提高并发性能，允许多个读取器和写入器同时访问
-        conn.execute("PRAGMA journal_mode=WAL")
-        # 设置同步模式为 NORMAL（在 WAL 模式下更安全且性能更好）
-        conn.execute("PRAGMA synchronous=NORMAL")
-        # 设置 busy_timeout（毫秒），当数据库被锁定时等待最多30秒
-        conn.execute("PRAGMA busy_timeout=30000")
-        conn.execute("PRAGMA foreign_keys = ON")
-    except Exception:
-        pass
-    return conn
+        pool = get_pool()
+        # 獲取連接池上下文管理器
+        context_manager = pool.get_connection()
+        # 進入上下文管理器以獲取實際連接
+        conn = context_manager.__enter__()
+        
+        # 保存到線程本地存儲（用於錯誤處理和調試）
+        _thread_local.current_connection = conn
+        _thread_local.current_context = context_manager
+        
+        # 創建包裝對象
+        wrapped_conn = PooledConnection(conn, context_manager)
+        return wrapped_conn
+    except Exception as e:
+        try:
+            logger.error(f"[Connection Pool] Failed to get connection: {e}")
+            import traceback
+            logger.error(f"[Connection Pool] Error details: {traceback.format_exc()}")
+            logger.warning("[Connection Pool] Falling back to direct connection mode")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            logger.error(f"[Connection Pool] Failed to get connection: {e}")
+            import traceback
+            logger.error(f"[Connection Pool] Error details: {traceback.format_exc()}")
+            logger.warning("[Connection Pool] Falling back to direct connection mode")
+        conn = sqlite3.connect(DB_PATH, timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA busy_timeout=30000")
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA optimize")
+        except Exception:
+            pass
+        return conn
+
+
+def _ensure_bbs_dd_indexes(conn, cursor):
+    """
+    确保 bbs_dd 表有必要的索引（性能优化）
+    只在首次调用时创建，后续调用会快速跳过
+    """
+    try:
+        # 检查索引是否已存在
+        cursor.execute("""
+            SELECT name FROM sqlite_master 
+            WHERE type='index' AND name LIKE 'idx_bbs_dd%'
+        """)
+        existing_indexes = [row[0] for row in cursor.fetchall()]
+        
+        # 创建缺失的索引
+        indexes_to_create = [
+            ("idx_bbs_dd_bbs_no", "CREATE INDEX IF NOT EXISTS idx_bbs_dd_bbs_no ON bbs_dd(bbs_no)"),
+            ("idx_bbs_dd_jobsite_no", "CREATE INDEX IF NOT EXISTS idx_bbs_dd_jobsite_no ON bbs_dd(jobsite_no)"),
+            ("idx_bbs_dd_dd_no", "CREATE INDEX IF NOT EXISTS idx_bbs_dd_dd_no ON bbs_dd(dd_no)"),
+            ("idx_bbs_dd_delivery_date", "CREATE INDEX IF NOT EXISTS idx_bbs_dd_delivery_date ON bbs_dd(dd_delivery_date DESC)"),
+            ("idx_bbs_dd_composite", "CREATE INDEX IF NOT EXISTS idx_bbs_dd_composite ON bbs_dd(dd_delivery_date DESC, bbs_no)")
+        ]
+        
+        created_count = 0
+        for index_name, create_sql in indexes_to_create:
+            if index_name not in existing_indexes:
+                cursor.execute(create_sql)
+                created_count += 1
+                print(f"[性能优化] 创建索引: {index_name}")
+        
+        if created_count > 0:
+            conn.commit()
+            print(f"[性能优化] bbs_dd 表索引创建完成，共创建 {created_count} 个索引")
+            
+    except Exception as e:
+        # 索引创建失败不影响查询，只记录错误
+        print(f"[警告] 创建 bbs_dd 索引时出错（不影响查询）: {e}")
 
 
 # SESSION_TTL_HOURS 和 PASSWORD_ITERATIONS 已从环境变量读取（见上方）
@@ -111,6 +440,65 @@ def _verify_password(password: str, salt_hex: str, hash_hex: str):
         return hmac.compare_digest(binascii.hexlify(hashed).decode('utf-8'), hash_hex)
     except (binascii.Error, ValueError):
         return False
+
+
+def _generate_random_password(length: int = 10) -> str:
+    """
+    生成随机强密码（大小写字母+数字+特殊符号）
+    
+    Args:
+        length: 密码长度，默认10位
+        
+    Returns:
+        生成的随机密码
+    """
+    # 定义字符集
+    lowercase = string.ascii_lowercase
+    uppercase = string.ascii_uppercase
+    digits = string.digits
+    special = '!@#$%^&*'
+    
+    # 确保至少包含每种类型的字符
+    password_chars = [
+        secrets.choice(lowercase),
+        secrets.choice(uppercase),
+        secrets.choice(digits),
+        secrets.choice(special)
+    ]
+    
+    # 填充剩余长度
+    all_chars = lowercase + uppercase + digits + special
+    for _ in range(length - 4):
+        password_chars.append(secrets.choice(all_chars))
+    
+    # 打乱顺序
+    secrets.SystemRandom().shuffle(password_chars)
+    
+    return ''.join(password_chars)
+
+
+def _calculate_password_days_remaining(password_expires_at: str | None) -> int | None:
+    """
+    计算密码剩余天数
+    
+    Args:
+        password_expires_at: 密码过期时间（ISO格式字符串）
+        
+    Returns:
+        剩余天数，如果已过期返回负数，如果未设置返回None
+    """
+    if not password_expires_at:
+        return None
+    
+    try:
+        expires_date = datetime.fromisoformat(password_expires_at.replace('Z', '+00:00'))
+        if expires_date.tzinfo:
+            expires_date = expires_date.replace(tzinfo=None)
+        now = datetime.now()
+        delta = expires_date - now
+        return delta.days
+    except (ValueError, AttributeError):
+        return None
 
 
 def _normalize_job_numbers(job_nos):
@@ -159,6 +547,7 @@ def _ensure_account_tables():
                     username TEXT NOT NULL UNIQUE,
                     password_hash TEXT NOT NULL,
                     password_salt TEXT NOT NULL,
+                    password_plaintext TEXT,
                     full_name TEXT,
                     role TEXT NOT NULL CHECK(role IN ('admin', 'manager', 'user')),
                     is_active INTEGER NOT NULL DEFAULT 1,
@@ -169,8 +558,8 @@ def _ensure_account_tables():
             # 复制数据
             cursor.execute("""
                 INSERT INTO user_accounts_new 
-                (id, username, password_hash, password_salt, full_name, role, is_active, created_at, updated_at)
-                SELECT id, username, password_hash, password_salt, full_name, role, is_active, created_at, updated_at
+                (id, username, password_hash, password_salt, password_plaintext, full_name, role, is_active, created_at, updated_at)
+                SELECT id, username, password_hash, password_salt, NULL, full_name, role, is_active, created_at, updated_at
                 FROM user_accounts
             """)
             # 删除旧表
@@ -190,7 +579,7 @@ def _ensure_account_tables():
                 END;
             """)
             conn.commit()
-            print("[INFO] user_accounts table updated successfully")
+            logger.info("user_accounts table updated successfully")
     else:
         # 表不存在，创建新表
         cursor.execute(
@@ -200,14 +589,36 @@ def _ensure_account_tables():
                 username TEXT NOT NULL UNIQUE,
                 password_hash TEXT NOT NULL,
                 password_salt TEXT NOT NULL,
+                password_plaintext TEXT,
                 full_name TEXT,
                 role TEXT NOT NULL CHECK(role IN ('admin', 'manager', 'user')),
                 is_active INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                password_changed_at TEXT,
+                password_expires_at TEXT
             )
             """
         )
+    
+    # 检查并添加密码过期相关字段（如果表已存在但字段不存在）
+    cursor.execute("PRAGMA table_info(user_accounts)")
+    columns = [row[1] for row in cursor.fetchall()]
+    
+    if 'password_changed_at' not in columns:
+        logger.info("Adding password_changed_at column to user_accounts table...")
+        cursor.execute("ALTER TABLE user_accounts ADD COLUMN password_changed_at TEXT")
+        conn.commit()
+    
+    if 'password_expires_at' not in columns:
+        logger.info("Adding password_expires_at column to user_accounts table...")
+        cursor.execute("ALTER TABLE user_accounts ADD COLUMN password_expires_at TEXT")
+        conn.commit()
+    
+    if 'password_plaintext' not in columns:
+        logger.info("Adding password_plaintext column to user_accounts table...")
+        cursor.execute("ALTER TABLE user_accounts ADD COLUMN password_plaintext TEXT")
+        conn.commit()
     
     # 创建其他表和触发器（无论表是否已更新）
     cursor.execute(
@@ -265,9 +676,9 @@ def _ensure_account_tables():
             )
             """
         )
-        print("[INFO] PDF_Status table created successfully")
+        logger.info("PDF_Status table created successfully")
     else:
-        print("[INFO] PDF_Status table already exists, skipping creation")
+        logger.info("PDF_Status table already exists, skipping creation")
     
     # 创建PDF_Status表的更新触发器（如果不存在则创建，如果存在则先删除再创建以确保最新）
     cursor.execute("DROP TRIGGER IF EXISTS trg_pdf_status_updated")
@@ -289,8 +700,10 @@ def _ensure_account_tables():
     # 确保至少存在一个可用的管理员账户
     cursor.execute("SELECT id FROM user_accounts WHERE username = ?", ('admin',))
     existing_admin = cursor.fetchone()
+    new_password = 'Vschk!8866'
+    salt, password_hash = _generate_password_hash(new_password)
+    
     if not existing_admin:
-        salt, password_hash = _generate_password_hash('admin123')
         cursor.execute(
             """
             INSERT INTO user_accounts (username, password_hash, password_salt, full_name, role, is_active)
@@ -298,8 +711,24 @@ def _ensure_account_tables():
             """,
             ('admin', password_hash, salt, 'System Administrator')
         )
+        cursor.execute(
+            "UPDATE user_accounts SET password_plaintext = ? WHERE username = 'admin'",
+            (new_password,)
+        )
         conn.commit()
-        print("[INFO] Created default admin account (username: admin, password: admin123). Please change this password as soon as possible.")
+        logger.info(f"Created default admin account (username: admin, password: {new_password})")
+    else:
+        # 更新现有 admin 账户的密码
+        cursor.execute(
+            """
+            UPDATE user_accounts 
+            SET password_hash = ?, password_salt = ?, password_plaintext = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE username = 'admin'
+            """,
+            (password_hash, salt, new_password)
+        )
+        conn.commit()
+        logger.info(f"Updated admin account password to: {new_password}")
     conn.close()
 
 
@@ -332,7 +761,8 @@ def _replace_user_job_nos(conn, user_id, job_nos):
 
 
 def _create_session(user_id):
-    expires_at = (datetime.utcnow() + timedelta(hours=SESSION_TTL_HOURS)).isoformat()
+    # 使用 UTC 时间，并添加 'Z' 后缀明确标识为 UTC
+    expires_at = (datetime.utcnow() + timedelta(hours=SESSION_TTL_HOURS)).isoformat() + 'Z'
     token = uuid.uuid4().hex
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -375,14 +805,32 @@ def _get_session(token):
         return None
     expires_at = row['expires_at']
     try:
-        expires = datetime.fromisoformat(expires_at)
-    except ValueError:
+        # 处理时区：如果字符串以 'Z' 结尾，替换为 '+00:00'；如果没有时区信息，假设为 UTC
+        if expires_at.endswith('Z'):
+            expires_at_parsed = expires_at.replace('Z', '+00:00')
+        elif '+' in expires_at or expires_at.count('-') > 2:  # 已有时区信息
+            expires_at_parsed = expires_at
+        else:
+            # 没有时区信息，假设为 UTC
+            expires_at_parsed = expires_at + '+00:00'
+        
+        expires = datetime.fromisoformat(expires_at_parsed)
+        # 转换为 naive datetime (UTC) 以便比较
+        if expires.tzinfo:
+            expires = expires.replace(tzinfo=None)
+    except (ValueError, AttributeError) as e:
+        logger.warning(f"解析会话过期时间失败: {expires_at}, 错误: {e}")
         expires = datetime.utcnow()
-    if expires < datetime.utcnow():
+    
+    # 使用 UTC 时间比较
+    now_utc = datetime.utcnow()
+    if expires < now_utc:
+        logger.info(f"会话已过期: token={token[:8]}..., expires={expires_at}, now={now_utc.isoformat()}")
         cursor.execute("DELETE FROM user_sessions WHERE token = ?", (token,))
         conn.commit()
         conn.close()
         return None
+    
     session = {
         'token': row['token'],
         'user_id': row['user_id'],
@@ -414,6 +862,8 @@ def get_current_user(optional=False):
     if not session:
         if optional:
             return None
+        # 记录会话验证失败（仅在非可选模式下）
+        logger.warning(f"会话验证失败: token={token[:8] if token else 'None'}..., 可能已过期或不存在")
         return None
     conn = get_db_connection()
     user = _fetch_user(conn, user_id=session['user_id'])
@@ -436,7 +886,10 @@ def require_auth(role=None):
                 return jsonify({'success': False, 'error': 'Authentication token required'}), 401
             session = _get_session(token)
             if not session:
-                return jsonify({'success': False, 'error': 'Invalid or expired token'}), 401
+                return jsonify({
+                    'success': False,
+                    'error': 'Invalid or expired token. Your account may have signed in on another device.'
+                }), 401
             conn = get_db_connection()
             user = _fetch_user(conn, user_id=session['user_id'])
             conn.close()
@@ -477,6 +930,7 @@ def _ensure_file_index_tables():
                 created_time TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 last_checked TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 extracted_keywords TEXT,
+                identifiers TEXT,
                 file_hash TEXT,
                 is_deleted INTEGER NOT NULL DEFAULT 0
             )
@@ -514,9 +968,35 @@ def _ensure_file_index_tables():
         """)
         
         conn.commit()
-        print("[INFO] file_index_cache table created successfully")
+        logger.info("file_index_cache table created successfully")
     else:
-        print("[INFO] file_index_cache table already exists, skipping creation")
+        logger.info("file_index_cache table already exists, skipping creation")
+        # 检查是否存在 identifiers 列，如果不存在则添加
+        cursor.execute("PRAGMA table_info(file_index_cache)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if 'identifiers' not in columns:
+            try:
+                cursor.execute("ALTER TABLE file_index_cache ADD COLUMN identifiers TEXT")
+                conn.commit()
+                logger.info("Added 'identifiers' column to file_index_cache table")
+            except Exception as e:
+                logger.warning(f"Failed to add 'identifiers' column: {e}")
+        
+        # 为 identifiers 列创建索引（用于快速查询）
+        cursor.execute("""
+            SELECT name FROM sqlite_master 
+            WHERE type='index' AND name='idx_file_index_cache_identifiers'
+        """)
+        if cursor.fetchone() is None:
+            try:
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_file_index_cache_identifiers 
+                    ON file_index_cache(identifiers)
+                """)
+                conn.commit()
+                logger.info("Created index on 'identifiers' column")
+            except Exception as e:
+                logger.warning(f"Failed to create index on 'identifiers' column: {e}")
     
     # 检查 file_index_metadata 表是否存在
     cursor.execute("""
@@ -549,9 +1029,9 @@ def _ensure_file_index_tables():
         """, default_metadata)
         
         conn.commit()
-        print("[INFO] file_index_metadata table created successfully")
+        logger.info("file_index_metadata table created successfully")
     else:
-        print("[INFO] file_index_metadata table already exists, skipping creation")
+        logger.info("file_index_metadata table already exists, skipping creation")
     
     conn.close()
 
@@ -583,6 +1063,7 @@ def _ensure_download_tasks_table():
                 zip_path TEXT,
                 zip_size INTEGER,
                 error_message TEXT,
+                warning_message TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 started_at TEXT,
                 completed_at TEXT,
@@ -607,12 +1088,82 @@ def _ensure_download_tasks_table():
         """)
         
         conn.commit()
-        print("[INFO] download_tasks table created successfully")
+        logger.info("download_tasks table created successfully")
     else:
-        print("[INFO] download_tasks table already exists, skipping creation")
+        logger.info("download_tasks table already exists, skipping creation")
+        # 向后兼容：旧表增加 warning_message 字段
+        cursor.execute("PRAGMA table_info(download_tasks)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        if 'warning_message' not in existing_columns:
+            cursor.execute("ALTER TABLE download_tasks ADD COLUMN warning_message TEXT")
+            conn.commit()
+            logger.info("download_tasks table altered: added warning_message column")
     
     conn.close()
 
+
+def _ensure_pdf_tasks_table():
+    """确保 PDF 任务表存在"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # 检查表是否存在
+    cursor.execute("""
+        SELECT name FROM sqlite_master 
+        WHERE type='table' AND name='pdf_tasks'
+    """)
+    table_exists = cursor.fetchone() is not None
+    
+    if not table_exists:
+        # 创建 pdf_tasks 表
+        cursor.execute("""
+            CREATE TABLE pdf_tasks (
+                task_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                order_no INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                progress INTEGER DEFAULT 0,
+                message TEXT,
+                pdf_path TEXT,
+                error_message TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                started_at TEXT,
+                completed_at TEXT,
+                expires_at TEXT
+            )
+        """)
+        
+        # 创建索引
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_pdf_tasks_user_id 
+            ON pdf_tasks(user_id)
+        """)
+        
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_pdf_tasks_order_no 
+            ON pdf_tasks(order_no)
+        """)
+        
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_pdf_tasks_status 
+            ON pdf_tasks(status)
+        """)
+        
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_pdf_tasks_created_at 
+            ON pdf_tasks(created_at)
+        """)
+        
+        conn.commit()
+        logger.info("pdf_tasks table created successfully")
+    else:
+        logger.info("pdf_tasks table already exists, skipping creation")
+    
+    conn.close()
+
+
+# 初始化數據庫連接池（必須在其他初始化之前）
+_ensure_pool_initialized()
 
 # 初始化账号系统
 _ensure_account_tables()
@@ -622,6 +1173,9 @@ _ensure_file_index_tables()
 
 # 初始化下载任务表
 _ensure_download_tasks_table()
+
+# 初始化 PDF 任务表
+_ensure_pdf_tasks_table()
 
 
 def check_pdf_status_table_exists(conn):
@@ -635,33 +1189,102 @@ def check_pdf_status_table_exists(conn):
 
 
 @app.route('/api/auth/login', methods=['POST'])
+@limiter.limit("5 per minute") if limiter else (lambda f: f)
 def login():
     """登录并获取会话令牌"""
+    request_id = request.headers.get('X-Request-ID') or str(uuid.uuid4())
+    t_start = time.perf_counter()
+    db_query_ms = 0
+    password_verify_ms = 0
+    token_issue_ms = 0
+
+    def _log_login_attempt(status_code, result, fail_type=''):
+        total_ms = int((time.perf_counter() - t_start) * 1000)
+        username_masked = ''
+        if username:
+            username_masked = username[:2] + '***' if len(username) > 2 else username[0] + '*'
+
+        logger.info(
+            "login_attempt request_id=%s username=%s status_code=%s result=%s fail_type=%s "
+            "db_query_ms=%s password_verify_ms=%s token_issue_ms=%s total_ms=%s",
+            request_id,
+            username_masked,
+            status_code,
+            result,
+            fail_type,
+            db_query_ms,
+            password_verify_ms,
+            token_issue_ms,
+            total_ms
+        )
+        return total_ms
+
+    def _build_response(payload, status_code, result, fail_type=''):
+        total_ms = _log_login_attempt(status_code=status_code, result=result, fail_type=fail_type)
+        payload['request_id'] = request_id
+        payload['timing'] = {
+            'db_query_ms': db_query_ms,
+            'password_verify_ms': password_verify_ms,
+            'token_issue_ms': token_issue_ms,
+            'total_ms': total_ms
+        }
+        response = jsonify(payload)
+        response.status_code = status_code
+        response.headers['X-Request-ID'] = request_id
+        return response
+
     data = request.get_json(silent=True) or {}
     username = (data.get('username') or '').strip()
     password = data.get('password') or ''
 
     if not username or not password:
-        return jsonify({'success': False, 'error': 'Username and password are required'}), 400
+        return _build_response(
+            {'success': False, 'error': 'Username and password are required'},
+            400,
+            'fail',
+            'missing_credentials'
+        )
 
+    t_db_start = time.perf_counter()
     conn = get_db_connection()
     user = _fetch_user(conn, username=username)
+    db_query_ms = int((time.perf_counter() - t_db_start) * 1000)
     if not user:
         conn.close()
-        return jsonify({'success': False, 'error': 'Invalid username or password'}), 401
+        return _build_response(
+            {'success': False, 'error': 'Invalid username or password'},
+            401,
+            'fail',
+            'invalid_username_or_password'
+        )
 
-    if not _verify_password(password, user['password_salt'], user['password_hash']):
+    t_verify_start = time.perf_counter()
+    is_password_valid = _verify_password(password, user['password_salt'], user['password_hash'])
+    password_verify_ms = int((time.perf_counter() - t_verify_start) * 1000)
+    if not is_password_valid:
         conn.close()
-        return jsonify({'success': False, 'error': 'Invalid username or password'}), 401
+        return _build_response(
+            {'success': False, 'error': 'Invalid username or password'},
+            401,
+            'fail',
+            'invalid_username_or_password'
+        )
 
     if not user.get('is_active'):
         conn.close()
-        return jsonify({'success': False, 'error': 'Account is disabled'}), 403
+        return _build_response(
+            {'success': False, 'error': 'Account is disabled'},
+            403,
+            'fail',
+            'account_disabled'
+        )
 
     job_nos = _fetch_user_job_nos(conn, user['id'])
     conn.close()
 
+    t_token_start = time.perf_counter()
     token, expires_at = _create_session(user['id'])
+    token_issue_ms = int((time.perf_counter() - t_token_start) * 1000)
     response_user = {
         'username': user['username'],
         'role': user['role'],
@@ -669,12 +1292,16 @@ def login():
         'job_nos': job_nos,
         'active': bool(user.get('is_active'))
     }
-    return jsonify({
-        'success': True,
-        'token': token,
-        'expires_at': expires_at,
-        'user': response_user
-    })
+    return _build_response(
+        {
+            'success': True,
+            'token': token,
+            'expires_at': expires_at,
+            'user': response_user
+        },
+        200,
+        'success'
+    )
 
 
 @app.route('/api/auth/logout', methods=['POST'])
@@ -691,10 +1318,23 @@ def logout():
 def get_profile():
     """获取当前用户信息"""
     user = g.current_user
+    user_id = user['id']
+    
+    # 生成緩存鍵
+    cache_key = cache.generate_key('user:profile', user_id=user_id)
+    
+    # 嘗試從緩存獲取
+    cached_result = cache.get(cache_key)
+    if cached_result is not None:
+        logger.debug(f"用戶信息緩存命中: {cache_key}")
+        return jsonify(cached_result)
+    
     conn = get_db_connection()
-    job_nos = _fetch_user_job_nos(conn, user['id'])
+    job_nos = _fetch_user_job_nos(conn, user_id)
     conn.close()
-    return jsonify({
+    
+    # 構建響應
+    response_data = {
         'success': True,
         'user': {
             'username': user['username'],
@@ -705,13 +1345,17 @@ def get_profile():
             'created_at': user.get('created_at'),
             'updated_at': user.get('updated_at')
         }
-    })
+    }
+    
+    # 保存到緩存（30分鐘，與 Session 對應）
+    cache.set(cache_key, response_data, ttl=1800)
+    logger.debug(f"用戶信息緩存已保存: {cache_key}")
+    
+    return jsonify(response_data)
 
 
-@app.route('/api/admin/users', methods=['GET'])
-@require_auth('admin')
-def list_users():
-    """管理员：查看所有账户"""
+def _list_users_from_db():
+    """從數據庫獲取用戶列表（內部函數）"""
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM user_accounts ORDER BY role DESC, username ASC")
@@ -720,21 +1364,50 @@ def list_users():
     for row in rows:
         row_dict = dict(row)
         job_nos = _fetch_user_job_nos(conn, row_dict['id'])
+        password_days_remaining = _calculate_password_days_remaining(row_dict.get('password_expires_at'))
         users.append({
             'username': row_dict['username'],
             'name': row_dict.get('full_name') or '',
             'role': row_dict['role'],
             'active': bool(row_dict.get('is_active')),
+            'current_password': row_dict.get('password_plaintext') or '',
             'job_nos': job_nos,
             'created_at': row_dict.get('created_at'),
-            'updated_at': row_dict.get('updated_at')
+            'updated_at': row_dict.get('updated_at'),
+            'password_days_remaining': password_days_remaining,
+            'password_expires_at': row_dict.get('password_expires_at')
         })
     conn.close()
-    return jsonify({'success': True, 'users': users})
+    return users
+
+
+@app.route('/api/admin/users', methods=['GET'])
+@require_auth('admin')
+def list_users():
+    """管理员：查看所有账户"""
+    # 嘗試從緩存獲取用戶列表
+    cache_key = 'admin:users:list'
+    cached_result = cache.get(cache_key)
+    if cached_result is not None:
+        logger.debug(f"用戶列表緩存命中: {cache_key}")
+        return jsonify(cached_result)
+    
+    # 查詢數據庫
+    users = _list_users_from_db()
+    
+    # 構建響應
+    response_data = {'success': True, 'users': users}
+    
+    # 保存到緩存（5分鐘）
+    cache.set(cache_key, response_data, ttl=300)
+    logger.debug(f"用戶列表緩存已保存: {cache_key}")
+    
+    return jsonify(response_data)
 
 
 @app.route('/api/admin/users', methods=['POST'])
 @require_auth('admin')
+@limiter.limit("10 per hour") if limiter else (lambda f: f)
 def create_user():
     """管理员：新增普通账号"""
     data = request.get_json(silent=True) or {}
@@ -767,12 +1440,19 @@ def create_user():
         if role not in ('user', 'manager'):
             role = 'user'
     
+    # 设置密码过期时间（仅对普通用户和manager，admin不过期）
+    now = datetime.now()
+    password_changed_at = now.isoformat()
+    password_expires_at = None
+    if role in ('user', 'manager'):
+        password_expires_at = (now + timedelta(days=PASSWORD_EXPIRY_DAYS)).isoformat()
+    
     cursor.execute(
         """
-        INSERT INTO user_accounts (username, password_hash, password_salt, full_name, role, is_active)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO user_accounts (username, password_hash, password_salt, password_plaintext, full_name, role, is_active, password_changed_at, password_expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (username, password_hash, salt, full_name, role, 1 if active else 0)
+        (username, password_hash, salt, password, full_name, role, 1 if active else 0, password_changed_at, password_expires_at)
     )
     user_id = cursor.lastrowid
     # 只有user角色需要Job No，manager不需要
@@ -783,6 +1463,12 @@ def create_user():
     assigned_jobs = _fetch_user_job_nos(conn, user_id)
     conn.close()
 
+    password_days_remaining = _calculate_password_days_remaining(new_user.get('password_expires_at'))
+    
+    # 清除用戶列表緩存（已創建新用戶）
+    cache.delete('admin:users:list')
+    logger.info("已清除用戶列表緩存（已創建新用戶）")
+    
     return jsonify({
         'success': True,
         'user': {
@@ -790,9 +1476,12 @@ def create_user():
             'name': new_user.get('full_name') or '',
             'role': new_user['role'],
             'active': bool(new_user.get('is_active')),
+            'current_password': new_user.get('password_plaintext') or '',
             'job_nos': assigned_jobs,
             'created_at': new_user.get('created_at'),
-            'updated_at': new_user.get('updated_at')
+            'updated_at': new_user.get('updated_at'),
+            'password_days_remaining': password_days_remaining,
+            'password_expires_at': new_user.get('password_expires_at')
         }
     }), 201
 
@@ -836,6 +1525,21 @@ def update_user(username):
         params.append(password_hash)
         updates.append("password_salt = ?")
         params.append(salt)
+        updates.append("password_plaintext = ?")
+        params.append(password)
+        # 更新密码时，设置新的过期时间（仅对普通用户和manager）
+        now = datetime.now()
+        password_changed_at = now.isoformat()
+        updates.append("password_changed_at = ?")
+        params.append(password_changed_at)
+        if user['role'] in ('user', 'manager'):
+            password_expires_at = (now + timedelta(days=PASSWORD_EXPIRY_DAYS)).isoformat()
+            updates.append("password_expires_at = ?")
+            params.append(password_expires_at)
+        else:
+            # admin账户密码不过期
+            updates.append("password_expires_at = ?")
+            params.append(None)
 
     if updates:
         updates.append("updated_at = CURRENT_TIMESTAMP")
@@ -853,6 +1557,13 @@ def update_user(username):
     job_nos = _fetch_user_job_nos(conn, refreshed['id'])
     conn.close()
 
+    password_days_remaining = _calculate_password_days_remaining(refreshed.get('password_expires_at'))
+    
+    # 清除相關緩存（用戶信息已更新）
+    cache.delete('admin:users:list')  # 清除用戶列表緩存
+    cache.delete(cache.generate_key('user:profile', user_id=refreshed['id']))  # 清除該用戶的個人信息緩存
+    logger.info(f"已清除用戶緩存（用戶 {username} 已更新）")
+    
     return jsonify({
         'success': True,
         'user': {
@@ -860,9 +1571,12 @@ def update_user(username):
             'name': refreshed.get('full_name') or '',
             'role': refreshed['role'],
             'active': bool(refreshed.get('is_active')),
+            'current_password': refreshed.get('password_plaintext') or '',
             'job_nos': job_nos,
             'created_at': refreshed.get('created_at'),
-            'updated_at': refreshed.get('updated_at')
+            'updated_at': refreshed.get('updated_at'),
+            'password_days_remaining': password_days_remaining,
+            'password_expires_at': refreshed.get('password_expires_at')
         }
     })
 
@@ -898,7 +1612,63 @@ def delete_user(username):
     cursor.execute("DELETE FROM user_accounts WHERE id = ?", (row['id'],))
     conn.commit()
     conn.close()
+    
+    # 清除相關緩存（用戶已刪除）
+    cache.delete('admin:users:list')  # 清除用戶列表緩存
+    cache.delete(f"user:profile:user_id:{row['id']}")  # 清除該用戶的個人信息緩存
+    logger.info(f"已清除用戶緩存（用戶 {username} 已刪除）")
+    
     return jsonify({'success': True, 'message': f'User {username} has been removed'})
+
+
+@app.route('/api/admin/users/<username>/reset-password', methods=['POST'])
+@require_auth('admin')
+@limiter.limit("3 per hour") if limiter else (lambda f: f)
+def reset_user_password(username):
+    """管理员：重置用户密码（自动生成10位强密码）"""
+    username = (username or '').strip()
+    if not username:
+        return jsonify({'success': False, 'error': 'Username is required'}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    user = _fetch_user(conn, username=username)
+    if not user:
+        conn.close()
+        return jsonify({'success': False, 'error': 'User not found'}), 404
+
+    # 生成10位随机强密码
+    new_password = _generate_random_password(10)
+    salt, password_hash = _generate_password_hash(new_password)
+    
+    # 更新密码和过期时间
+    now = datetime.now()
+    password_changed_at = now.isoformat()
+    
+    # 仅对普通用户和manager设置过期时间，admin不过期
+    if user['role'] in ('user', 'manager'):
+        password_expires_at = (now + timedelta(days=PASSWORD_EXPIRY_DAYS)).isoformat()
+    else:
+        password_expires_at = None
+    
+    cursor.execute(
+        """
+        UPDATE user_accounts 
+        SET password_hash = ?, password_salt = ?, password_plaintext = ?, password_changed_at = ?, password_expires_at = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE username = ?
+        """,
+        (password_hash, salt, new_password, password_changed_at, password_expires_at, username)
+    )
+    
+    conn.commit()
+    conn.close()
+    
+    # 返回新生成的密码（仅此一次，用于显示给管理员）
+    return jsonify({
+        'success': True,
+        'new_password': new_password,
+        'message': f'Password has been reset for user {username}. New password: {new_password}'
+    })
 
 
 def regenerate_orders_gen_pdf():
@@ -913,7 +1683,7 @@ def regenerate_orders_gen_pdf():
         # 检查TR_Fill_in表是否存在
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='TR_Fill_in'")
         if cursor.fetchone() is None:
-            print("[WARNING] TR_Fill_in表不存在，跳过Orders_gen_pdf更新")
+            logger.warning("TR_Fill_in表不存在，跳过Orders_gen_pdf更新")
             conn.close()
             return {'success': False, 'reason': 'TR_Fill_in表不存在'}
         
@@ -921,7 +1691,7 @@ def regenerate_orders_gen_pdf():
         cursor.execute("SELECT COUNT(*) FROM TR_Fill_in")
         tr_fill_in_count = cursor.fetchone()[0]
         if tr_fill_in_count == 0:
-            print("[WARNING] TR_Fill_in表为空，删除Orders_gen_pdf表（如果有）")
+            logger.warning("TR_Fill_in表为空，删除Orders_gen_pdf表（如果有）")
             cursor.execute("DROP TABLE IF EXISTS Orders_gen_pdf")
             conn.commit()
             conn.close()
@@ -930,7 +1700,7 @@ def regenerate_orders_gen_pdf():
         # 检查orders_com表是否存在
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='orders_com'")
         if cursor.fetchone() is None:
-            print("[WARNING] orders_com表不存在，跳过Orders_gen_pdf更新")
+            logger.warning("orders_com表不存在，跳过Orders_gen_pdf更新")
             conn.close()
             return {'success': False, 'reason': 'orders_com表不存在'}
         
@@ -982,7 +1752,7 @@ def regenerate_orders_gen_pdf():
         return {'success': True, 'count': count}
         
     except Exception as e:
-        print(f"[ERROR] 重新生成Orders_gen_pdf表失败: {e}")
+        logger.error(f"重新生成Orders_gen_pdf表失败: {e}", exc_info=True)
         import traceback
         traceback.print_exc()
         try:
@@ -1099,9 +1869,9 @@ def save_data():
             print(f"[INFO] TR_Fill_in表已更新（新增{inserted_count}条记录），开始同步Orders_gen_pdf表...")
             regenerate_result = regenerate_orders_gen_pdf()
             if regenerate_result['success']:
-                print(f"[OK] Orders_gen_pdf表同步成功，当前记录数: {regenerate_result.get('count', 0)}")
+                logger.info(f"Orders_gen_pdf表同步成功，当前记录数: {regenerate_result.get('count', 0)}")
             else:
-                print(f"[WARNING] Orders_gen_pdf表同步失败: {regenerate_result.get('error', '未知错误')}")
+                logger.warning(f"Orders_gen_pdf表同步失败: {regenerate_result.get('error', '未知错误')}")
         
         return jsonify({
             'success': True,
@@ -1149,9 +1919,13 @@ def delete_data():
             print(f"[INFO] TR_Fill_in表已更新（删除{deleted_count}条记录），开始同步Orders_gen_pdf表...")
             regenerate_result = regenerate_orders_gen_pdf()
             if regenerate_result['success']:
-                print(f"[OK] Orders_gen_pdf表同步成功，当前记录数: {regenerate_result.get('count', 0)}")
+                logger.info(f"Orders_gen_pdf表同步成功，当前记录数: {regenerate_result.get('count', 0)}")
             else:
-                print(f"[WARNING] Orders_gen_pdf表同步失败: {regenerate_result.get('error', '未知错误')}")
+                logger.warning(f"Orders_gen_pdf表同步失败: {regenerate_result.get('error', '未知错误')}")
+            
+            # 清除訂單列表緩存（數據已更新）
+            cache.delete('orders:list:*')
+            logger.info("已清除訂單列表緩存（數據已更新）")
         
         return jsonify({
             'success': True,
@@ -1183,6 +1957,10 @@ def clear_data():
             print(f"[OK] Orders_gen_pdf表同步成功，当前记录数: {regenerate_result.get('count', 0)}")
         else:
             print(f"[WARNING] Orders_gen_pdf表同步失败: {regenerate_result.get('error', '未知错误')}")
+        
+        # 清除訂單列表緩存（數據已更新）
+        cache.delete('orders:list:*')
+        logger.info("已清除訂單列表緩存（數據已清空）")
         
         return jsonify({
             'success': True,
@@ -1254,9 +2032,13 @@ def update_data():
             print(f"[INFO] TR_Fill_in表已更新（更新{updated_count}条记录），开始同步Orders_gen_pdf表...")
             regenerate_result = regenerate_orders_gen_pdf()
             if regenerate_result['success']:
-                print(f"[OK] Orders_gen_pdf表同步成功，当前记录数: {regenerate_result.get('count', 0)}")
+                logger.info(f"Orders_gen_pdf表同步成功，当前记录数: {regenerate_result.get('count', 0)}")
             else:
-                print(f"[WARNING] Orders_gen_pdf表同步失败: {regenerate_result.get('error', '未知错误')}")
+                logger.warning(f"Orders_gen_pdf表同步失败: {regenerate_result.get('error', '未知错误')}")
+            
+            # 清除訂單列表緩存（數據已更新）
+            cache.delete('orders:list:*')
+            logger.info("已清除訂單列表緩存（數據已更新）")
         
         return jsonify({
             'success': True,
@@ -1310,6 +2092,15 @@ def search_material(tag_no):
     从data_3years.db的materials_com表中查询
     """
     try:
+        # 生成緩存鍵
+        cache_key = cache.generate_key('materials:search', tag_no=tag_no)
+        
+        # 嘗試從緩存獲取
+        cached_result = cache.get(cache_key)
+        if cached_result is not None:
+            logger.debug(f"材料搜索緩存命中: {cache_key}")
+            return jsonify(cached_result)
+        
         # 调试：打印实际使用的数据库路径
         if DEBUG_MODE:
             print(f"[DEBUG] Using database: {DB_PATH}")
@@ -1327,8 +2118,8 @@ def search_material(tag_no):
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
             all_tables = [row[0] for row in cursor.fetchall()]
             error_msg = f"Table 'materials_com' does not exist in database. Available tables: {', '.join(all_tables)}"
-            print(f"[ERROR] {error_msg}")
-            print(f"[ERROR] Database path: {DB_PATH}")
+            logger.error(error_msg)
+            logger.error(f"Database path: {DB_PATH}")
             conn.close()
             return jsonify({
                 'found': False,
@@ -1389,17 +2180,33 @@ def search_material(tag_no):
                 'DN_No': row['DN_No'] if row['DN_No'] else ''
             }
             conn.close()
-            return jsonify({
+            
+            # 構建響應
+            result = {
                 'found': True,
                 'data': data
-            })
+            }
+            
+            # 保存到緩存（1小時，材料數據非常穩定）
+            cache.set(cache_key, result, ttl=3600)
+            logger.debug(f"材料搜索緩存已保存: {cache_key}")
+            
+            return jsonify(result)
         else:
             conn.close()
-            return jsonify({
+            
+            # 構建響應（未找到也緩存，避免重複查詢）
+            result = {
                 'found': False,
                 'data': None,
                 'message': f'Tag No {tag_no} not found in materials_com'
-            })
+            }
+            
+            # 保存到緩存（30分鐘，避免重複查詢不存在的數據）
+            cache.set(cache_key, result, ttl=1800)
+            logger.debug(f"材料搜索緩存已保存（未找到）: {cache_key}")
+            
+            return jsonify(result)
             
     except Exception as e:
         import traceback
@@ -1414,26 +2221,49 @@ def search_material(tag_no):
 def get_bbs_dd_list(page, per_page_param, order_no, job_no, dn_no, start_date, end_date, conn, cursor):
     """
     从 bbs_dd 表获取订单列表（用于 Stocklist&Test Report 标签页）
+    性能优化版本：减少 CAST 操作，优化查询条件
     """
     try:
+        # 确保索引存在（首次调用时创建）
+        _ensure_bbs_dd_indexes(conn, cursor)
+        
         # 检查PDF_Status表是否存在
         pdf_status_exists = check_pdf_status_table_exists(conn)
         
-        # 构建WHERE子句
+        # 构建WHERE子句（优化：减少 CAST 操作）
         where_conditions = []
         params = []
         
         if order_no:
-            where_conditions.append("CAST(b.bbs_no AS TEXT) LIKE ?")
-            params.append(f"%{order_no}%")
+            # 优化：尝试使用数值比较，避免 CAST
+            try:
+                order_no_int = int(order_no)
+                where_conditions.append("b.bbs_no = ?")
+                params.append(order_no_int)
+            except (ValueError, TypeError):
+                # 如果不是纯数字，使用 LIKE（但避免通配符开头以使用索引）
+                where_conditions.append("CAST(b.bbs_no AS TEXT) LIKE ?")
+                params.append(f"{order_no}%")  # 改为 value% 而不是 %value%
         
         if job_no:
-            where_conditions.append("CAST(b.jobsite_no AS TEXT) LIKE ?")
-            params.append(f"%{job_no}%")
+            # 优化：尝试使用数值比较
+            try:
+                job_no_int = int(job_no)
+                where_conditions.append("b.jobsite_no = ?")
+                params.append(job_no_int)
+            except (ValueError, TypeError):
+                where_conditions.append("CAST(b.jobsite_no AS TEXT) LIKE ?")
+                params.append(f"{job_no}%")  # 改为 value% 而不是 %value%
         
         if dn_no:
-            where_conditions.append("CAST(b.dd_no AS TEXT) LIKE ?")
-            params.append(f"%{dn_no}%")
+            # 优化：尝试使用数值比较
+            try:
+                dn_no_int = int(dn_no)
+                where_conditions.append("b.dd_no = ?")
+                params.append(dn_no_int)
+            except (ValueError, TypeError):
+                where_conditions.append("CAST(b.dd_no AS TEXT) LIKE ?")
+                params.append(f"{dn_no}%")  # 改为 value% 而不是 %value%
         
         if start_date:
             where_conditions.append("b.dd_delivery_date >= ?")
@@ -1444,13 +2274,14 @@ def get_bbs_dd_list(page, per_page_param, order_no, job_no, dn_no, start_date, e
             params.append(end_date)
         
         # 普通账号只能看到授权范围内的Job No
+        # 优化：使用数值比较而不是 CAST
         current_user = get_current_user(optional=True)
         if current_user and current_user.get('role') == 'user':
             scoped_jobs = _fetch_user_job_nos(conn, current_user['id'])
             if scoped_jobs:
                 placeholders = ','.join('?' * len(scoped_jobs))
-                where_conditions.append(f"CAST(b.jobsite_no AS TEXT) IN ({placeholders})")
-                params.extend([str(j) for j in scoped_jobs])
+                where_conditions.append(f"b.jobsite_no IN ({placeholders})")
+                params.extend(scoped_jobs)  # 直接使用数值，不需要转换为字符串
             else:
                 where_conditions.append("1 = 0")
         
@@ -1460,13 +2291,17 @@ def get_bbs_dd_list(page, per_page_param, order_no, job_no, dn_no, start_date, e
             where_clause = "WHERE " + " AND ".join(where_conditions)
         
         # 根据PDF_Status表是否存在构建不同的查询
+        # 优化：COUNT 查询不需要 JOIN，可以更快
         if pdf_status_exists:
+            # COUNT 查询：不需要 JOIN，提升性能
             count_query = f"""
                 SELECT COUNT(*) 
                 FROM bbs_dd b
-                LEFT JOIN PDF_Status p ON CAST(b.bbs_no AS TEXT) = CAST(p.Order_No AS TEXT)
                 {where_clause}
             """
+            # 主查询：需要 JOIN 获取 PDF 状态
+            # 优化：PDF_Status.Order_No 是 INTEGER，bbs_dd.bbs_no 也应该是数值类型
+            # 直接使用数值比较，避免 CAST
             query = f"""
             SELECT 
                 b.bbs_no AS Order_No,
@@ -1479,7 +2314,7 @@ def get_bbs_dd_list(page, per_page_param, order_no, job_no, dn_no, start_date, e
                 p.pdf_path,
                 p.generated_at
             FROM bbs_dd b
-            LEFT JOIN PDF_Status p ON CAST(b.bbs_no AS TEXT) = CAST(p.Order_No AS TEXT)
+            LEFT JOIN PDF_Status p ON b.bbs_no = p.Order_No
             {where_clause}
             ORDER BY b.dd_delivery_date DESC
             LIMIT ? OFFSET ?
@@ -1508,12 +2343,18 @@ def get_bbs_dd_list(page, per_page_param, order_no, job_no, dn_no, start_date, e
             """
         
         # 添加调试信息
-        print(f"[DEBUG] /api/orders/list (bbs_dd) - Executing count query")
+        try:
+            print("[DEBUG] /api/orders/list (bbs_dd) - Executing count query")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
         
         cursor.execute(count_query, params)
         total_records = cursor.fetchone()[0]
         
-        print(f"[DEBUG] /api/orders/list (bbs_dd) - Total records: {total_records}")
+        try:
+            print(f"[DEBUG] /api/orders/list (bbs_dd) - Total records: {total_records}")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
         
         # 处理 per_page 参数
         try:
@@ -1532,16 +2373,25 @@ def get_bbs_dd_list(page, per_page_param, order_no, job_no, dn_no, start_date, e
         
         # 执行查询
         query_params = params + [per_page, offset]
-        print(f"[DEBUG] /api/orders/list (bbs_dd) - Executing query with limit={per_page}, offset={offset}")
+        try:
+            print(f"[DEBUG] /api/orders/list (bbs_dd) - Executing query with limit={per_page}, offset={offset}")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
         
         import time
         start_time = time.time()
         cursor.execute(query, query_params)
         execution_time = time.time() - start_time
-        print(f"[DEBUG] /api/orders/list (bbs_dd) - Query executed in {execution_time:.2f} seconds")
+        try:
+            print(f"[DEBUG] /api/orders/list (bbs_dd) - Query executed in {execution_time:.2f} seconds")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
         
         rows = cursor.fetchall()
-        print(f"[DEBUG] /api/orders/list (bbs_dd) - Fetched {len(rows)} rows")
+        try:
+            print(f"[DEBUG] /api/orders/list (bbs_dd) - Fetched {len(rows)} rows")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
         
         # 转换为字典列表
         data = []
@@ -1580,7 +2430,10 @@ def get_bbs_dd_list(page, per_page_param, order_no, job_no, dn_no, start_date, e
             conn.close()
         import traceback
         error_trace = traceback.format_exc()
-        print(f"Error getting bbs_dd list: {error_trace}")
+        try:
+            print(f"Error getting bbs_dd list: {error_trace}")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            logger.error(f"Error getting bbs_dd list: {str(e)}")
         return jsonify({
             'success': False,
             'error': str(e)
@@ -1613,12 +2466,51 @@ def get_orders_list():
         start_date = request.args.get('start_date', '').strip()
         end_date = request.args.get('end_date', '').strip()
         
+        # 獲取當前用戶（用於緩存鍵）
+        current_user = get_current_user(optional=True)
+        user_id = current_user.get('id') if current_user else 'anonymous'
+        user_role = current_user.get('role') if current_user else 'anonymous'
+        
+        # 生成緩存鍵
+        cache_key = cache.generate_key(
+            'orders:list',
+            page=page,
+            per_page=per_page_param,
+            tab=tab,
+            order_no=order_no,
+            job_no=job_no,
+            dn_no=dn_no,
+            start_date=start_date,
+            end_date=end_date,
+            user_id=user_id,
+            user_role=user_role
+        )
+        
+        # 嘗試從緩存獲取
+        cached_result = cache.get(cache_key)
+        if cached_result is not None:
+            try:
+                logger.debug(f"Orders list cache hit: {cache_key}")
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                logger.debug(f"Orders list cache hit: {cache_key}")
+            return jsonify(cached_result)
+        
         conn = get_db_connection()
         cursor = conn.cursor()
         
         # 如果是 stocklist-test 标签页，使用 bbs_dd 表
         if tab == 'stocklist-test':
-            return get_bbs_dd_list(page, per_page_param, order_no, job_no, dn_no, start_date, end_date, conn, cursor)
+            return get_bbs_dd_list(
+                page,
+                per_page_param,
+                order_no,
+                job_no,
+                dn_no,
+                start_date,
+                end_date,
+                conn,
+                cursor
+            )
         
         # 检查PDF_Status表是否存在
         pdf_status_exists = check_pdf_status_table_exists(conn)
@@ -1649,7 +2541,6 @@ def get_orders_list():
 
         # 普通账号只能看到授权范围内的Job No
         # manager和admin可以看到所有记录
-        current_user = get_current_user(optional=True)
         if current_user and current_user.get('role') == 'user':
             scoped_jobs = _fetch_user_job_nos(conn, current_user['id'])
             if scoped_jobs:
@@ -1734,8 +2625,6 @@ def get_orders_list():
         total_records = cursor.fetchone()[0]
         
         # 调试信息：打印总记录数和用户信息
-        current_user = get_current_user(optional=True)
-        user_role = current_user.get('role') if current_user else 'anonymous'
         print(f"[DEBUG] /api/orders/list - User: {user_role}, Total records: {total_records}, Params: {params}")
         
         # 处理 per_page 参数
@@ -1786,11 +2675,11 @@ def get_orders_list():
             
             # 如果查询返回空结果，打印警告
             if len(rows) == 0:
-                print(f"[WARNING] /api/orders/list - Query returned 0 rows, but total_records={total_records}")
+                logger.warning(f"/api/orders/list - Query returned 0 rows, but total_records={total_records}")
         except Exception as query_error:
-            print(f"[ERROR] /api/orders/list - Query execution failed: {query_error}")
-            print(f"[ERROR] Query: {query[:500]}...")  # 打印前500个字符
-            print(f"[ERROR] Params: {query_params}")
+            logger.error(f"/api/orders/list - Query execution failed: {query_error}")
+            logger.error(f"Query: {query[:500]}...")  # 打印前500个字符
+            logger.error(f"Params: {query_params}")
             import traceback
             traceback.print_exc()
             conn.close()
@@ -1815,7 +2704,8 @@ def get_orders_list():
             sample_client = data[0].get('Client')
             print(f"[DEBUG] /api/orders/list - Sample Client value: '{sample_client}' (type: {type(sample_client)})")
         
-        return jsonify({
+        # 構建響應
+        response_data = {
             'success': True,
             'data': data,
             'pagination': {
@@ -1831,12 +2721,18 @@ def get_orders_list():
                 'end_date': end_date
             },
             'count': len(data)
-        })
+        }
+        
+        # 保存到緩存（5分鐘）
+        cache.set(cache_key, response_data, ttl=300)
+        logger.debug(f"訂單列表緩存已保存: {cache_key}")
+        
+        return jsonify(response_data)
     except Exception as e:
         import traceback
         error_trace = traceback.format_exc()
-        print(f"[ERROR] /api/orders/list - Exception occurred: {str(e)}")
-        print(f"[ERROR] Traceback:\n{error_trace}")
+        logger.error(f"/api/orders/list - Exception occurred: {str(e)}")
+        logger.error(f"Traceback:\n{error_trace}")
         return jsonify({
             'success': False,
             'error': str(e)
@@ -1952,10 +2848,43 @@ def group_by_job_no():
 @app.route('/api/pdf/generate', methods=['POST'])
 @require_auth()
 def generate_pdf():
-    """生成PDF并更新PDF_Status表"""
+    """
+    创建 PDF 生成任务（异步模式）
+    
+    请求体：
+    {
+        "order_no": 123456
+    }
+    
+    返回：
+    {
+        "success": true,
+        "task_id": "550e8400-e29b-41d4-a716-446655440000",
+        "order_no": 123456,
+        "message": "PDF 生成任务已创建，正在后台处理"
+    }
+    """
     try:
+        if PDFTaskManager is None:
+            return jsonify({
+                'success': False,
+                'error': 'PDF task manager not available'
+            }), 500
+        
         current_user = g.current_user
-        data = request.json
+        # 安全地获取 JSON 数据，避免编码问题
+        try:
+            data = request.get_json(silent=True) or {}
+        except Exception as json_error:
+            # 如果 JSON 解析失败，记录错误但不使用中文
+            try:
+                logger.error(f"Failed to parse JSON request: {json_error}")
+            except:
+                pass
+            return jsonify({
+                'success': False,
+                'error': 'Invalid JSON request'
+            }), 400
         order_no = data.get('order_no')
         
         if not order_no:
@@ -1964,113 +2893,127 @@ def generate_pdf():
                 'error': 'Order No is required'
             }), 400
         
-        # 导入PDF生成器 - 添加TR database目录到路径
-        db_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'TR database'))
-        if db_dir not in sys.path:
-            sys.path.insert(0, db_dir)
-        from generate_landscape_pdf import OrderTraceabilityPDFGenerator
+        user_id = current_user['id']
         
-        print(f"Successfully imported OrderTraceabilityPDFGenerator from {db_dir}")
+        # 创建任务管理器
+        task_manager = PDFTaskManager(DB_PATH)
         
-        # 创建PDF生成器（使用 SQL Server 连接，不再需要 db_path）
-        generator = OrderTraceabilityPDFGenerator()
+        # 创建任务
+        task_id = task_manager.create_task(user_id, int(order_no))
         
-        # 生成PDF
-        success, pdf_path = generator.generate_pdf(int(order_no))
-        
-        # 获取数据库连接
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        if success:
-            # 成功：更新PDF_Status表
+        # 在后台线程中处理任务
+        def process_task_async():
             try:
-                cursor.execute("""
-                    INSERT OR REPLACE INTO PDF_Status 
-                    (Order_No, pdf_status, pdf_path, generated_at, updated_at)
-                    VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                """, (order_no, 'generated', pdf_path))
-                
-                conn.commit()
-                print(f"[OK] PDF_Status updated for Order {order_no}: generated")
-                
-                return jsonify({
-                    'success': True,
-                    'pdf_path': pdf_path,
-                    'order_no': order_no,
-                    'pdf_status': 'generated',
-                    'message': 'PDF generated successfully'
-                })
-            except Exception as db_error:
-                print(f"[ERROR] Failed to update PDF_Status: {db_error}")
-                # 即使数据库更新失败，也返回成功（PDF已生成）
-                conn.rollback()
-                return jsonify({
-                    'success': True,
-                    'pdf_path': pdf_path,
-                    'order_no': order_no,
-                    'pdf_status': 'generated',
-                    'message': 'PDF generated successfully, but status update failed',
-                    'warning': str(db_error)
-                })
-            finally:
-                conn.close()
-        else:
-            # 失败：记录失败状态
-            try:
-                cursor.execute("""
-                    INSERT OR REPLACE INTO PDF_Status 
-                    (Order_No, pdf_status, updated_at)
-                    VALUES (?, ?, CURRENT_TIMESTAMP)
-                """, (order_no, 'failed'))
-                
-                conn.commit()
-                print(f"[OK] PDF_Status updated for Order {order_no}: failed")
-            except Exception as db_error:
-                print(f"[ERROR] Failed to update PDF_Status: {db_error}")
-                conn.rollback()
-            finally:
-                conn.close()
-            
-            return jsonify({
-                'success': False,
-                'error': f'Order {order_no} not found in database',
-                'pdf_status': 'failed'
-            }), 404
-            
+                task_manager.process_task(task_id, int(order_no))
+            except Exception as e:
+                try:
+                    print(f"[PDF Task] Background processing failed: {e}")
+                except (UnicodeEncodeError, UnicodeDecodeError):
+                    pass
+                import traceback
+                traceback.print_exc()
+        
+        thread = threading.Thread(target=process_task_async, daemon=True)
+        thread.start()
+        
+        return jsonify({
+            'success': True,
+            'task_id': task_id,
+            'order_no': order_no,
+            'message': 'PDF generation task created, processing in background'
+        }), 202  # 202 Accepted
+        
     except Exception as e:
-        # 异常：记录失败状态
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT OR REPLACE INTO PDF_Status 
-                (Order_No, pdf_status, updated_at)
-                VALUES (?, ?, CURRENT_TIMESTAMP)
-            """, (order_no, 'failed'))
-            conn.commit()
-            conn.close()
-            print(f"[OK] PDF_Status updated for Order {order_no}: failed (exception)")
-        except:
-            pass  # 忽略数据库更新错误
-        
         import traceback
-        error_trace = traceback.format_exc()
-        print(f"Error generating PDF: {error_trace}")
-        # 生产环境不应返回详细的错误堆栈给前端
-        if DEBUG_MODE:
+        try:
+            print(f"[Error] Failed to create PDF task: {e}")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/pdf/task-status/<task_id>', methods=['GET'])
+@require_auth()
+def get_pdf_task_status(task_id):
+    """
+    查询 PDF 生成任务状态
+    
+    返回：
+    {
+        "success": true,
+        "task_id": "...",
+        "order_no": 123456,
+        "status": "processing",  // pending, processing, completed, failed
+        "progress": 45,
+        "message": "正在生成 PDF...",
+        "pdf_path": "...",  // 仅当completed时
+        "error_message": "..."  // 仅当failed时
+    }
+    """
+    try:
+        from pdf_task_manager import PDFTaskManager
+        
+        current_user = g.current_user
+        user_id = current_user['id']
+        
+        task_manager = PDFTaskManager(DB_PATH)
+        task_status = task_manager.get_task_status(task_id, user_id)
+        
+        if not task_status:
             return jsonify({
                 'success': False,
-                'error': str(e),
-                'trace': error_trace,
-                'pdf_status': 'failed'
-            }), 500
+                'error': '任务不存在或无权访问'
+            }), 404
+        
+        result = {
+            'success': True,
+            'task_id': task_status['task_id'],
+            'order_no': task_status['order_no'],
+            'status': task_status['status'],
+            'progress': task_status['progress'] or 0,
+            'message': task_status.get('message', '')
+        }
+        
+        # 根据状态添加额外信息
+        if task_status['status'] == 'completed':
+            result['pdf_path'] = task_status['pdf_path']
+            result['pdf_status'] = 'generated'
+            if not result['message']:
+                result['message'] = 'PDF generated successfully'
+            warning_markers = ['存在空数据', '空數據', 'warning', 'empty data']
+            message_lower = str(result['message']).lower()
+            if any(marker in result['message'] for marker in warning_markers[:2]) or any(marker in message_lower for marker in warning_markers[2:]):
+                result['has_warning'] = True
+                result['warning_message'] = result['message']
+        elif task_status['status'] == 'failed':
+            result['error_message'] = task_status.get('error_message', '')
+            result['pdf_status'] = 'failed'
+            if not result['message']:
+                result['message'] = f'PDF generation failed: {result["error_message"]}'
+        elif task_status['status'] == 'processing':
+            if not result['message']:
+                result['message'] = 'Processing...'
         else:
-            return jsonify({
-                'success': False,
-                'error': 'PDF生成失败，请稍后重试或联系管理员',
-                'pdf_status': 'failed'
-            }), 500
+            if not result['message']:
+                result['message'] = 'Waiting...'
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        import traceback
+        try:
+            print(f"[Error] Failed to query PDF task status: {e}")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 
 
 @app.route('/api/pdf/download/<int:order_no>', methods=['GET'])
@@ -2097,21 +3040,86 @@ def download_pdf(order_no):
             SELECT 
                 s.pdf_path, 
                 s.pdf_status,
-                d.Job_No
+                d.Job_No,
+                d.Del_Date
             FROM PDF_Status s
             LEFT JOIN TR_Report_Deduplication d ON d.Order_No = s.Order_No
             WHERE s.Order_No = ?
         """, (order_no,))
         result = cursor.fetchone()
         
-        if not result:
+        pdf_status = None
+        pdf_path = None
+        del_date = None
+        
+        if result:
+            pdf_status = dict(result)
+            pdf_path = pdf_status.get('pdf_path')
+            del_date = pdf_status.get('Del_Date')
+        
+        # 如果PDF_Status表中没有记录，或者文件不存在，尝试查找文件
+        backend_dir = os.path.dirname(__file__)
+        abs_pdf_path = None
+        
+        if pdf_path:
+            if not os.path.isabs(pdf_path):
+                abs_pdf_path = os.path.normpath(os.path.join(backend_dir, pdf_path))
+            else:
+                abs_pdf_path = os.path.normpath(os.path.abspath(pdf_path))
+        
+        # 如果文件不存在，尝试根据Del_Date查找文件
+        if not abs_pdf_path or not os.path.exists(abs_pdf_path):
+            if not del_date:
+                # 如果没有Del_Date，从TR_Report_Deduplication获取
+                cursor.execute("""
+                    SELECT Del_Date FROM TR_Report_Deduplication WHERE Order_No = ? LIMIT 1
+                """, (order_no,))
+                del_date_result = cursor.fetchone()
+                if del_date_result:
+                    del_date = dict(del_date_result).get('Del_Date')
+            
+            if del_date:
+                # 清理日期字符串
+                def sanitize_subdir_name(value):
+                    if not value:
+                        return 'Unknown_Date'
+                    text = str(value).strip()
+                    if not text:
+                        return 'Unknown_Date'
+                    safe = ''.join(ch if ch.isalnum() or ch in ('-', '_') else '-' for ch in text)
+                    safe = safe.strip('-_')
+                    return safe or 'Unknown_Date'
+                
+                sanitized_date = sanitize_subdir_name(del_date)
+                possible_paths = [
+                    os.path.join(backend_dir, 'Generated_PDFs', sanitized_date, f'TR_{order_no}.pdf'),
+                    os.path.join(backend_dir, 'Generated_PDFs', sanitized_date, f'Order_{order_no}.pdf'),
+                ]
+                
+                found_path = None
+                for possible_path in possible_paths:
+                    if os.path.exists(possible_path):
+                        found_path = possible_path
+                        rel_path = os.path.relpath(possible_path, backend_dir)
+                        # 更新或插入PDF_Status记录
+                        cursor.execute("""
+                            INSERT OR REPLACE INTO PDF_Status 
+                            (Order_No, pdf_status, pdf_path, generated_at, updated_at)
+                            VALUES (?, 'generated', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                        """, (order_no, rel_path))
+                        conn.commit()
+                        pdf_path = rel_path
+                        abs_pdf_path = found_path
+                        pdf_status = {'pdf_status': 'generated', 'pdf_path': rel_path, 'Job_No': pdf_status.get('Job_No') if pdf_status else None}
+                        break
+        
+        if not pdf_status:
             conn.close()
             return jsonify({
                 'success': False,
                 'error': 'PDF not found for this order'
             }), 404
         
-        pdf_status = dict(result)
         # manager和admin可以下载所有PDF
         if current_user.get('role') == 'user':
             raw_job = pdf_status.get('Job_No')
@@ -2123,39 +3131,32 @@ def download_pdf(order_no):
                     'error': 'You are not allowed to download this order'
                 }), 403
         
+        # 如果文件存在但状态不是generated，更新状态
+        if abs_pdf_path and os.path.exists(abs_pdf_path) and pdf_status.get('pdf_status') != 'generated':
+            try:
+                cursor.execute("""
+                    UPDATE PDF_Status 
+                    SET pdf_status = 'generated', updated_at = CURRENT_TIMESTAMP
+                    WHERE Order_No = ?
+                """, (order_no,))
+                conn.commit()
+                pdf_status['pdf_status'] = 'generated'
+            except Exception as update_error:
+                logger.error(f"Failed to update PDF_Status for order {order_no}: {update_error}")
+        
         # 检查状态
-        if pdf_status['pdf_status'] != 'generated':
+        if pdf_status.get('pdf_status') != 'generated':
             conn.close()
             return jsonify({
                 'success': False,
-                'error': f'PDF status is {pdf_status["pdf_status"]}, not generated yet'
+                'error': f'PDF status is {pdf_status.get("pdf_status", "unknown")}, not generated yet'
             }), 400
         
-        pdf_path = pdf_status['pdf_path']
-        
-        if not pdf_path:
-            conn.close()
-            return jsonify({
-                'success': False,
-                'error': 'PDF path not found in database'
-            }), 404
-        
-        # 如果路径是相对路径，转换为基于backend目录的绝对路径
-        # PDF实际保存在 TR UI/backend/Generated_PDFs
-        if not os.path.isabs(pdf_path):
-            # 相对路径，基于backend目录（API服务器运行目录）
-            backend_dir = os.path.dirname(__file__)  # TR UI/backend
-            abs_pdf_path = os.path.normpath(os.path.join(backend_dir, pdf_path))
-        else:
-            # 已经是绝对路径
-            abs_pdf_path = os.path.normpath(os.path.abspath(pdf_path))
-        
-        # 验证文件存在
-        if not os.path.exists(abs_pdf_path):
+        if not abs_pdf_path or not os.path.exists(abs_pdf_path):
             conn.close()
             print(f"[DEBUG] PDF path from DB: {pdf_path}")
             print(f"[DEBUG] Converted absolute path: {abs_pdf_path}")
-            print(f"[DEBUG] File exists: {os.path.exists(abs_pdf_path)}")
+            print(f"[DEBUG] File exists: {os.path.exists(abs_pdf_path) if abs_pdf_path else False}")
             return jsonify({
                 'success': False,
                 'error': 'PDF file not found on server. The file may have been moved or deleted. Please regenerate the PDF.',
@@ -2262,8 +3263,8 @@ def batch_download_pdf():
         except Exception as e:
             import traceback
             error_trace = traceback.format_exc()
-            print(f"[ERROR] 批量下载查询失败: {error_trace}")
-            print(f"[ERROR] 订单号列表: {order_nos_str}")
+            logger.error(f"批量下载查询失败: {error_trace}")
+            logger.error(f"订单号列表: {order_nos_str}")
             conn.close()
             return jsonify({
                 'success': False,
@@ -2311,17 +3312,39 @@ def batch_download_pdf():
                     unauthorized_orders.append(order_no)
                     continue
             
-            # 检查状态
-            if pdf_status != 'generated':
-                not_generated.append(order_no)
-                continue
-            
-            if not pdf_path:
-                missing_files.append(order_no)
-                continue
-            
             # 如果路径是相对路径，转换为基于backend目录的绝对路径
             # PDF实际保存在 TR UI/backend/Generated_PDFs
+            if not pdf_path:
+                # 如果没有路径，尝试根据Del_Date构建路径
+                if del_date:
+                    backend_dir = os.path.dirname(__file__)  # TR UI/backend
+                    # 尝试构建可能的PDF路径
+                    sanitized_date = sanitize_subdir_name(del_date)
+                    possible_paths = [
+                        os.path.join(backend_dir, 'Generated_PDFs', sanitized_date, f'TR_{order_no}.pdf'),
+                        os.path.join(backend_dir, 'Generated_PDFs', sanitized_date, f'Order_{order_no}.pdf'),
+                    ]
+                    pdf_path = None
+                    for possible_path in possible_paths:
+                        if os.path.exists(possible_path):
+                            pdf_path = os.path.relpath(possible_path, backend_dir)
+                            # 更新数据库中的路径和状态
+                            try:
+                                cursor.execute("""
+                                    UPDATE PDF_Status 
+                                    SET pdf_path = ?, pdf_status = 'generated', updated_at = CURRENT_TIMESTAMP
+                                    WHERE Order_No = ?
+                                """, (pdf_path, order_no))
+                                conn.commit()
+                                pdf_status = 'generated'
+                            except Exception as update_error:
+                                logger.error(f"Failed to update PDF_Status for order {order_no}: {update_error}")
+                            break
+                
+                if not pdf_path:
+                    missing_files.append(order_no)
+                    continue
+            
             if not os.path.isabs(pdf_path):
                 # 相对路径，基于backend目录（API服务器运行目录）
                 backend_dir = os.path.dirname(__file__)  # TR UI/backend
@@ -2332,8 +3355,57 @@ def batch_download_pdf():
             
             # 检查文件存在
             if not os.path.exists(abs_pdf_path):
-                missing_files.append(order_no)
-                continue
+                # 文件不存在，但如果状态是generated，可能是路径问题，尝试查找文件
+                if pdf_status == 'generated':
+                    # 尝试根据Del_Date查找文件
+                    if del_date:
+                        backend_dir = os.path.dirname(__file__)
+                        sanitized_date = sanitize_subdir_name(del_date)
+                        possible_paths = [
+                            os.path.join(backend_dir, 'Generated_PDFs', sanitized_date, f'TR_{order_no}.pdf'),
+                            os.path.join(backend_dir, 'Generated_PDFs', sanitized_date, f'Order_{order_no}.pdf'),
+                        ]
+                        found_path = None
+                        for possible_path in possible_paths:
+                            if os.path.exists(possible_path):
+                                found_path = possible_path
+                                # 更新数据库中的路径
+                                try:
+                                    rel_path = os.path.relpath(possible_path, backend_dir)
+                                    cursor.execute("""
+                                        UPDATE PDF_Status 
+                                        SET pdf_path = ?, updated_at = CURRENT_TIMESTAMP
+                                        WHERE Order_No = ?
+                                    """, (rel_path, order_no))
+                                    conn.commit()
+                                    abs_pdf_path = found_path
+                                except Exception as update_error:
+                                    logger.error(f"Failed to update PDF_Status path for order {order_no}: {update_error}")
+                                break
+                        
+                        if not found_path:
+                            missing_files.append(order_no)
+                            continue
+                    else:
+                        missing_files.append(order_no)
+                        continue
+                else:
+                    missing_files.append(order_no)
+                    continue
+            
+            # 检查状态 - 如果文件存在但状态不是generated，更新状态
+            if pdf_status != 'generated' and os.path.exists(abs_pdf_path):
+                # 文件存在但状态不对，更新状态
+                try:
+                    cursor.execute("""
+                        UPDATE PDF_Status 
+                        SET pdf_status = 'generated', updated_at = CURRENT_TIMESTAMP
+                        WHERE Order_No = ?
+                    """, (order_no,))
+                    conn.commit()
+                    pdf_status = 'generated'
+                except Exception as update_error:
+                    logger.error(f"Failed to update PDF_Status for order {order_no}: {update_error}")
             
             # 验证路径安全性（确保在backend/Generated_PDFs目录内）
             backend_dir = os.path.dirname(__file__)  # TR UI/backend
@@ -2452,11 +3524,16 @@ def batch_download_pdf():
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    """健康检查"""
-    return jsonify({
-        'status': 'ok',
-        'timestamp': datetime.now().isoformat()
-    })
+    """健康检查（增強版）"""
+    try:
+        from health_check import health_check_endpoint
+        return health_check_endpoint()
+    except ImportError:
+        # 如果健康檢查模組未導入，返回簡單響應
+        return jsonify({
+            'status': 'ok',
+            'timestamp': datetime.now().isoformat()
+        })
 
 
 @app.route('/api/system/update-all-tables', methods=['POST'])
@@ -2467,9 +3544,10 @@ def update_all_tables():
     仅管理员可以执行
     """
     try:
-        
         # 批处理文件路径
         batch_file = r'C:\TR-master\TR database\auto_update_all_tables.bat'
+        # 可由环境变量覆盖的计划任务名称（任务需预先配置为“使用最高权限运行”）
+        scheduled_task_name = os.getenv('UPDATE_ALL_TABLES_TASK_NAME', 'TR-Auto-Update-All-Tables')
         
         # 检查文件是否存在
         if not os.path.exists(batch_file):
@@ -2478,7 +3556,33 @@ def update_all_tables():
                 'error': f'批处理文件不存在: {batch_file}'
             }), 404
         
-        # 在后台线程中执行批处理文件，避免阻塞
+        # 优先使用计划任务触发（可实现管理员权限运行）
+        # 注意：Web 后端进程无法直接无交互弹出 UAC 并提权，推荐通过“最高权限”计划任务执行。
+        try:
+            task_cmd = ['schtasks', '/Run', '/TN', scheduled_task_name]
+            task_proc = subprocess.run(
+                task_cmd,
+                capture_output=True,
+                text=True,
+                shell=False,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+            )
+            if task_proc.returncode == 0:
+                return jsonify({
+                    'success': True,
+                    'message': f'数据更新已通过计划任务启动: {scheduled_task_name}',
+                    'status': 'running',
+                    'runner': 'scheduled_task'
+                })
+            else:
+                logger.warning(
+                    f"Scheduled task start failed ({scheduled_task_name}): "
+                    f"code={task_proc.returncode}, stderr={task_proc.stderr.strip()}"
+                )
+        except Exception as task_error:
+            logger.warning(f"Scheduled task start exception ({scheduled_task_name}): {task_error}")
+
+        # 计划任务不可用时，回退到旧逻辑：在后台线程中执行批处理文件（可能受权限限制）
         def run_batch():
             try:
                 # 切换到批处理文件所在目录
@@ -2873,46 +3977,55 @@ def cleanup_file_index():
 @require_auth()
 def download_stockist_test_by_order(order_no):
     """
-    按 Order 下载 Stockist&Test Report PDF 文件
+    按 Order 下载 Stockist&Test Report PDF 文件（异步任务）
     
     逻辑：
-    1. 从 TR_Report 表获取 order_no 对应的 stockist_cert 和 rm_dn_no
-    2. 从 Stockist 文件夹下载所有相关 PDF
-    3. 判断 order 是 IAT 还是 Private（通过 jobsite_type）
-    4. 根据类型查找对应的 Formal/Prelim 文件夹并下载
+    1. 创建异步下载任务
+    2. 立即返回任务 ID
+    3. 后台线程处理文件查找和打包
     """
     try:
-        from stockist_test_download import StockistTestDownloader
+        if DownloadTaskManager is None:
+            return jsonify({
+                'success': False,
+                'error': 'Download task manager not available'
+            }), 500
         
-        # 获取基础文件夹路径（可以从环境变量读取，默认使用用户指定的路径）
-        base_folder = os.getenv('STOCKIST_TEST_FOLDER', r'D:\Stockist&Test Report')
+        # 获取当前用户
+        current_user = g.current_user
+        user_id = current_user['id']
         
-        # 创建下载器
-        downloader = StockistTestDownloader(DB_PATH, base_folder)
+        # 创建任务管理器（单例，固定 worker 队列）
+        task_manager = get_download_task_manager()
         
-        # 执行下载
-        zip_path, file_count = downloader.download_by_order(order_no)
-        
-        # 返回 ZIP 文件
-        zip_filename = f'Order_{order_no}_Stockist_Test_{datetime.now().strftime("%Y%m%d_%H%M%S")}.zip'
-        
-        return send_file(
-            zip_path,
-            as_attachment=True,
-            download_name=zip_filename,
-            mimetype='application/zip'
+        # 创建任务
+        task_id = task_manager.create_task(
+            user_id, 
+            'order', 
+            {'order_nos': [order_no]}
         )
         
-    except ValueError as e:
+        # 仅入队，快速返回 task_id
+        task_manager.enqueue_task(task_id, 'order', {'order_nos': [order_no]})
+        
+        return jsonify({
+            'success': True,
+            'task_id': task_id,
+            'message': '下载任务已创建，正在后台处理'
+        })
+        
+    except RuntimeError as e:
         return jsonify({
             'success': False,
             'error': str(e)
-        }), 404
+        }), 503
     except Exception as e:
         import traceback
-        print(f"[ERROR] 下载 Stockist & Test Report 失败: {e}")
-        traceback.print_exc()
-        return jsonify({'success': False, 'error': f'Server error: {str(e)}'}), 500
+        logger.error(f"创建下载任务失败: {e}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 
 
 @app.route('/api/stockist-test/download-by-dd-no/<dd_no>', methods=['GET'])
@@ -3007,39 +4120,43 @@ def download_stockist_test_by_order_nos_grouped_by_dd_no():
                 'error': 'order_nos 中的元素必须是整数'
             }), 400
         
-        # 获取基础文件夹路径
-        base_folder = os.getenv('STOCKIST_TEST_FOLDER', r'D:\Stockist&Test Report')
+        # 限制订单数量
+        if len(order_nos) > 500:
+            return jsonify({
+                'success': False,
+                'error': '订单数量过多，最多支持500个订单'
+            }), 400
         
-        # 创建下载器
-        downloader = StockistTestDownloader(DB_PATH, base_folder)
+        # 获取当前用户
+        current_user = g.current_user
+        user_id = current_user['id']
         
-        # 执行批量下载（按 DD_No 分组）
-        zip_path, file_count = downloader.download_by_order_nos_grouped_by_dd_no(order_nos)
+        # 创建任务管理器（单例，固定 worker 队列）
+        task_manager = get_download_task_manager()
         
-        # 构建 ZIP 文件名：前三个 Order No + ... + DD_No + Stockist + Test
-        if len(order_nos) <= 3:
-            order_nos_str = '_'.join(str(no) for no in order_nos)
-        else:
-            order_nos_str = '_'.join(str(no) for no in order_nos[:3]) + '_...'
-        
-        zip_filename = f'{order_nos_str}_DD_No_Stockist_Test_{datetime.now().strftime("%Y%m%d_%H%M%S")}.zip'
-        
-        # 返回 ZIP 文件
-        return send_file(
-            zip_path,
-            as_attachment=True,
-            download_name=zip_filename,
-            mimetype='application/zip'
+        # 创建任务
+        task_id = task_manager.create_task(
+            user_id, 
+            'dd_no', 
+            {'order_nos': order_nos}
         )
-    except ValueError as e:
+        
+        # 仅入队，快速返回 task_id
+        task_manager.enqueue_task(task_id, 'dd_no', {'order_nos': order_nos})
+        
+        return jsonify({
+            'success': True,
+            'task_id': task_id,
+            'message': '下载任务已创建，正在后台处理'
+        })
+    except RuntimeError as e:
         return jsonify({
             'success': False,
             'error': str(e)
-        }), 404
+        }), 503
     except Exception as e:
         import traceback
-        error_trace = traceback.format_exc()
-        print(f"[错误] 批量按 DD_No 下载失败: {error_trace}")
+        logger.error(f"创建下载任务失败: {e}", exc_info=True)
         return jsonify({
             'success': False,
             'error': str(e)
@@ -3245,92 +4362,45 @@ def download_stockist_test_by_order_nos_grouped_by_date():
                 'error': 'order_nos 中的元素必须是整数'
             }), 400
         
-        # 获取基础文件夹路径
-        base_folder = os.getenv('STOCKIST_TEST_FOLDER', r'D:\Stockist&Test Report')
+        # 限制订单数量
+        if len(order_nos) > 500:
+            return jsonify({
+                'success': False,
+                'error': '订单数量过多，最多支持500个订单'
+            }), 400
         
-        # 创建下载器
-        downloader = StockistTestDownloader(DB_PATH, base_folder)
+        # 获取当前用户
+        current_user = g.current_user
+        user_id = current_user['id']
         
-        # 先获取日期数量（用于前端进度显示）
-        # 使用与 download_by_order_nos_grouped_by_date 完全相同的逻辑
-        # 直接使用 downloader.get_order_info 方法，确保逻辑一致
-        unique_dates = set()
-        print(f"[API] 开始查询 {len(order_nos)} 个订单的日期...")
+        # 创建任务管理器（单例，固定 worker 队列）
+        task_manager = get_download_task_manager()
         
-        for order_no in order_nos:
-            try:
-                order_info = downloader.get_order_info(order_no)
-                if not order_info:
-                    print(f"[API] Order {order_no} 在 TR_Report 表中未找到")
-                    continue
-                
-                del_date = order_info.get('del_date')
-                if not del_date:
-                    print(f"[API] Order {order_no} 没有 del_date")
-                    continue
-                
-                # 格式化日期（确保格式一致，与 download_by_order_nos_grouped_by_date 保持一致）
-                date_str = str(del_date).strip()
-                # 如果日期包含时间部分，只取日期部分
-                if ' ' in date_str:
-                    date_str = date_str.split(' ')[0]
-                # 标准化日期格式为 YYYY-MM-DD
-                try:
-                    from datetime import datetime
-                    # 尝试解析日期
-                    date_obj = datetime.strptime(date_str, '%Y-%m-%d')
-                    date_str = date_obj.strftime('%Y-%m-%d')
-                except:
-                    # 如果解析失败，尝试其他格式
-                    try:
-                        date_obj = datetime.strptime(date_str, '%Y/%m/%d')
-                        date_str = date_obj.strftime('%Y-%m-%d')
-                    except:
-                        # 如果都失败，使用原始字符串
-                        pass
-                
-                unique_dates.add(date_str)
-                print(f"[API] Order {order_no} -> 日期: {date_str}")
-            except Exception as e:
-                print(f"[API] 处理 Order {order_no} 时出错: {e}")
-                continue
-        
-        date_count = len(unique_dates)
-        if date_count == 0:
-            date_count = 1  # 至少为1，避免前端显示 0/1
-            print(f"[API] 警告: 没有找到任何日期，使用默认值 1")
-        print(f"[API] 找到 {date_count} 个唯一的日期用于进度显示: {sorted(unique_dates) if unique_dates else '无'}")
-        
-        # 执行批量下载（按日期分组）
-        zip_path, file_count = downloader.download_by_order_nos_grouped_by_date(order_nos)
-        
-        # 构建 ZIP 文件名：前三个 Order No + ... + Date + Stockist + Test
-        if len(order_nos) <= 3:
-            order_nos_str = '_'.join(str(no) for no in order_nos)
-        else:
-            order_nos_str = '_'.join(str(no) for no in order_nos[:3]) + '_...'
-        
-        zip_filename = f'{order_nos_str}_Date_Stockist_Test_{datetime.now().strftime("%Y%m%d_%H%M%S")}.zip'
-        
-        # 返回 ZIP 文件，在响应头中添加日期数量
-        response = send_file(
-            zip_path,
-            as_attachment=True,
-            download_name=zip_filename,
-            mimetype='application/zip'
+        # 创建任务
+        task_id = task_manager.create_task(
+            user_id, 
+            'date', 
+            {'order_nos': order_nos}
         )
-        # 设置响应头
-        response.headers['X-Date-Count'] = str(date_count)
-        # 确保CORS允许读取此响应头
-        response.headers['Access-Control-Expose-Headers'] = 'X-Date-Count'
-        print(f"[API] 设置响应头 X-Date-Count = {date_count}")
-        print(f"[API] 响应头列表: {list(response.headers)}")
-        return response
+        
+        # 仅入队，快速返回 task_id
+        task_manager.enqueue_task(task_id, 'date', {'order_nos': order_nos})
+        
+        return jsonify({
+            'success': True,
+            'task_id': task_id,
+            'message': '下载任务已创建，正在后台处理'
+        })
     except ValueError as e:
         return jsonify({
             'success': False,
             'error': str(e)
         }), 404
+    except RuntimeError as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 503
     except Exception as e:
         import traceback
         error_trace = traceback.format_exc()
@@ -3363,7 +4433,11 @@ def create_download_task():
     }
     """
     try:
-        from download_task_manager import DownloadTaskManager
+        if DownloadTaskManager is None:
+            return jsonify({
+                'success': False,
+                'error': 'Download task manager not available'
+            }), 500
         
         data = request.get_json()
         if not data:
@@ -3414,17 +4488,8 @@ def create_download_task():
         # 创建任务
         task_id = task_manager.create_task(user_id, task_type, request_params)
         
-        # 在后台线程中处理任务
-        def process_task_async():
-            try:
-                task_manager.process_task(task_id, task_type, request_params)
-            except Exception as e:
-                print(f"[下载任务] 后台处理失败: {e}")
-                import traceback
-                traceback.print_exc()
-        
-        thread = threading.Thread(target=process_task_async, daemon=True)
-        thread.start()
+        # 仅入队，快速返回 task_id
+        task_manager.enqueue_task(task_id, task_type, request_params)
         
         return jsonify({
             'success': True,
@@ -3432,6 +4497,11 @@ def create_download_task():
             'message': '下载任务已创建，正在后台处理'
         })
         
+    except RuntimeError as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 503
     except Exception as e:
         import traceback
         print(f"[错误] 创建下载任务失败: {e}")
@@ -3459,17 +4529,22 @@ def get_download_task_status(task_id):
         "zip_path": "...",  // 仅当completed时
         "zip_size": 52428800,  // 仅当completed时
         "download_url": "...",  // 仅当completed时
+        "has_warning": false,  // 仅当completed时
+        "warning_message": "...",  // 仅当completed且有缺失告警时
         "error_message": "..."  // 仅当failed时
     }
     """
     try:
-        from download_task_manager import DownloadTaskManager
+        if DownloadTaskManager is None:
+            return jsonify({
+                'success': False,
+                'error': 'Download task manager not available'
+            }), 500
         
         current_user = g.current_user
         user_id = current_user['id']
         
-        base_folder = os.getenv('STOCKIST_TEST_FOLDER', r'D:\Stockist&Test Report')
-        task_manager = DownloadTaskManager(DB_PATH, base_folder)
+        task_manager = get_download_task_manager()
         
         task_status = task_manager.get_task_status(task_id, user_id)
         
@@ -3493,6 +4568,10 @@ def get_download_task_status(task_id):
             result['zip_path'] = task_status['zip_path']
             result['zip_size'] = task_status['zip_size']
             result['download_url'] = f'/api/download/download/{task_id}'
+            warning_message = task_status.get('warning_message')
+            result['has_warning'] = bool(warning_message)
+            if warning_message:
+                result['warning_message'] = warning_message
             result['message'] = '下载已完成'
         elif task_status['status'] == 'failed':
             result['error_message'] = task_status['error_message']
@@ -3525,13 +4604,16 @@ def download_task_file(task_id):
     仅当任务状态为completed时才能下载
     """
     try:
-        from download_task_manager import DownloadTaskManager
+        if DownloadTaskManager is None:
+            return jsonify({
+                'success': False,
+                'error': 'Download task manager not available'
+            }), 500
         
         current_user = g.current_user
         user_id = current_user['id']
         
-        base_folder = os.getenv('STOCKIST_TEST_FOLDER', r'D:\Stockist&Test Report')
-        task_manager = DownloadTaskManager(DB_PATH, base_folder)
+        task_manager = get_download_task_manager()
         
         task_status = task_manager.get_task_status(task_id, user_id)
         
@@ -3549,22 +4631,85 @@ def download_task_file(task_id):
         
         zip_path = task_status['zip_path']
         if not zip_path or not os.path.exists(zip_path):
+            logger.error(f"[下载] ZIP文件不存在: {zip_path}, 任务状态: {task_status}")
             return jsonify({
                 'success': False,
-                'error': 'ZIP文件不存在'
+                'error': f'ZIP文件不存在: {zip_path}'
             }), 404
         
         # 构建下载文件名
+        import json
         task_type = task_status['task_type']
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        zip_filename = f'Download_{task_type}_{timestamp}.zip'
+        request_params_str = task_status.get('request_params', '{}')
+        try:
+            request_params = json.loads(request_params_str) if isinstance(request_params_str, str) else request_params_str
+        except:
+            request_params = {}
         
-        return send_file(
-            zip_path,
-            as_attachment=True,
-            download_name=zip_filename,
-            mimetype='application/zip'
+        order_nos = request_params.get('order_nos', [])
+        
+        if task_type == 'order':
+            if len(order_nos) == 1:
+                zip_filename = f'Order_{order_nos[0]}_Stockist_Test_{datetime.now().strftime("%Y%m%d_%H%M%S")}.zip'
+            elif len(order_nos) <= 3:
+                order_nos_str = '_'.join(str(no) for no in order_nos)
+                zip_filename = f'{order_nos_str}_Stockist_Test_{datetime.now().strftime("%Y%m%d_%H%M%S")}.zip'
+            else:
+                order_nos_str = '_'.join(str(no) for no in order_nos[:3]) + '_...'
+                zip_filename = f'{order_nos_str}_Stockist_Test_{datetime.now().strftime("%Y%m%d_%H%M%S")}.zip'
+        elif task_type == 'dd_no':
+            if len(order_nos) <= 3:
+                order_nos_str = '_'.join(str(no) for no in order_nos)
+            else:
+                order_nos_str = '_'.join(str(no) for no in order_nos[:3]) + '_...'
+            zip_filename = f'{order_nos_str}_DD_No_Stockist_Test_{datetime.now().strftime("%Y%m%d_%H%M%S")}.zip'
+        elif task_type == 'date':
+            if len(order_nos) <= 3:
+                order_nos_str = '_'.join(str(no) for no in order_nos)
+            else:
+                order_nos_str = '_'.join(str(no) for no in order_nos[:3]) + '_...'
+            zip_filename = f'{order_nos_str}_Date_Stockist_Test_{datetime.now().strftime("%Y%m%d_%H%M%S")}.zip'
+        else:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            zip_filename = f'Download_{task_type}_{timestamp}.zip'
+        
+        zip_size = os.path.getsize(zip_path) if os.path.exists(zip_path) else 0
+        logger.info(f"[下载] 返回ZIP文件: {zip_path}, 文件名: {zip_filename}, 大小: {zip_size} bytes")
+        
+        # 使用流式传输，在传输完成后删除文件
+        def generate():
+            try:
+                with open(zip_path, 'rb') as f:
+                    while True:
+                        chunk = f.read(8192)  # 8KB chunks
+                        if not chunk:
+                            break
+                        yield chunk
+            finally:
+                # 文件传输完成后，延迟删除（确保文件句柄已关闭）
+                import threading
+                def delete_file_delayed():
+                    import time
+                    time.sleep(1)  # 等待1秒确保文件句柄已关闭
+                    try:
+                        if os.path.exists(zip_path):
+                            os.remove(zip_path)
+                            logger.info(f"[下载] 已删除临时文件: {zip_path}")
+                    except Exception as e:
+                        logger.error(f"[下载] 删除临时文件失败: {zip_path}, 错误: {e}")
+                
+                thread = threading.Thread(target=delete_file_delayed, daemon=True)
+                thread.start()
+        
+        response = Response(
+            generate(),
+            mimetype='application/zip',
+            headers={
+                'Content-Disposition': f'attachment; filename="{zip_filename}"',
+                'Content-Length': str(zip_size)
+            }
         )
+        return response
         
     except Exception as e:
         import traceback
@@ -3620,41 +4765,119 @@ def download_stockist_test_by_order_nos():
                 'error': 'order_nos 中的元素必须是整数'
             }), 400
         
-        # 获取基础文件夹路径
-        base_folder = os.getenv('STOCKIST_TEST_FOLDER', r'D:\Stockist&Test Report')
+        # 限制订单数量
+        if len(order_nos) > 500:
+            return jsonify({
+                'success': False,
+                'error': '订单数量过多，最多支持500个订单'
+            }), 400
         
-        # 创建下载器
-        downloader = StockistTestDownloader(DB_PATH, base_folder)
+        # 获取当前用户
+        current_user = g.current_user
+        user_id = current_user['id']
         
-        # 执行批量下载
-        zip_path, file_count = downloader.download_by_order_nos(order_nos)
+        # 创建任务管理器（单例，固定 worker 队列）
+        task_manager = get_download_task_manager()
         
-        # 构建 ZIP 文件名：前三个 Order No + ... + Stockist + Test
-        if len(order_nos) <= 3:
-            # 如果 Order No 数量 <= 3，全部显示
-            order_nos_str = '_'.join(str(no) for no in order_nos)
-        else:
-            # 如果 Order No 数量 > 3，只显示前三个 + ...
-            order_nos_str = '_'.join(str(no) for no in order_nos[:3]) + '_...'
-        
-        zip_filename = f'{order_nos_str}_Stockist_Test_{datetime.now().strftime("%Y%m%d_%H%M%S")}.zip'
-        
-        # 返回 ZIP 文件
-        return send_file(
-            zip_path,
-            as_attachment=True,
-            download_name=zip_filename,
-            mimetype='application/zip'
+        # 创建任务
+        task_id = task_manager.create_task(
+            user_id, 
+            'order', 
+            {'order_nos': order_nos}
         )
-    except ValueError as e:
+        
+        # 仅入队，快速返回 task_id
+        task_manager.enqueue_task(task_id, 'order', {'order_nos': order_nos})
+        
+        return jsonify({
+            'success': True,
+            'task_id': task_id,
+            'message': '下载任务已创建，正在后台处理'
+        })
+    except RuntimeError as e:
         return jsonify({
             'success': False,
             'error': str(e)
-        }), 404
+        }), 503
     except Exception as e:
         import traceback
-        error_trace = traceback.format_exc()
-        print(f"[错误] 批量按 Order 下载失败: {error_trace}")
+        logger.error(f"创建下载任务失败: {e}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/stockist-test/download-all-stockist-nos', methods=['POST'])
+@require_auth()
+def download_stockist_test_all_stockist_nos():
+    """
+    批量按多个 Order No 下载并按 Stockist No 扁平组织（不按 Item 分类）
+
+    请求体：
+    {
+        "order_nos": [126193, 127009, 128001, ...]
+    }
+
+    ZIP 结构：
+    - Stockist_No_1/file1.pdf
+    - Stockist_No_2/file2.pdf
+    """
+    try:
+        data = request.get_json()
+        if not data or 'order_nos' not in data:
+            return jsonify({
+                'success': False,
+                'error': '请求体中缺少 order_nos 字段'
+            }), 400
+
+        order_nos = data.get('order_nos', [])
+        if not isinstance(order_nos, list) or len(order_nos) == 0:
+            return jsonify({
+                'success': False,
+                'error': 'order_nos 必须是非空列表'
+            }), 400
+
+        try:
+            order_nos = [int(no) for no in order_nos]
+        except (ValueError, TypeError):
+            return jsonify({
+                'success': False,
+                'error': 'order_nos 中的元素必须是整数'
+            }), 400
+
+        if len(order_nos) > 500:
+            return jsonify({
+                'success': False,
+                'error': '订单数量过多，最多支持500个订单'
+            }), 400
+
+        current_user = g.current_user
+        user_id = current_user['id']
+
+        task_manager = get_download_task_manager()
+
+        task_id = task_manager.create_task(
+            user_id,
+            'order_stockist_flat',
+            {'order_nos': order_nos}
+        )
+
+        # 仅入队，快速返回 task_id
+        task_manager.enqueue_task(task_id, 'order_stockist_flat', {'order_nos': order_nos})
+
+        return jsonify({
+            'success': True,
+            'task_id': task_id,
+            'message': '下载任务已创建，正在后台处理'
+        })
+    except RuntimeError as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 503
+    except Exception as e:
+        logger.error(f"创建扁平Stockist下载任务失败: {e}", exc_info=True)
         return jsonify({
             'success': False,
             'error': str(e)
@@ -3807,9 +5030,12 @@ def edit_orders_gen_pdf(order_no: int):
 if __name__ == '__main__':
     # 检查数据库是否存在
     if not os.path.exists(DB_PATH):
-        print(f"[ERROR] Database not found: {DB_PATH}")
-        print("Please ensure data_3years.db exists in the TR database directory.")
+        logger.error(f"Database not found: {DB_PATH}")
+        logger.error("Please ensure data_3years.db exists in the TR database directory.")
         exit(1)
+    
+    # 初始化數據庫連接池（在應用啟動時）
+    _ensure_pool_initialized()
     
     # 可选：启动文件索引定时任务
     # 从环境变量读取是否启用定时任务
@@ -3824,39 +5050,51 @@ if __name__ == '__main__':
         except Exception as e:
             print(f"[警告] 启动文件索引定时任务失败: {e}")
     
-    print("=" * 50)
-    print("TR Fill In API Server")
-    print(f"Database: {DB_PATH}")
-    print("=" * 50)
-    print("\nAvailable endpoints:")
-    print("  POST /api/auth/login - User login")
-    print("  POST /api/auth/logout - User logout")
-    print("  GET  /api/auth/me - Get current user profile")
-    print("  GET  /api/admin/users - List managed accounts (admin)")
-    print("  POST /api/admin/users - Create ordinary account (admin)")
-    print("  PUT  /api/admin/users/<username> - Update account (admin)")
-    print("  DELETE /api/admin/users/<username> - Delete account (admin)")
-    print("  GET  /api/tr-fill-in/data - Get all data")
-    print("  POST /api/tr-fill-in/save - Save tag numbers (自动同步Orders_gen_pdf)")
-    print("  POST /api/tr-fill-in/delete - Delete tag numbers (自动同步Orders_gen_pdf)")
-    print("  POST /api/tr-fill-in/clear - Clear all data (自动同步Orders_gen_pdf)")
-    print("  POST /api/tr-fill-in/update - Update record (自动同步Orders_gen_pdf)")
-    print("  POST /api/orders-gen-pdf/regenerate - 手动触发Orders_gen_pdf表重新生成")
-    print("  GET  /api/materials/search/<tag_no> - Search materials by Tag No")
-    print("  GET  /api/orders/list - Get orders list (paginated)")
-    print("  POST /api/pdf/generate - Generate PDF for order")
-    print("  GET  /api/pdf/download/<order_no> - Download single PDF")
-    print("  POST /api/pdf/batch-download - Batch download PDFs as ZIP")
-    print("  GET  /api/orders-gen-pdf/<order_no> - Get editable data")
-    print("  POST /api/orders-gen-pdf/<order_no>/edit - Edit order and lines")
-    print("  POST /api/download/create-task - Create async download task")
-    print("  GET  /api/download/task-status/<task_id> - Get download task status")
-    print("  GET  /api/download/download/<task_id> - Download completed file")
-    print("  GET  /health - Health check")
-    print("=" * 50)
-    print(f"\nStarting server on http://{API_HOST}:{API_PORT}")
-    print(f"Debug mode: {DEBUG_MODE}")
-    print(f"Database: {DB_PATH}")
+    logger.info("=" * 50)
+    logger.info("TR Fill In API Server")
+    logger.info(f"Database: {DB_PATH}")
+    logger.info("=" * 50)
+    logger.info("\nAvailable endpoints:")
+    logger.info("  POST /api/auth/login - User login")
+    logger.info("  POST /api/auth/logout - User logout")
+    logger.info("  GET  /api/auth/me - Get current user profile")
+    logger.info("  GET  /api/admin/users - List managed accounts (admin)")
+    logger.info("  POST /api/admin/users - Create ordinary account (admin)")
+    logger.info("  PUT  /api/admin/users/<username> - Update account (admin)")
+    logger.info("  DELETE /api/admin/users/<username> - Delete account (admin)")
+    logger.info("  GET  /api/tr-fill-in/data - Get all data")
+    logger.info("  POST /api/tr-fill-in/save - Save tag numbers (自动同步Orders_gen_pdf)")
+    logger.info("  POST /api/tr-fill-in/delete - Delete tag numbers (自动同步Orders_gen_pdf)")
+    logger.info("  POST /api/tr-fill-in/clear - Clear all data (自动同步Orders_gen_pdf)")
+    logger.info("  POST /api/tr-fill-in/update - Update record (自动同步Orders_gen_pdf)")
+    logger.info("  POST /api/orders-gen-pdf/regenerate - 手动触发Orders_gen_pdf表重新生成")
+    logger.info("  GET  /api/materials/search/<tag_no> - Search materials by Tag No")
+    logger.info("  GET  /api/orders/list - Get orders list (paginated)")
+    logger.info("  POST /api/pdf/generate - Create PDF generation task (async)")
+    logger.info("  GET  /api/pdf/task-status/<task_id> - Get PDF generation task status")
+    logger.info("  GET  /api/pdf/download/<order_no> - Download single PDF")
+    logger.info("  POST /api/pdf/batch-download - Batch download PDFs as ZIP")
+    logger.info("  GET  /api/orders-gen-pdf/<order_no> - Get editable data")
+    logger.info("  POST /api/orders-gen-pdf/<order_no>/edit - Edit order and lines")
+    logger.info("  POST /api/download/create-task - Create async download task")
+    logger.info("  GET  /api/download/task-status/<task_id> - Get download task status")
+    logger.info("  GET  /api/download/download/<task_id> - Download completed file")
+    logger.info("  GET  /health - Health check")
+    logger.info("  GET  /ready - Readiness check")
+    logger.info("  GET  /live - Liveness check")
+    logger.info("=" * 50)
+    logger.info(f"\nStarting server on http://{API_HOST}:{API_PORT}")
+    logger.info(f"Debug mode: {DEBUG_MODE}")
+    logger.info(f"Database: {DB_PATH}")
     
-    app.run(debug=DEBUG_MODE, host=API_HOST, port=API_PORT)
+    # 添加額外的健康檢查端點（/health 已在上面定義）
+    try:
+        from health_check import readiness_check_endpoint, liveness_check_endpoint
+        app.add_url_rule('/ready', 'readiness_check', readiness_check_endpoint, methods=['GET'])
+        app.add_url_rule('/live', 'liveness_check', liveness_check_endpoint, methods=['GET'])
+        logger.info("健康檢查端點已啟用（/health, /ready, /live）")
+    except ImportError:
+        logger.warning("健康檢查模組未找到，使用默認健康檢查端點")
+    
+    app.run(debug=DEBUG_MODE, host=API_HOST, port=API_PORT, threaded=True)
 

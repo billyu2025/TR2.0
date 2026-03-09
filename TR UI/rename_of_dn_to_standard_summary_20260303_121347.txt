@@ -1,0 +1,8 @@
+﻿scanned=262
+renamed=171
+skip_no_map=91
+skip_no_date=0
+skip_conflict=0
+skip_same=0
+errors=0
+report=C:\TR-master\TR UI\rename_of_dn_to_standard_report_20260303_121347.csv

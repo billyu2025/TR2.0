@@ -1,0 +1,6 @@
+pdf=D:\Stockist&Test Report\Stockist Cert\Stockist + MIll Cert_C0354.pdf
+pages=8
+run_time=2026-03-03T11:55:25.235238
+date_of_delivery_candidates:
+  - page 1: on/abt.January 18,2024
+  - page 1: on/abt.January 18,2024

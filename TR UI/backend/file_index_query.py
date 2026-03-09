@@ -246,14 +246,48 @@ class FileIndexQuery:
         对于 IAT Formal，返回的是匹配的子文件夹路径，需要进一步获取文件夹内的所有PDF
         
         Args:
-            folder_path: 父文件夹路径
-            keywords: 关键词列表（用于匹配子文件夹名）
+            folder_path: 父文件夹路径或子文件夹路径
+            keywords: 关键词列表（用于匹配子文件夹名）。如果为空，返回该文件夹中的所有PDF文件
             
         Returns:
             匹配的文件路径列表（对于IAT Formal，返回文件夹内所有PDF；其他返回文件路径）
         """
+        # 如果 keywords 为空，返回该文件夹中的所有 PDF 文件
         if not keywords:
-            return []
+            # 对于 IAT Formal，索引表中存储的是文件夹路径，需要遍历文件夹获取所有 PDF
+            if not self.is_index_available():
+                return []
+            
+            try:
+                # 标准化文件夹路径
+                folder_path_normalized = os.path.normpath(folder_path)
+                
+                # 检查文件夹是否存在
+                if not os.path.exists(folder_path_normalized):
+                    print(f"[索引查询] 文件夹不存在: {folder_path_normalized}")
+                    return []
+                
+                # 如果路径是文件夹，遍历获取所有 PDF 文件
+                if os.path.isdir(folder_path_normalized):
+                    found_files = []
+                    for root, dirs, files in os.walk(folder_path_normalized):
+                        for file in files:
+                            if file.lower().endswith('.pdf'):
+                                pdf_path = os.path.join(root, file)
+                                if os.path.exists(pdf_path):
+                                    found_files.append(pdf_path)
+                    print(f"[索引查询] 文件夹 {os.path.basename(folder_path_normalized)}: 遍历找到 {len(found_files)} 个 PDF 文件")
+                    return found_files
+                else:
+                    # 如果是文件，直接返回
+                    if folder_path_normalized.lower().endswith('.pdf'):
+                        return [folder_path_normalized]
+                    return []
+            except Exception as e:
+                print(f"[索引查询] 查询文件夹 {folder_path} 中的所有文件失败: {e}")
+                import traceback
+                traceback.print_exc()
+                return []
         
         if not self.is_index_available():
             return []
@@ -325,3 +359,274 @@ class FileIndexQuery:
             import traceback
             traceback.print_exc()
             return []
+    
+    def check_file_exists_in_iat_prelim(self, source_filename: str, 
+                                        base_folder: str = r"D:\Stockist&Test Report") -> Optional[str]:
+        """
+        检查 IAT Prelim 文件夹中是否已存在对应文件
+        
+        例如："Physical, chemical & geometry test report of C0146" 和 "C0146_IAT_Prelim" 是同一个文件
+        
+        Args:
+            source_filename: 源文件名（例如："Physical, chemical & geometry test report of C0146.pdf"）
+            base_folder: Stockist&Test Report 基础文件夹路径
+            
+        Returns:
+            如果找到对应文件，返回文件路径；否则返回 None
+        """
+        if not self.is_index_available():
+            return None
+        
+        try:
+            import re
+            
+            # 从源文件名中提取可能的标识符
+            # 匹配模式1：多个字母+数字的组合（如 SS79825, NT0094, ZZ3274）
+            # 匹配模式2：单个字母+至少3位数字的组合（如 C0146, C0274, A1234）
+            # 优先匹配较长的标识符（多个字母+数字）
+            identifier_pattern = r'([A-Z]{2,}\d+|[A-Z]\d{3,})'
+            matches = re.findall(identifier_pattern, source_filename.upper())
+            
+            if not matches:
+                # 如果没找到，尝试更宽泛的匹配（单个字母+至少2位数字）
+                identifier_pattern_fallback = r'([A-Z]\d{2,})'
+                matches = re.findall(identifier_pattern_fallback, source_filename.upper())
+            
+            if not matches:
+                print(f"[检查] 无法从文件名中提取标识符: {source_filename}")
+                return None
+            
+            # 使用找到的标识符进行匹配（去重）
+            # 优先使用较长的标识符（更准确）
+            identifiers = sorted(list(set(matches)), key=len, reverse=True)
+            print(f"[检查] 从文件名 '{source_filename}' 中提取的标识符: {identifiers}")
+            
+            if not identifiers:
+                print(f"[检查] 警告：未能提取到标识符")
+                return None
+            
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            
+            # 构建查询：检查 identifiers 字段中是否包含该标识符
+            # 只要索引的 identifiers 字段中包含该标识符，就认为文件已存在
+            # 例如：如果索引中有文件的 identifiers 包含 "SS70913"，就无需复制 "Physical, chemical & geometry test report of SS70913.pdf"
+            conditions = [
+                "folder_type = 'IAT Prelim'",
+                "is_deleted = 0"
+            ]
+            params = []
+            
+            # 为每个标识符构建匹配条件
+            # 在 identifiers 字段中查找该标识符（逗号分隔的字符串）
+            identifier_conditions = []
+            for identifier in identifiers:
+                # 在 identifiers 字段中查找该标识符
+                # 使用 LIKE 匹配，确保匹配完整的标识符（避免部分匹配）
+                # 例如：查找 "SS70913" 时，匹配 ",SS70913," 或 "SS70913," 或 ",SS70913" 或 "SS70913"
+                identifier_conditions.append("(identifiers LIKE ? OR identifiers LIKE ? OR identifiers LIKE ? OR identifiers = ?)")
+                params.extend([
+                    f'%,{identifier},%',  # 中间
+                    f'{identifier},%',   # 开头
+                    f'%,{identifier}',   # 结尾
+                    identifier           # 完全匹配
+                ])
+            
+            if identifier_conditions:
+                conditions.append(f"({' OR '.join(identifier_conditions)})")
+            
+            query = f"""
+                SELECT DISTINCT file_path, file_name, identifiers
+                FROM file_index_cache
+                WHERE {' AND '.join(conditions)}
+                LIMIT 1
+            """
+            
+            print(f"[检查] 执行查询，标识符: {identifiers}, 在 identifiers 字段中查找")
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+            
+            print(f"[检查] 查询结果: 找到 {len(rows)} 条记录")
+            if len(rows) > 0:
+                print(f"[检查] 索引的 identifiers 中包含标识符，文件已存在: {rows[0]['file_name']} (identifiers: {rows[0].get('identifiers', '')})")
+                # 返回第一个匹配的文件路径（用于日志显示）
+                file_path = rows[0]['file_path']
+                if os.path.exists(file_path):
+                    conn.close()
+                    return file_path
+                else:
+                    # 即使文件不存在，只要索引中有记录，也认为文件已存在
+                    print(f"[检查] 文件路径不存在，但索引中有记录，认为文件已存在")
+                    conn.close()
+                    return file_path  # 仍然返回路径，让调用者知道找到了
+            
+            conn.close()
+            return None
+            
+        except Exception as e:
+            print(f"[错误] 检查 IAT Prelim 文件失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def check_file_exists_in_private_formal(self, source_filename: str, 
+                                             base_folder: str = r"D:\Stockist&Test Report") -> Optional[str]:
+        """
+        检查 Private Formal 文件夹中是否已存在对应文件
+        
+        例如："C0146.pdf" 和 "C0146_Private_Formal.pdf" 是同一个文件
+        
+        Args:
+            source_filename: 源文件名（例如："C0146.pdf" 或 "SS78156.pdf"）
+            base_folder: Stockist&Test Report 基础文件夹路径
+            
+        Returns:
+            如果找到对应文件，返回文件路径；否则返回 None
+        """
+        if not self.is_index_available():
+            return None
+        
+        try:
+            import re
+            
+            # 从源文件名中提取标识符（使用与 IAT Prelim 相同的逻辑）
+            identifier_pattern = r'([A-Z]{2,}\d+|[A-Z]\d{3,})'
+            matches = re.findall(identifier_pattern, source_filename.upper())
+            
+            if not matches:
+                identifier_pattern_fallback = r'([A-Z]\d{2,})'
+                matches = re.findall(identifier_pattern_fallback, source_filename.upper())
+            
+            if not matches:
+                return None
+            
+            identifiers = sorted(list(set(matches)), key=len, reverse=True)
+            
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            
+            # 构建查询：检查 identifiers 字段中是否包含该标识符
+            conditions = [
+                "folder_type = 'Private Formal'",
+                "is_deleted = 0"
+            ]
+            params = []
+            
+            identifier_conditions = []
+            for identifier in identifiers:
+                identifier_conditions.append("(identifiers LIKE ? OR identifiers LIKE ? OR identifiers LIKE ? OR identifiers = ?)")
+                params.extend([
+                    f'%,{identifier},%',
+                    f'{identifier},%',
+                    f'%,{identifier}',
+                    identifier
+                ])
+            
+            if identifier_conditions:
+                conditions.append(f"({' OR '.join(identifier_conditions)})")
+            
+            query = f"""
+                SELECT DISTINCT file_path, file_name, identifiers
+                FROM file_index_cache
+                WHERE {' AND '.join(conditions)}
+                LIMIT 1
+            """
+            
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+            
+            if len(rows) > 0:
+                print(f"[检查] 索引的 identifiers 中包含标识符，文件已存在: {rows[0]['file_name']} (identifiers: {rows[0].get('identifiers', '')})")
+                file_path = rows[0]['file_path']
+                conn.close()
+                return file_path
+            
+            conn.close()
+            return None
+            
+        except Exception as e:
+            print(f"[错误] 检查 Private Formal 文件失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def check_file_exists_in_private_prelim(self, source_filename: str, 
+                                             base_folder: str = r"D:\Stockist&Test Report") -> Optional[str]:
+        """
+        检查 Private Prelim 文件夹中是否已存在对应文件
+        
+        例如："Physical, chemical & geometry test report of SS77294" 和 "SS77294_Private_Prelim" 是同一个文件
+        
+        Args:
+            source_filename: 源文件名（例如："Physical, chemical & geometry test report of SS77294.pdf"）
+            base_folder: Stockist&Test Report 基础文件夹路径
+            
+        Returns:
+            如果找到对应文件，返回文件路径；否则返回 None
+        """
+        if not self.is_index_available():
+            return None
+        
+        try:
+            import re
+            
+            # 从源文件名中提取标识符（使用与 IAT Prelim 相同的逻辑）
+            identifier_pattern = r'([A-Z]{2,}\d+|[A-Z]\d{3,})'
+            matches = re.findall(identifier_pattern, source_filename.upper())
+            
+            if not matches:
+                identifier_pattern_fallback = r'([A-Z]\d{2,})'
+                matches = re.findall(identifier_pattern_fallback, source_filename.upper())
+            
+            if not matches:
+                return None
+            
+            identifiers = sorted(list(set(matches)), key=len, reverse=True)
+            
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            
+            # 构建查询：检查 identifiers 字段中是否包含该标识符
+            conditions = [
+                "folder_type = 'Private Prelim'",
+                "is_deleted = 0"
+            ]
+            params = []
+            
+            identifier_conditions = []
+            for identifier in identifiers:
+                identifier_conditions.append("(identifiers LIKE ? OR identifiers LIKE ? OR identifiers LIKE ? OR identifiers = ?)")
+                params.extend([
+                    f'%,{identifier},%',
+                    f'{identifier},%',
+                    f'%,{identifier}',
+                    identifier
+                ])
+            
+            if identifier_conditions:
+                conditions.append(f"({' OR '.join(identifier_conditions)})")
+            
+            query = f"""
+                SELECT DISTINCT file_path, file_name, identifiers
+                FROM file_index_cache
+                WHERE {' AND '.join(conditions)}
+                LIMIT 1
+            """
+            
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+            
+            if len(rows) > 0:
+                print(f"[检查] 索引的 identifiers 中包含标识符，文件已存在: {rows[0]['file_name']} (identifiers: {rows[0].get('identifiers', '')})")
+                file_path = rows[0]['file_path']
+                conn.close()
+                return file_path
+            
+            conn.close()
+            return None
+            
+        except Exception as e:
+            print(f"[错误] 检查 Private Prelim 文件失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return None

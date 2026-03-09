@@ -118,6 +118,40 @@ class FileIndexBuilder:
         # 返回JSON格式的字符串
         return json.dumps(keywords_list, ensure_ascii=False)
     
+    def extract_identifiers(self, file_name: str) -> str:
+        """
+        从文件名中提取标识符（如 SS70913、C0146、NW00018 等）
+        
+        Args:
+            file_name: 文件名（不含路径）
+            
+        Returns:
+            逗号分隔的标识符字符串（如 "SS70913,C0146"），如果没有找到则返回空字符串
+        """
+        import re
+        
+        identifiers = set()
+        
+        # 移除文件扩展名
+        name_without_ext = os.path.splitext(file_name)[0].upper()
+        
+        # 匹配模式1：多个字母+数字的组合（如 SS79825, NT0094, ZZ3274, NW00018）
+        # 匹配模式2：单个字母+至少3位数字的组合（如 C0146, C0274, A1234）
+        identifier_pattern = r'([A-Z]{2,}\d+|[A-Z]\d{3,})'
+        matches = re.findall(identifier_pattern, name_without_ext)
+        
+        if not matches:
+            # 如果没找到，尝试更宽泛的匹配（单个字母+至少2位数字）
+            identifier_pattern_fallback = r'([A-Z]\d{2,})'
+            matches = re.findall(identifier_pattern_fallback, name_without_ext)
+        
+        # 去重并排序
+        for match in matches:
+            identifiers.add(match)
+        
+        # 返回逗号分隔的字符串
+        return ','.join(sorted(identifiers))
+    
     def get_file_info(self, file_path: str, folder_type: str) -> Optional[Dict]:
         """
         获取文件信息
@@ -140,6 +174,9 @@ class FileIndexBuilder:
             # 提取关键词
             keywords_json = self.extract_keywords(file_name, file_path)
             
+            # 提取标识符（如 SS70913、C0146 等）
+            identifiers_str = self.extract_identifiers(file_name)
+            
             return {
                 'file_path': file_path,
                 'file_name': file_name,
@@ -148,6 +185,7 @@ class FileIndexBuilder:
                 'file_size': stat.st_size,
                 'modified_time': stat.st_mtime,  # Unix时间戳
                 'extracted_keywords': keywords_json,
+                'identifiers': identifiers_str,
                 'is_deleted': 0
             }
         except (OSError, PermissionError) as e:
@@ -246,9 +284,9 @@ class FileIndexBuilder:
                     cursor.executemany("""
                         INSERT OR REPLACE INTO file_index_cache (
                             file_path, file_name, folder_path, folder_type,
-                            file_size, modified_time, extracted_keywords,
+                            file_size, modified_time, extracted_keywords, identifiers,
                             is_deleted, last_checked
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                     """, [
                         (
                             info['file_path'],
@@ -258,6 +296,7 @@ class FileIndexBuilder:
                             info['file_size'],
                             info['modified_time'],
                             info['extracted_keywords'],
+                            info.get('identifiers', ''),  # 使用 get 以兼容旧数据
                             info['is_deleted']
                         )
                         for info in batch

@@ -151,9 +151,21 @@
 
 .page-header {
     display: flex;
-    justify-content: space-between;
+    justify-content: flex-start;
     align-items: center;
+    gap: 12px;
     margin-bottom: 28px;
+}
+
+.system-update-notice {
+    margin: 0;
+    padding: 8px 12px;
+    border-radius: 8px;
+    border: 1px solid #ffe3a3;
+    background: #fff8e1;
+    color: #7a5a00;
+    font-size: 13px;
+    font-weight: 600;
 }
 
 .page-header h1 {
@@ -169,6 +181,7 @@
 
 /* 更新数据按钮 - 优化样式 */
 .update-data-btn {
+    margin-left: auto;
     background: linear-gradient(135deg, var(--color-warning) 0%, #e67e22 100%);
     color: white;
     border: none;
@@ -503,6 +516,15 @@
     transform: none;
     box-shadow: none;
     filter: grayscale(0.3);
+}
+
+/* 扁平按Stockist No下载按钮（绿色强调） */
+.batch-download-all-stockist-btn {
+    background: linear-gradient(135deg, #0ba360 0%, #3cba92 100%);
+}
+
+.batch-download-all-stockist-btn:hover:not(:disabled) {
+    background: linear-gradient(135deg, #07995a 0%, #29ad83 100%);
 }
 
 /* 清除选择按钮 */

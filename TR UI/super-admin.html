@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>TR Report System - 超级管理员控制台</title>
+    <title>TR Report System - 超級管理員控制台</title>
     <link rel="stylesheet" href="styles/super-admin.css">
     <script src="scripts/vue.global.prod.js"></script>
 </head>
@@ -15,7 +15,7 @@
                 <img src="images/logo.png" alt="VSC Logo" class="topbar__logo">
                 <div class="topbar__title">
                     <h1>TR Report System</h1>
-                    <p>超级管理员控制台</p>
+                    <p>超級管理員控制台</p>
                 </div>
             </div>
             <div class="topbar__right">
@@ -23,7 +23,7 @@
                     <span class="user-chip__avatar">👑</span>
                     <div class="user-chip__info">
                         <span class="user-chip__name">{{ userInfo.name }}</span>
-                        <span class="user-chip__role">超级管理员</span>
+                        <span class="user-chip__role">超級管理員</span>
                     </div>
                 </div>
                 <button class="btn btn--ghost" @click="openPage('dashboard.html')">主控制台</button>
@@ -55,14 +55,14 @@
                         :class="{ 'menu__item--active': activeTab === 'users' }"
                         @click="activeTab = 'users'"
                     >
-                        <span>👥 账号管理</span>
+                        <span>👥 帳號管理</span>
                     </button>
                     <button 
                         class="menu__item" 
                         :class="{ 'menu__item--active': activeTab === 'tasks' }"
                         @click="activeTab = 'tasks'"
                     >
-                        <span>🛠️ 系统任务</span>
+                        <span>🛠️ 系統任務</span>
                     </button>
                     <button 
                         class="menu__item" 
@@ -74,23 +74,23 @@
                 </nav>
 
                 <section class="quick-panel">
-                    <h3>系统状态</h3>
+                    <h3>系統狀態</h3>
                     <ul>
                         <li>
-                            <span>数据库连接</span>
+                            <span>數據庫連接</span>
                             <strong :class="{'status-ok': systemStatus.database, 'status-warn': !systemStatus.database}">
                                 {{ systemStatus.database ? '正常' : '待检查' }}
                             </strong>
                         </li>
                         <li>
-                            <span>自动更新任务</span>
+                            <span>自動更新任務</span>
                             <strong :class="{'status-ok': systemStatus.scheduler === '正常', 'status-warn': systemStatus.scheduler !== '正常'}">
                                 {{ systemStatus.scheduler }}
                             </strong>
                         </li>
                         <li>
-                            <span>邮件通知</span>
-                            <strong :class="{'status-ok': systemStatus.mail === '已启用', 'status-warn': systemStatus.mail !== '已启用'}">
+                            <span>郵件通知</span>
+                            <strong :class="{'status-ok': systemStatus.mail === '已啟用', 'status-warn': systemStatus.mail !== '已啟用'}">
                                 {{ systemStatus.mail }}
                             </strong>
                         </li>
@@ -103,27 +103,27 @@
                 <section v-if="activeTab === 'overview'" class="panel">
                     <header class="panel__header">
                         <div>
-                            <h2>订单总览</h2>
-                            <p>可查看所有 Job 的订单和 PDF 状态，支持快速搜索</p>
+                            <h2>訂單總覽</h2>
+                            <p>可查看所有 Job 的訂單和 PDF 狀態，支援快速搜尋</p>
                         </div>
                         <div class="filter-bar">
                             <input 
                                 v-model.trim="filters.orderNo"
                                 type="text" 
-                                placeholder="搜索 Order No"
+                                placeholder="搜尋 Order No"
                                 @input="debouncedFilter"
                             >
                             <input 
                                 v-model.trim="filters.jobNo"
                                 type="text" 
-                                placeholder="搜索 Job No"
+                                placeholder="搜尋 Job No"
                                 @input="debouncedFilter"
                             >
                             <select v-model="filters.status" @change="applyFilters">
-                                <option value="">全部状态</option>
+                                <option value="">全部狀態</option>
                                 <option value="generated">已生成 PDF</option>
                                 <option value="pending">待生成</option>
-                                <option value="failed">生成失败</option>
+                                <option value="failed">生成失敗</option>
                             </select>
                             <button class="btn btn--ghost" @click="resetFilters">重置</button>
                         </div>
@@ -131,7 +131,7 @@
 
                     <div class="stats-grid">
                         <div class="stat-card">
-                            <div class="stat-card__label">总订单数</div>
+                            <div class="stat-card__label">總訂單數</div>
                             <div class="stat-card__value">{{ dashboard.totalOrders }}</div>
                         </div>
                         <div class="stat-card">
@@ -145,8 +145,8 @@
                         </div>
                         <div class="stat-card">
                             <div class="stat-card__label">最近更新</div>
-                            <div class="stat-card__value">{{ dashboard.latestGenerated || '暂无' }}</div>
-                            <div class="stat-card__extra">最近生成时间</div>
+                            <div class="stat-card__value">{{ dashboard.latestGenerated || '暫無' }}</div>
+                            <div class="stat-card__extra">最近生成時間</div>
                         </div>
                     </div>
 
@@ -166,10 +166,10 @@
                             </thead>
                             <tbody>
                                 <tr v-if="loading">
-                                    <td colspan="8" class="table-empty">正在加载数据...</td>
+                                    <td colspan="8" class="table-empty">正在載入數據...</td>
                                 </tr>
                                 <tr v-else-if="filteredOrders.length === 0">
-                                    <td colspan="8" class="table-empty">暂无符合条件的订单</td>
+                                    <td colspan="8" class="table-empty">暫無符合條件的訂單</td>
                                 </tr>
                                 <tr v-for="order in paginatedOrders" :key="order.orderNo">
                                     <td>{{ order.orderNo }}</td>
@@ -185,7 +185,7 @@
                                     </td>
                                     <td class="table-actions">
                                         <button class="link" @click="openOrder(order.orderNo)">查看</button>
-                                        <button class="link" @click="downloadPdf(order)" :disabled="order.status !== 'generated'">下载 PDF</button>
+                                        <button class="link" @click="downloadPdf(order)" :disabled="order.status !== 'generated'">下載 PDF</button>
                                     </td>
                                 </tr>
                             </tbody>
@@ -213,14 +213,14 @@
                                 <span class="tag" :class="`tag--${job.status}`">{{ renderStatus(job.status) }}</span>
                             </div>
                             <p>订单数量：{{ job.count }}</p>
-                            <p>总重量：{{ job.totalWt.toFixed(2) }}</p>
+                            <p>總重量：{{ job.totalWt.toFixed(2) }}</p>
                             <p>已生成：{{ job.generated }}/{{ job.count }}</p>
                             <div class="job-card__actions">
-                                <button class="btn btn--ghost" @click="filters.jobNo = job.jobNo; activeTab = 'overview'; applyFilters();">查看详情</button>
-                                <button class="btn btn--ghost" @click="assignJob(job.jobNo)">分配账号</button>
+                                <button class="btn btn--ghost" @click="filters.jobNo = job.jobNo; activeTab = 'overview'; applyFilters();">查看詳情</button>
+                                <button class="btn btn--ghost" @click="assignJob(job.jobNo)">分配帳號</button>
                             </div>
                         </div>
-                        <p v-if="jobSummary.length === 0" class="panel__empty">暂无数据，请先同步订单</p>
+                        <p v-if="jobSummary.length === 0" class="panel__empty">暫無數據，請先同步訂單</p>
                     </div>
                 </section>
 
@@ -228,18 +228,18 @@
                 <section v-else-if="activeTab === 'users'" class="panel">
                     <header class="panel__header">
                         <div>
-                            <h2>账号管理预览</h2>
-                            <p>此处展示计划中的账号管理界面，后端完成后可直接对接</p>
+                            <h2>帳號管理預覽</h2>
+                            <p>此處展示計劃中的帳號管理介面，後端完成後可直接對接</p>
                         </div>
                         <div>
-                            <button class="btn btn--primary" @click="openCreateUser">+ 新建用户</button>
+                            <button class="btn btn--primary" @click="openCreateUser">+ 新建用戶</button>
                         </div>
                     </header>
                     <div class="user-table-wrapper">
                         <table>
                             <thead>
                                 <tr>
-                                    <th>用户名</th>
+                                    <th>用戶名</th>
                                     <th>姓名</th>
                                     <th>角色</th>
                                     <th>负责 Job No</th>
@@ -255,26 +255,26 @@
                                     <td>{{ user.jobNos.length ? user.jobNos.join(', ') : '未分配' }}</td>
                                     <td>
                                         <span :class="['tag', user.active ? 'tag--generated' : 'tag--pending']">
-                                            {{ user.active ? '启用' : '停用' }}
+                                            {{ user.active ? '啟用' : '停用' }}
                                         </span>
                                     </td>
                                     <td class="table-actions">
-                                        <button class="link" @click="editUser(user)">编辑</button>
-                                        <button class="link" @click="toggleUser(user)">{{ user.active ? '停用' : '启用' }}</button>
-                                        <button class="link" @click="resetPassword(user)">重置密码</button>
+                                        <button class="link" @click="editUser(user)">編輯</button>
+                                        <button class="link" @click="toggleUser(user)">{{ user.active ? '停用' : '啟用' }}</button>
+                                        <button class="link" @click="resetPassword(user)">重置密碼</button>
                                     </td>
                                 </tr>
                             </tbody>
                         </table>
-                        <p class="panel__tip">提示：上述数据为演示用途，后端完成后即可替换为实时账号信息。</p>
+                        <p class="panel__tip">提示：上述數據為演示用途，後端完成後即可替換為即時帳號資訊。</p>
                     </div>
                 </section>
 
                 <!-- 系统任务 -->
                 <section v-else-if="activeTab === 'tasks'" class="panel">
                     <header class="panel__header">
-                        <h2>系统任务与自动化</h2>
-                        <p>查看计划任务、最近运行结果以及下一步安排</p>
+                        <h2>系統任務與自動化</h2>
+                        <p>查看計劃任務、最近運行結果以及下一步安排</p>
                     </header>
                     <ul class="timeline">
                         <li v-for="task in systemTasks" :key="task.id">
@@ -291,8 +291,8 @@
                 <!-- 活动日志 -->
                 <section v-else-if="activeTab === 'logs'" class="panel">
                     <header class="panel__header">
-                        <h2>最近活动（演示数据）</h2>
-                        <p>后续可接入真实操作日志</p>
+                        <h2>最近活動（演示數據）</h2>
+                        <p>後續可接入真實操作日誌</p>
                     </header>
                     <div class="log-list">
                         <article v-for="log in activityLogs" :key="log.id" class="log-item">
@@ -313,12 +313,12 @@
             <div class="modal__overlay" @click="closeModal"></div>
             <div class="modal__content">
                 <header class="modal__header">
-                    <h3>{{ modal.mode === 'create' ? '新建用户' : '编辑用户' }}</h3>
+                    <h3>{{ modal.mode === 'create' ? '新建用戶' : '編輯用戶' }}</h3>
                     <button class="modal__close" @click="closeModal">×</button>
                 </header>
                 <div class="modal__body">
                     <label>
-                        用户名
+                        用戶名
                         <input type="text" v-model.trim="modal.form.username" :disabled="modal.mode === 'edit'">
                     </label>
                     <label>
@@ -328,9 +328,9 @@
                     <label>
                         角色
                         <select v-model="modal.form.role">
-                            <option value="admin">超级管理员</option>
-                            <option value="manager">账号管理员</option>
-                            <option value="user">普通用户</option>
+                            <option value="admin">超級管理員</option>
+                            <option value="manager">帳號管理員</option>
+                            <option value="user">普通用戶</option>
                         </select>
                     </label>
                     <label>
@@ -338,10 +338,10 @@
                         <input type="text" v-model.trim="modal.form.jobNos">
                     </label>
                     <label v-if="modal.mode === 'create'">
-                        初始密码
-                        <input type="text" v-model.trim="modal.form.password" placeholder="暂未生成">
+                        初始密碼
+                        <input type="text" v-model.trim="modal.form.password" placeholder="暫未生成">
                     </label>
-                    <p class="modal__hint">提示：当前仅作为 UI 预览，后续可与后台账号表打通。</p>
+                    <p class="modal__hint">提示：當前僅作為 UI 預覽，後續可與後台帳號表打通。</p>
                 </div>
                 <footer class="modal__footer">
                     <button class="btn btn--ghost" @click="closeModal">取消</button>

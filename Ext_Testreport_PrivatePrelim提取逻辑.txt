@@ -1,0 +1,42 @@
+1) 扫描入口与目标
+源目录：SOURCE_DIRS（包含 Rebar DN 和 Rebar DN\00 - Passed record）
+目标目录：D:\Stockist&Test Report\Private Prelim
+只遍历源目录下直接子目录，并用 ^[A-Z0-9]+$ 识别 DN 文件夹（如 SS71181）
+2) 在每个 DN 文件夹里找候选目录（递归）
+通过 _discover_candidate_dirs() 递归发现可能存放文件的位置，支持大量变体：
+Test report / Test reoport / Test reprt
+Private test report / Private test / Private report / ... only
+PRAIVE TEST REPORT（PRIVATE 拼写错误）
+也支持不经过 Test report 层，例如 SS69680\Private test report
+3) 文件级过滤（先排除 Formal）
+每个候选目录下逐文件检查：
+如果命中 Formal 模式（如 SS79782.pdf）则跳过（不算 Private Prelim）
+非 Formal 的 PDF 会被记录为“该 DN 有资料”，避免误写入“未找到文件”TXT
+4) 文件名识别与输出名生成（核心）
+由 get_private_prelim_output_name(filename, dn_no) 决定是否提取：
+返回 None：不匹配，不提取
+返回原文件名：匹配且保持原名
+返回新文件名：匹配但需重命名（如 Chemical Test Report.pdf -> Chemical Test Report of SSxxxx.pdf）
+识别优先级：
+多 DN 精确匹配（如 ... of SS71088&SS71060，只要包含当前文件夹 DN 就算命中）
+常见精确前缀匹配（physical, chemical & geometry ... 等，含 of/to、空格变体）
+固定无 DN 命名补全（physical & geometry test report 等）
+Preliminary - xxx test report 单项重命名
+模糊匹配兜底 is_fuzzy_private_prelim_file()
+支持拼写错：chamical/chemcial、gemoetry/geometery
+支持 test report 或简写 test of/test to
+支持 of/to
+支持多 DN（& 连接）
+5) 复制与去重策略
+copy_file_to_target() 的处理顺序：
+先查索引（file_index_query）是否已有“等价文件” -> skipped_matched
+再查目标目录同名文件是否已存在 -> skipped_existing
+否则复制 -> copied
+> 当前实现是“已存在就跳过”，不是强制覆盖。
+6) 未找到文件 TXT 的写入规则
+只有在某个 DN 文件夹里：
+没命中可提取文件，且
+也没有 Formal 文件，且
+也没有任何非 Formal PDF
+才会写入 未找到文件的文件夹列表.txt。
+所以“有 PDF 但未命中/已存在跳过”的情况，不会再被写到最终 TXT。

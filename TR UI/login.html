@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>TR Report System - 登录</title>
+    <title>TR Report System - 登入</title>
     <link rel="stylesheet" href="styles/login.css">
     <script src="scripts/vue.global.js"></script>
 </head>
@@ -16,25 +16,25 @@
                     <div class="brand-content">
                         <img src="images/logo.png" alt="VSC Logo" class="brand-logo">
                         <h1 class="brand-title">TR Report System</h1>
-                        <p class="brand-subtitle">TR报告管理系统</p>
+                        <p class="brand-subtitle">TR報告管理系統</p>
                     </div>
                 </div>
 
                 <!-- 右侧表单区域 -->
                 <div class="form-section">
                     <div class="login-header">
-                        <h1>用户登录</h1>
+                        <h1>用戶登入</h1>
                     </div>
 
                     <form @submit.prevent="handleLogin" class="login-form">
                     <!-- 账号输入 -->
                     <div class="form-group">
-                        <label for="username">账号名称</label>
+                        <label for="username">帳號名稱</label>
                         <input 
                             type="text" 
                             id="username"
                             v-model="loginForm.username"
-                            placeholder="请输入账号名称"
+                            placeholder="請輸入帳號名稱"
                             required
                             autocomplete="username"
                         >
@@ -42,13 +42,13 @@
 
                     <!-- 密码输入 -->
                     <div class="form-group">
-                        <label for="password">密码</label>
+                        <label for="password">密碼</label>
                         <div class="password-input-wrapper">
                             <input 
                                 :type="showPassword ? 'text' : 'password'" 
                                 id="password"
                                 v-model="loginForm.password"
-                                placeholder="请输入密码"
+                                placeholder="請輸入密碼"
                                 required
                                 autocomplete="current-password"
                             >
@@ -57,7 +57,7 @@
                                 class="toggle-password"
                                 @click="showPassword = !showPassword"
                             >
-                                {{ showPassword ? '显示' : '隐藏' }}
+                                {{ showPassword ? '顯示' : '隱藏' }}
                             </button>
                         </div>
                     </div>
@@ -66,7 +66,7 @@
                     <div class="form-options">
                         <label class="remember-me">
                             <input type="checkbox" v-model="loginForm.remember">
-                            <span>记住我</span>
+                            <span>記住我</span>
                         </label>
                     </div>
 
@@ -82,8 +82,8 @@
 
                     <!-- 登录按钮 -->
                     <button type="submit" class="login-button" :disabled="loading">
-                        <span v-if="!loading">登录</span>
-                        <span v-else>登录中...</span>
+                        <span v-if="!loading">登入</span>
+                        <span v-else>登入中...</span>
                     </button>
                     </form>
 

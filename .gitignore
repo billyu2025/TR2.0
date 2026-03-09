@@ -12,6 +12,7 @@ TR UI/.env
 
 # 日志文件
 TR database/logs/
+TR UI/backend/logs
 
 # 生成的PDF文件
 TR UI/backend/Generated_PDFs/

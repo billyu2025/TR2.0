@@ -7,7 +7,7 @@
     <link rel="stylesheet" href="styles/dashboard.css">
     <link rel="stylesheet" href="styles/tr-records.css">
     <script src="scripts/vue.global.js"></script>
-    <script src="config.js"></script>
+    <script src="config.js?v=20260224a"></script>
 </head>
 <body>
     <div id="app">
@@ -52,9 +52,12 @@
             <main class="content">
                 <div class="page-header">
                     <h1>TR記錄管理</h1>
+                    <div class="system-update-notice">
+                        提示：每天 13:05-13:15、16:20-16:30，系統處於更新狀態，更新完成後方可使用。
+                    </div>
                     <button 
                         class="update-data-btn" 
-                        @click="startUpdateAllTables"
+                        @click="startUpdateAllTables($event)"
                         :disabled="updateDataLoading"
                         v-if="userInfo.role === 'admin'"
                     >
@@ -70,7 +73,7 @@
                         :class="{ 'tab-btn--active': activeSubTab === 'records' }"
                         @click="activeSubTab = 'records'"
                     >
-                        TR记录管理
+                        TR記錄管理
                     </button>
                     <button 
                         class="tab-btn" 
@@ -81,15 +84,15 @@
                     </button>
                 </div>
 
-                <!-- TR记录管理 Tab 内容 -->
+                <!-- TR記錄管理 Tab 內容 -->
                 <div v-if="activeSubTab === 'records'">
-                <!-- 搜索栏 -->
+                <!-- 搜尋欄 -->
                 <div class="search-section">
                     <div class="search-box">
                         <input 
                             type="text" 
                             v-model="searchQuery.orderNo" 
-                            placeholder="按 Order No 搜索"
+                            placeholder="按 Order No 搜尋"
                             @keyup.enter="performSearch"
                         >
                     </div>
@@ -97,7 +100,7 @@
                         <input 
                             type="text" 
                             v-model="searchQuery.jobNo" 
-                            placeholder="按Job No搜索"
+                            placeholder="按Job No搜尋"
                             @keyup.enter="performSearch"
                         >
                     </div>
@@ -119,14 +122,14 @@
                             :max="maxDate"
                         >
                     </div>
-                    <button class="search-btn" @click="performSearch">搜索</button>
+                    <button class="search-btn" @click="performSearch">搜尋</button>
                     <button class="reset-btn" @click="resetSearch">重置</button>
                 </div>
 
                 <!-- 批量操作区域 -->
                 <div class="batch-actions" v-if="currentSelectedRecords.length > 0">
                     <div class="batch-info">
-                        <span>已选择 {{ currentSelectedRecords.length }} 条记录</span>
+                        <span>已選擇 {{ currentSelectedRecords.length }} 條記錄</span>
                     </div>
                     <div class="batch-buttons">
                         <button 
@@ -181,16 +184,16 @@
                             </tr>
                         </thead>
                         <tbody>
-                            <!-- 加载状态 -->
+                            <!-- 載入狀態 -->
                             <tr v-if="loading">
                                 <td colspan="10" class="loading-row">
                                     <div class="table-loading">
                                         <div class="loading-spinner-small"></div>
-                                        <span>正在加载数据...</span>
+                                        <span>正在載入數據...</span>
                                     </div>
                                 </td>
                             </tr>
-                            <!-- 数据行 -->
+                            <!-- 數據行 -->
                             <template v-else>
                                 <tr 
                                     v-for="record in filteredRecords" 
@@ -256,8 +259,8 @@
                     </table>
                 </div>
 
-                <!-- 分页 - 只在非搜索状态时显示 -->
-                <div class="pagination" v-if="!isSearching">
+                <!-- 分頁 - 搜索和非搜索狀態都顯示 -->
+                <div class="pagination" v-if="totalPages > 0">
                     <button @click="prevPage" :disabled="currentPage === 1">上一頁</button>
                     <span>第 {{ currentPage }} 頁，共 {{ totalPages }} 頁</span>
                     <button @click="nextPage" :disabled="currentPage === totalPages">下一頁</button>
@@ -272,7 +275,15 @@
                         <input 
                             type="text" 
                             v-model="searchQuery.orderNo" 
-                            placeholder="按 Order No 搜索"
+                            placeholder="按 Order No 搜尋"
+                            @keyup.enter="performSearch"
+                        >
+                    </div>
+                    <div class="search-box">
+                        <input 
+                            type="text" 
+                            v-model="searchQuery.jobNo" 
+                            placeholder="按 Job No 搜尋"
                             @keyup.enter="performSearch"
                         >
                     </div>
@@ -280,7 +291,7 @@
                         <input 
                             type="text" 
                             v-model="searchQuery.dnNo" 
-                            placeholder="按DD_No搜索"
+                            placeholder="按DD_No搜尋"
                             @keyup.enter="performSearch"
                         >
                     </div>
@@ -302,14 +313,14 @@
                             :max="maxDate"
                         >
                     </div>
-                    <button class="search-btn" @click="performSearch">搜索</button>
+                    <button class="search-btn" @click="performSearch">搜尋</button>
                     <button class="reset-btn" @click="resetSearch">重置</button>
                 </div>
 
                 <!-- 批量操作区域 -->
                 <div class="batch-actions" v-if="currentSelectedRecords.length > 0">
                     <div class="batch-info">
-                        <span>已选择 {{ currentSelectedRecords.length }} 条记录</span>
+                        <span>已選擇 {{ currentSelectedRecords.length }} 條記錄</span>
                     </div>
                     <div class="batch-buttons">
                         <button 
@@ -317,24 +328,32 @@
                             @click="downloadByOrder"
                             :disabled="currentSelectedRecords.length === 0"
                         >
-                            📥 按Order下载{{ currentSelectedRecords.length > 1 ? ` (${currentSelectedRecords.length}个)` : '' }}
+                            📥 按Order下載{{ currentSelectedRecords.length > 1 ? ` (${currentSelectedRecords.length}個)` : '' }}
                         </button>
                         <button 
                             class="batch-download-btn" 
                             @click="downloadByDdNo"
                             :disabled="currentSelectedRecords.length === 0"
                         >
-                            📥 按DD_No下载{{ currentSelectedRecords.length > 1 ? ` (${currentSelectedRecords.length}个)` : '' }}
+                            📥 按DD_No下載{{ currentSelectedRecords.length > 1 ? ` (${currentSelectedRecords.length}個)` : '' }}
                         </button>
                         <button 
                             class="batch-download-btn" 
                             @click="downloadByDate"
                             :disabled="currentSelectedRecords.length === 0"
                         >
-                            📥 按日期下载{{ currentSelectedRecords.length > 1 ? ` (${currentSelectedRecords.length}个)` : '' }}
+                            📥 按日期下載{{ currentSelectedRecords.length > 1 ? ` (${currentSelectedRecords.length}個)` : '' }}
+                        </button>
+                        <button
+                            type="button"
+                            class="batch-download-btn batch-download-all-stockist-btn"
+                            @click="downloadAllStockistNoFiles"
+                            :disabled="currentSelectedRecords.length === 0"
+                        >
+                            ✅ 全部Stockist No下載{{ currentSelectedRecords.length > 1 ? ` (${currentSelectedRecords.length}個)` : '' }}
                         </button>
                         <button class="clear-selection-btn" @click="clearSelection">
-                            ✕ 清除选择
+                            ✕ 清除選擇
                         </button>
                     </div>
                 </div>
@@ -361,16 +380,16 @@
                             </tr>
                         </thead>
                         <tbody>
-                            <!-- 加载状态 -->
+                            <!-- 載入狀態 -->
                             <tr v-if="loading">
                                 <td colspan="7" class="loading-row">
                                     <div class="table-loading">
                                         <div class="loading-spinner-small"></div>
-                                        <span>正在加载数据...</span>
+                                        <span>正在載入數據...</span>
                                     </div>
                                 </td>
                             </tr>
-                            <!-- 数据行 -->
+                            <!-- 數據行 -->
                             <template v-else>
                                 <tr v-for="record in filteredRecords" :key="record.id">
                                     <td class="checkbox-column">
@@ -389,18 +408,18 @@
                                     <td>{{ record.delDate }}</td>
                                 </tr>
                                 <tr v-if="filteredRecords.length === 0">
-                                    <td colspan="7" class="no-data">暂无数据</td>
+                                    <td colspan="7" class="no-data">暫無數據</td>
                                 </tr>
                             </template>
                         </tbody>
                     </table>
                 </div>
 
-                <!-- 分页 - 只在非搜索状态时显示 -->
-                <div class="pagination" v-if="!isSearching">
-                    <button @click="prevPage" :disabled="currentPage <= 1">上一页</button>
-                    <span>第 {{ currentPage }} 页，共 {{ totalPages }} 页</span>
-                    <button @click="nextPage" :disabled="currentPage >= totalPages">下一页</button>
+                <!-- 分頁 - 搜索和非搜索狀態都顯示 -->
+                <div class="pagination" v-if="totalPages > 0">
+                    <button @click="prevPage" :disabled="currentPage <= 1">上一頁</button>
+                    <span>第 {{ currentPage }} 頁，共 {{ totalPages }} 頁</span>
+                    <button @click="nextPage" :disabled="currentPage >= totalPages">下一頁</button>
                 </div>
                 </div>
             </main>
@@ -555,7 +574,7 @@
         </div>
     </div>
 
-    <script src="scripts/tr-records.js"></script>
+    <script src="scripts/tr-records.js?v=20260224a"></script>
 </body>
 </html>
 
