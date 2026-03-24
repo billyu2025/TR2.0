@@ -12,6 +12,18 @@ function getAuthInfo() {
     }
 }
 
+function getSessionUserRole() {
+    try {
+        const authInfo = getAuthInfo();
+        if (authInfo.user && authInfo.user.role) {
+            return authInfo.user.role;
+        }
+    } catch (e) {
+        /* ignore */
+    }
+    return '';
+}
+
 // 辅助函数：构建正确的 API URL，避免路径重复
 function buildApiUrl(path) {
     const apiBaseUrl = window.API_BASE_URL || 'http://127.0.0.1:5000';
@@ -53,7 +65,7 @@ createApp({
             userInfo: {
                 username: '',
                 name: '',
-                role: '',
+                role: getSessionUserRole(),
                 jobNos: []
             },
             showSettings: false,
@@ -154,7 +166,6 @@ createApp({
                     username: user.username,
                     role: user.role,
                     active: user.active,
-                    currentPassword: user.current_password || '',
                     jobNos: user.job_nos || [],
                     createdAt: user.created_at,
                     updatedAt: user.updated_at
@@ -186,7 +197,7 @@ createApp({
 
         openEditModal(user) {
             this.modal.mode = 'edit';
-            const knownPwd = user.currentPassword || this.knownUserPasswords[user.username] || '';
+            const knownPwd = this.knownUserPasswords[user.username] || '';
             this.modal.form = {
                 username: user.username,
                 password: knownPwd,

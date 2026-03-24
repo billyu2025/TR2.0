@@ -126,6 +126,5 @@ CORS_ALLOWED_ORIGINS = [
 
 CORS_ALLOW_CREDENTIALS = True
 
-# SQLite数据库路径（用于读取materials_com和orders_com表）
 DATABASE_PATH = os.path.join(BASE_DIR.parent, 'TR database', 'data_3years.db')
 

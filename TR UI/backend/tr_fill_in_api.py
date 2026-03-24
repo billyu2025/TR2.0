@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# Placeholder header – the real tr_fill_in_api.py content should already exist on disk.
+# This stub file was added accidentally; please ignore.
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 TR Fill In API Server
 Handles data synchronization requests from the frontend TR Fill In page
@@ -22,6 +27,9 @@ import secrets
 import string
 import traceback
 import time
+import re
+import ipaddress
+import json
 from datetime import datetime, timedelta
 from functools import wraps
 from dotenv import load_dotenv
@@ -52,9 +60,31 @@ except ImportError as e:
         pass
 
 app = Flask(__name__)
-# 允许跨域请求，包括 file:// 协议
-# 暴露自定义响应头，以便前端可以读取
-CORS(app, resources={r"/*": {"origins": "*", "expose_headers": ["X-Date-Count"]}}, supports_credentials=True)
+
+
+def _parse_cors_origins():
+    """
+    浏览器跨域 Origin 须为完整 URL（含协议与端口）。
+    环境变量 CORS_ORIGINS：逗号分隔，例如：
+    http://192.168.32.97:8000,http://report.vschk.com:8000,http://127.0.0.1:5500
+    未设置时使用默认内网与正式域名（端口 8000）。
+    """
+    raw = os.getenv("CORS_ORIGINS", "").strip()
+    if raw:
+        return [o.strip() for o in raw.split(",") if o.strip()]
+    return [
+        "http://192.168.32.97:8000",
+        "http://report.vschk.com:8000",
+    ]
+
+
+CORS_ORIGINS = _parse_cors_origins()
+# 暴露自定义响应头，以便前端可以读取；origins 白名单（与 supports_credentials 同时使用时不可为 *）
+CORS(
+    app,
+    resources={r"/*": {"origins": CORS_ORIGINS, "expose_headers": ["X-Date-Count"]}},
+    supports_credentials=True,
+)
 
 # 从环境变量读取配置，如果没有则使用默认值
 # 数据库路径
@@ -80,9 +110,155 @@ SESSION_TTL_HOURS = int(os.getenv('SESSION_TTL_HOURS', '24'))
 PASSWORD_ITERATIONS = int(os.getenv('PASSWORD_ITERATIONS', '120000'))
 PASSWORD_EXPIRY_DAYS = 180  # 普通账户密码有效期（天）
 
+
+def _parse_rate_limit_list(raw: str | None, defaults: list[str]) -> list[str]:
+    """解析限流字符串：支持逗号或分号分隔多条，如 \"300 per hour, 5000 per day\"。"""
+    if not raw or not str(raw).strip():
+        return list(defaults)
+    return [p.strip() for p in re.split(r'[;,]', str(raw)) if p.strip()]
+
+
+# 通用限流（flask-limiter），可通过环境变量覆盖；示例见 backend/env.rate_limit.example
+RATE_LIMIT_GLOBAL = _parse_rate_limit_list(
+    os.getenv("RATE_LIMIT_GLOBAL"),
+    ["600 per hour", "12000 per day"],
+)
+RATE_LIMIT_STORAGE_URI = os.getenv("RATE_LIMIT_STORAGE_URI", "memory://")
+RATE_LIMIT_LOGIN = os.getenv("RATE_LIMIT_LOGIN", "5 per minute")
+RATE_LIMIT_ADMIN_CREATE_USER = os.getenv("RATE_LIMIT_ADMIN_CREATE_USER", "10 per hour")
+RATE_LIMIT_ADMIN_RESET_PASSWORD = os.getenv("RATE_LIMIT_ADMIN_RESET_PASSWORD", "3 per hour")
+RATE_LIMIT_HEAVY_POST = os.getenv("RATE_LIMIT_HEAVY_POST", "30 per minute")
+RATE_LIMIT_DOWNLOAD_GET = os.getenv("RATE_LIMIT_DOWNLOAD_GET", "120 per minute")
+RATE_LIMIT_PDF_GENERATE = os.getenv("RATE_LIMIT_PDF_GENERATE", "45 per minute")
+RATE_LIMIT_SYSTEM_POST = os.getenv("RATE_LIMIT_SYSTEM_POST", "5 per hour")
+
 # 初始化統一日誌系統
 logger = init_logger(debug_mode=DEBUG_MODE)
 access_logger = get_access_logger()
+
+
+def _safe_error_message(exc: BaseException | None) -> str:
+    """
+    生产环境不向客户端返回异常细节、路径或数据库错误原文。
+    DEBUG=True 时返回 str(exc) 便于本地联调。
+    """
+    if exc is not None and DEBUG_MODE:
+        return str(exc)
+    return '操作失败，请稍后重试或联系管理员'
+
+
+# --- 管理端 IP 白名单（M8）：仅允许内网/VPN 等网段访问管理类 API ---
+ADMIN_IP_WHITELIST_ENABLED = os.getenv('ADMIN_IP_WHITELIST_ENABLED', 'false').lower() == 'true'
+ADMIN_TRUST_PROXY_HEADERS = os.getenv('ADMIN_TRUST_PROXY_HEADERS', 'false').lower() == 'true'
+_admin_allowed_networks = None
+
+
+def _load_admin_allowed_networks():
+    """逗号分隔：单 IP 或 CIDR，如 192.168.1.0/24,10.0.0.0/8,127.0.0.1"""
+    global _admin_allowed_networks
+    if _admin_allowed_networks is not None:
+        return _admin_allowed_networks
+    raw = os.getenv('ADMIN_ALLOWED_NETWORKS', '').strip()
+    nets = []
+    if raw:
+        for part in raw.split(','):
+            part = part.strip()
+            if not part:
+                continue
+            if '/' not in part:
+                part = f'{part}/32' if ':' not in part else f'{part}/128'
+            try:
+                nets.append(ipaddress.ip_network(part, strict=False))
+            except ValueError:
+                try:
+                    logger.warning('忽略无效的管理端网段配置: %s', part)
+                except Exception:
+                    pass
+    _admin_allowed_networks = nets
+    return _admin_allowed_networks
+
+
+def _effective_client_ip() -> str:
+    """在反向代理后应设 ADMIN_TRUST_PROXY_HEADERS=true，并依赖 Nginx 传入的 X-Real-IP / X-Forwarded-For。"""
+    if ADMIN_TRUST_PROXY_HEADERS:
+        real = request.headers.get('X-Real-IP')
+        if real:
+            return real.strip()
+        xff = request.headers.get('X-Forwarded-For')
+        if xff:
+            return xff.split(',')[0].strip()
+    return (request.remote_addr or '').strip()
+
+
+def _is_admin_backend_path(path: str) -> bool:
+    """管理类 API：账号管理、系统更新、文件索引写操作。"""
+    if path.startswith('/api/admin'):
+        return True
+    if path.startswith('/api/system'):
+        return True
+    if path in ('/api/file-index/rebuild', '/api/file-index/update', '/api/file-index/cleanup'):
+        return True
+    return False
+
+
+@app.before_request
+def _enforce_admin_ip_whitelist():
+    if request.method == 'OPTIONS':
+        return None
+    if not ADMIN_IP_WHITELIST_ENABLED:
+        return None
+    if not _is_admin_backend_path(request.path):
+        return None
+    nets = _load_admin_allowed_networks()
+    if not nets:
+        try:
+            logger.warning('ADMIN_IP_WHITELIST_ENABLED 已开启但 ADMIN_ALLOWED_NETWORKS 为空，拒绝管理端访问')
+        except Exception:
+            pass
+        return (
+            jsonify({
+                'success': False,
+                'error': '管理端访问未配置允许的网段',
+                'code': 503,
+            }),
+            503,
+        )
+    ip_str = _effective_client_ip()
+    try:
+        ip_obj = ipaddress.ip_address(ip_str)
+    except ValueError:
+        try:
+            logger.warning('无法解析客户端 IP: %s path=%s', ip_str, request.path)
+        except Exception:
+            pass
+        return (
+            jsonify({
+                'success': False,
+                'error': '管理功能仅允许内网或授权网段访问',
+                'code': 403,
+            }),
+            403,
+        )
+    allowed = any(ip_obj in net for net in nets)
+    if allowed:
+        return None
+    try:
+        logger.warning(
+            '管理端 API 已拦截: path=%s ip=%s',
+            request.path,
+            ip_str,
+        )
+    except Exception:
+        pass
+    return (
+        jsonify({
+            'success': False,
+            'error': '管理功能仅允许内网或授权网段访问',
+            'code': 403,
+        }),
+        403,
+    )
+
 
 # 下载任务管理器单例：避免每个请求各自创建线程池/队列
 _download_task_manager = None
@@ -110,24 +286,34 @@ cache = init_cache(default_ttl=300)  # 默認5分鐘
 try:
     from flask_limiter import Limiter
     from flask_limiter.util import get_remote_address
-    
-    # 初始化限流器（使用內存存儲，簡單場景）
+
     limiter = Limiter(
         app=app,
-        key_func=get_remote_address,  # 根據 IP 地址限流
-        default_limits=["200 per day", "50 per hour"],  # 全局默認限制
-        storage_uri="memory://"  # 使用內存存儲
+        key_func=get_remote_address,
+        default_limits=RATE_LIMIT_GLOBAL,
+        storage_uri=RATE_LIMIT_STORAGE_URI,
     )
     try:
-        logger.info("Rate limiting system enabled")
+        logger.info(
+            "Rate limiting enabled: global=%s storage=%s",
+            RATE_LIMIT_GLOBAL,
+            RATE_LIMIT_STORAGE_URI,
+        )
     except (UnicodeEncodeError, UnicodeDecodeError):
-        logger.info("Rate limiting system enabled")
+        logger.info("Rate limiting enabled")
 except ImportError:
     limiter = None
     try:
         logger.warning("flask-limiter not installed, rate limiting disabled")
     except (UnicodeEncodeError, UnicodeDecodeError):
         logger.warning("flask-limiter not installed, rate limiting disabled")
+
+
+def _route_limit(rule: str):
+    """对路由应用限流规则；未安装 flask-limiter 时为 no-op。"""
+    if limiter:
+        return limiter.limit(rule)
+    return lambda f: f
 
 
 # ============================================================================
@@ -179,6 +365,17 @@ def forbidden(error):
     }), 403
 
 
+@app.errorhandler(429)
+def too_many_requests(error):
+    """限流（flask-limiter 等返回 429）"""
+    logger.warning(f"429 Too Many Requests: {request.path} - {request.remote_addr}")
+    return jsonify({
+        'success': False,
+        'error': '请求过于频繁，请稍后再试',
+        'code': 429,
+    }), 429
+
+
 @app.errorhandler(500)
 def internal_error(error):
     """處理 500 錯誤（服務器內部錯誤）"""
@@ -191,11 +388,13 @@ def internal_error(error):
         'code': 500
     }
     
-    # 僅在調試模式下返回詳細錯誤信息
+    # 僅在調試模式下返回詳細錯誤信息（生产环境不返回堆栈）
     if DEBUG_MODE:
         error_response['detail'] = str(error)
         error_response['traceback'] = traceback.format_exc()
-    
+    else:
+        error_response['error'] = '服务器内部错误，请稍后重试'
+
     return jsonify(error_response), 500
 
 
@@ -210,26 +409,25 @@ def handle_exception(e):
         exc_info=True
     )
     
-    # 根據錯誤類型返回不同的響應
+    import traceback
+
     error_response = {
         'success': False,
-        'error': 'Unexpected error occurred',
-        'code': 500
+        'error': _safe_error_message(e),
+        'code': 500,
     }
-    
-    # 僅在調試模式下返回詳細錯誤信息
-    import traceback
     if DEBUG_MODE:
-        error_response['detail'] = str(e)
         error_response['type'] = type(e).__name__
         error_response['traceback'] = traceback.format_exc()
     else:
-        # 生產環境：記錄詳細信息但不返回給用戶
         try:
-            logger.error(f"Detailed error info (logged only, not returned to user): {traceback.format_exc()}")
+            logger.error(
+                "Detailed error info (logged only, not returned to user): %s",
+                traceback.format_exc(),
+            )
         except (UnicodeEncodeError, UnicodeDecodeError):
-            logger.error(f"Error occurred: {type(e).__name__}: {str(e)}")
-    
+            logger.error("Error occurred: %s: %s", type(e).__name__, str(e))
+
     return jsonify(error_response), 500
 
 
@@ -241,6 +439,9 @@ def handle_exception(e):
 from db_pool import init_pool, get_pool
 import threading
 
+# 导入数据库适配器函数（模块级别，避免作用域问题）
+from db_adapter import is_postgres, get_connection as adapter_get_connection, placeholders as db_placeholders, sql_placeholder
+
 # 初始化連接池（最大連接數20）
 _pool_initialized = False
 _pool_lock = threading.Lock()
@@ -249,7 +450,11 @@ _pool_lock = threading.Lock()
 _thread_local = threading.local()
 
 def _ensure_pool_initialized():
-    """確保連接池已初始化"""
+    """確保連接池已初始化（仅用于 SQLite 模式）"""
+    # PostgreSQL 模式不需要 SQLite 连接池
+    if is_postgres():
+        return
+    
     global _pool_initialized
     with _pool_lock:
         if not _pool_initialized:
@@ -266,6 +471,46 @@ def _ensure_pool_initialized():
                 except (UnicodeEncodeError, UnicodeDecodeError):
                     logger.error(f"[Connection Pool] Failed to initialize connection pool: {e}")
                 _pool_initialized = False
+
+# 后台任务（文件索引调度器等）：Waitress / 直接运行 tr_fill_in_api 共用，只初始化一次
+_background_services_started = False
+_background_services_lock = threading.Lock()
+
+
+def start_background_services():
+    """
+    生产入口必须调用本函数（见 start_waitress.py），否则仅 python tr_fill_in_api.py 会启动调度器。
+    初始化 SQLite 连接池（如需），并按 ENABLE_FILE_INDEX_SCHEDULER 启动文件索引定时任务。
+    """
+    global _background_services_started
+    with _background_services_lock:
+        if _background_services_started:
+            return
+        _background_services_started = True
+
+    _ensure_pool_initialized()
+
+    enable_scheduler = os.getenv('ENABLE_FILE_INDEX_SCHEDULER', 'False').lower() == 'true'
+    if not enable_scheduler:
+        try:
+            logger.debug('文件索引定时任务未启用（ENABLE_FILE_INDEX_SCHEDULER!=true）')
+        except Exception:
+            pass
+        return
+
+    try:
+        from file_index_scheduler import start_file_index_scheduler
+
+        base_folder = os.getenv('STOCKIST_TEST_FOLDER', r'D:\Stockist&Test Report')
+        update_interval = int(os.getenv('FILE_INDEX_UPDATE_INTERVAL_HOURS', '1'))
+        start_file_index_scheduler(DB_PATH, base_folder, update_interval)
+        logger.info('文件索引定时任务已启动，更新间隔: %s 小时', update_interval)
+    except Exception as e:
+        try:
+            logger.warning('启动文件索引定时任务失败: %s', e)
+        except Exception:
+            pass
+
 
 # 包裝類：讓連接池的連接行為像普通連接
 class PooledConnection:
@@ -323,6 +568,11 @@ def get_db_connection():
     注意：為了保持兼容性，返回的連接對象在調用 close() 時會自動歸還到連接池。
     建議使用 with 語句，但手動 close() 也可以正常工作。
     """
+    # PostgreSQL 模式：直接使用 db_adapter.get_connection()（它已经处理了连接池）
+    if is_postgres():
+        return adapter_get_connection()
+
+    # SQLite 模式：使用连接池
     _ensure_pool_initialized()
     
     try:
@@ -350,6 +600,7 @@ def get_db_connection():
             import traceback
             logger.error(f"[Connection Pool] Error details: {traceback.format_exc()}")
             logger.warning("[Connection Pool] Falling back to direct connection mode")
+        # Fallback: 直接创建 SQLite 连接（仅用于 SQLite 模式）
         conn = sqlite3.connect(DB_PATH, timeout=30.0)
         conn.row_factory = sqlite3.Row
         try:
@@ -363,18 +614,48 @@ def get_db_connection():
         return conn
 
 
+def _table_exists(cursor, table_name):
+    """检查表是否存在（支持 SQLite 和 PostgreSQL）"""
+    from db_adapter import is_postgres
+    if is_postgres():
+        cursor.execute("""
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = %s
+            ) AS exists
+        """, (table_name,))
+        row = cursor.fetchone()
+        return bool(row.get('exists') if isinstance(row, dict) else row[0]) if row else False
+    else:
+        cursor.execute("""
+            SELECT name FROM sqlite_master 
+            WHERE type='table' AND name=?
+        """, (table_name,))
+        return cursor.fetchone() is not None
+
+
 def _ensure_bbs_dd_indexes(conn, cursor):
     """
     确保 bbs_dd 表有必要的索引（性能优化）
     只在首次调用时创建，后续调用会快速跳过
     """
+    from db_adapter import is_postgres
     try:
         # 检查索引是否已存在
-        cursor.execute("""
-            SELECT name FROM sqlite_master 
-            WHERE type='index' AND name LIKE 'idx_bbs_dd%'
-        """)
-        existing_indexes = [row[0] for row in cursor.fetchall()]
+        if is_postgres():
+            cursor.execute("""
+                SELECT indexname
+                FROM pg_indexes
+                WHERE schemaname = 'public' AND tablename = 'bbs_dd' AND indexname LIKE 'idx_bbs_dd%'
+            """)
+            existing_indexes = [row['indexname'] if isinstance(row, dict) else row[0] for row in cursor.fetchall()]
+        else:
+            cursor.execute("""
+                SELECT name FROM sqlite_master 
+                WHERE type='index' AND name LIKE 'idx_bbs_dd%'
+            """)
+            existing_indexes = [row[0] for row in cursor.fetchall()]
         
         # 创建缺失的索引
         indexes_to_create = [
@@ -390,15 +671,24 @@ def _ensure_bbs_dd_indexes(conn, cursor):
             if index_name not in existing_indexes:
                 cursor.execute(create_sql)
                 created_count += 1
-                print(f"[性能优化] 创建索引: {index_name}")
+                try:
+                    logger.info("[性能优化] Creating index: " + str(index_name))
+                except (UnicodeEncodeError, UnicodeDecodeError, Exception):
+                    pass
         
         if created_count > 0:
             conn.commit()
-            print(f"[性能优化] bbs_dd 表索引创建完成，共创建 {created_count} 个索引")
+            try:
+                logger.info("[性能优化] bbs_dd table indexes created, total: " + str(created_count) + " indexes")
+            except (UnicodeEncodeError, UnicodeDecodeError, Exception):
+                pass
             
     except Exception as e:
         # 索引创建失败不影响查询，只记录错误
-        print(f"[警告] 创建 bbs_dd 索引时出错（不影响查询）: {e}")
+        try:
+            logger.warning("[警告] Error creating bbs_dd indexes (does not affect queries): " + str(e))
+        except (UnicodeEncodeError, UnicodeDecodeError, Exception):
+            pass
 
 
 # SESSION_TTL_HOURS 和 PASSWORD_ITERATIONS 已从环境变量读取（见上方）
@@ -477,12 +767,13 @@ def _generate_random_password(length: int = 10) -> str:
     return ''.join(password_chars)
 
 
-def _calculate_password_days_remaining(password_expires_at: str | None) -> int | None:
+def _calculate_password_days_remaining(password_expires_at: str | datetime | None) -> int | None:
     """
     计算密码剩余天数
     
     Args:
-        password_expires_at: 密码过期时间（ISO格式字符串）
+        password_expires_at: 密码过期时间（ISO格式字符串或datetime对象）
+                            PostgreSQL返回datetime对象，SQLite返回字符串
         
     Returns:
         剩余天数，如果已过期返回负数，如果未设置返回None
@@ -491,13 +782,26 @@ def _calculate_password_days_remaining(password_expires_at: str | None) -> int |
         return None
     
     try:
-        expires_date = datetime.fromisoformat(password_expires_at.replace('Z', '+00:00'))
+        # 如果已经是datetime对象（PostgreSQL返回的），直接使用
+        if isinstance(password_expires_at, datetime):
+            expires_date = password_expires_at
+        else:
+            # 如果是字符串（SQLite返回的），需要解析
+            expires_date = datetime.fromisoformat(str(password_expires_at).replace('Z', '+00:00'))
+        
+        # 如果有时区信息，移除时区（统一使用本地时间）
         if expires_date.tzinfo:
             expires_date = expires_date.replace(tzinfo=None)
+        
         now = datetime.now()
         delta = expires_date - now
         return delta.days
-    except (ValueError, AttributeError):
+    except (ValueError, AttributeError, TypeError) as e:
+        # 记录错误以便调试
+        try:
+            logger.warning("Failed to calculate password days remaining: " + str(e) + ", value: " + str(password_expires_at) + ", type: " + str(type(password_expires_at)))
+        except Exception:
+            pass
         return None
 
 
@@ -520,231 +824,381 @@ def _normalize_job_numbers(job_nos):
 
 
 def _ensure_account_tables():
+    from db_adapter import is_postgres
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    # 检查表是否存在
-    cursor.execute("""
-        SELECT name FROM sqlite_master 
-        WHERE type='table' AND name='user_accounts'
-    """)
-    table_exists = cursor.fetchone() is not None
+    # 检查表是否存在（支持 SQLite 和 PostgreSQL）
+    if is_postgres():
+        cursor.execute("""
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = %s
+            ) AS exists
+        """, ('user_accounts',))
+        row = cursor.fetchone()
+        table_exists = bool(row.get('exists') if isinstance(row, dict) else row[0]) if row else False
+    else:
+        cursor.execute("""
+            SELECT name FROM sqlite_master 
+            WHERE type='table' AND name='user_accounts'
+        """)
+        table_exists = cursor.fetchone() is not None
     
     if table_exists:
         # 表已存在，检查约束是否需要更新
-        cursor.execute("""
-            SELECT sql FROM sqlite_master 
-            WHERE type='table' AND name='user_accounts'
-        """)
-        create_sql = cursor.fetchone()
-        if create_sql and 'manager' not in create_sql[0]:
-            # 约束不包含'manager'，需要重建表
-            print("[INFO] Updating user_accounts table to support 'manager' role...")
-            # 创建临时表
+        # PostgreSQL 不支持直接获取 CREATE TABLE SQL，所以跳过这个检查
+        if is_postgres():
+            # PostgreSQL: 检查 role 列是否支持 'manager' 值
+            # 由于 PostgreSQL 使用 CHECK 约束，我们假设如果表存在就已经支持了
+            # 如果需要更新，可以通过 ALTER TABLE 添加约束
+            pass
+        else:
+            # SQLite: 检查 CREATE TABLE SQL
             cursor.execute("""
-                CREATE TABLE user_accounts_new (
+                SELECT sql FROM sqlite_master
+                WHERE type='table' AND name='user_accounts'
+            """)
+            create_sql = cursor.fetchone()
+            if create_sql and 'manager' not in create_sql[0]:
+                # 约束不包含'manager'，需要重建表（仅 SQLite）
+                logger.info("Updating user_accounts table to support 'manager' role...")
+                # SQLite: 重建表
+                cursor.execute("""
+                    CREATE TABLE user_accounts_new (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        username TEXT NOT NULL UNIQUE,
+                        password_hash TEXT NOT NULL,
+                        password_salt TEXT NOT NULL,
+                        full_name TEXT,
+                        role TEXT NOT NULL CHECK(role IN ('admin', 'manager', 'user')),
+                        is_active INTEGER NOT NULL DEFAULT 1,
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """)
+                # 复制数据
+                cursor.execute("""
+                    INSERT INTO user_accounts_new
+                    (id, username, password_hash, password_salt, full_name, role, is_active, created_at, updated_at)
+                    SELECT id, username, password_hash, password_salt, full_name, role, is_active, created_at, updated_at
+                    FROM user_accounts
+                    """)
+                # 删除旧表
+                cursor.execute("DROP TABLE user_accounts")
+                # 重命名新表
+                cursor.execute("ALTER TABLE user_accounts_new RENAME TO user_accounts")
+                # 重新创建触发器
+                cursor.execute("DROP TRIGGER IF EXISTS trg_user_accounts_updated")
+                cursor.execute("""
+                    CREATE TRIGGER IF NOT EXISTS trg_user_accounts_updated
+                    AFTER UPDATE ON user_accounts
+                    FOR EACH ROW
+                    BEGIN
+                        UPDATE user_accounts
+                        SET updated_at = CURRENT_TIMESTAMP
+                        WHERE id = NEW.id;
+                    END;
+                """)
+                conn.commit()
+                logger.info("user_accounts table updated successfully")
+    else:
+        # 表不存在，创建新表
+        if is_postgres():
+            # PostgreSQL: 使用 GENERATED BY DEFAULT AS IDENTITY
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_accounts (
+                    id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                    username TEXT NOT NULL UNIQUE,
+                    password_hash TEXT NOT NULL,
+                    password_salt TEXT NOT NULL,
+                    full_name TEXT,
+                    role TEXT NOT NULL CHECK(role IN ('admin', 'manager', 'user')),
+                    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    password_changed_at TIMESTAMPTZ,
+                    password_expires_at TIMESTAMPTZ
+                )
+                """
+            )
+        else:
+            # SQLite: 使用 AUTOINCREMENT
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_accounts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     username TEXT NOT NULL UNIQUE,
                     password_hash TEXT NOT NULL,
                     password_salt TEXT NOT NULL,
-                    password_plaintext TEXT,
                     full_name TEXT,
                     role TEXT NOT NULL CHECK(role IN ('admin', 'manager', 'user')),
                     is_active INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    password_changed_at TEXT,
+                    password_expires_at TEXT
                 )
-            """)
-            # 复制数据
-            cursor.execute("""
-                INSERT INTO user_accounts_new 
-                (id, username, password_hash, password_salt, password_plaintext, full_name, role, is_active, created_at, updated_at)
-                SELECT id, username, password_hash, password_salt, NULL, full_name, role, is_active, created_at, updated_at
-                FROM user_accounts
-            """)
-            # 删除旧表
-            cursor.execute("DROP TABLE user_accounts")
-            # 重命名新表
-            cursor.execute("ALTER TABLE user_accounts_new RENAME TO user_accounts")
-            # 重新创建触发器
-            cursor.execute("DROP TRIGGER IF EXISTS trg_user_accounts_updated")
-            cursor.execute("""
-                CREATE TRIGGER IF NOT EXISTS trg_user_accounts_updated
-                AFTER UPDATE ON user_accounts
-                FOR EACH ROW
-                BEGIN
-                    UPDATE user_accounts
-                    SET updated_at = CURRENT_TIMESTAMP
-                    WHERE id = NEW.id;
-                END;
-            """)
-            conn.commit()
-            logger.info("user_accounts table updated successfully")
-    else:
-        # 表不存在，创建新表
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS user_accounts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT NOT NULL UNIQUE,
-                password_hash TEXT NOT NULL,
-                password_salt TEXT NOT NULL,
-                password_plaintext TEXT,
-                full_name TEXT,
-                role TEXT NOT NULL CHECK(role IN ('admin', 'manager', 'user')),
-                is_active INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                password_changed_at TEXT,
-                password_expires_at TEXT
+                """
             )
-            """
-        )
-    
+
     # 检查并添加密码过期相关字段（如果表已存在但字段不存在）
-    cursor.execute("PRAGMA table_info(user_accounts)")
-    columns = [row[1] for row in cursor.fetchall()]
+    if is_postgres():
+        # PostgreSQL: 检查列是否存在
+        cursor.execute("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'user_accounts'
+        """)
+        columns = [row['column_name'] if isinstance(row, dict) else row[0] for row in cursor.fetchall()]
+    else:
+        # SQLite: 使用 PRAGMA
+        cursor.execute("PRAGMA table_info(user_accounts)")
+        columns = [row[1] for row in cursor.fetchall()]
     
     if 'password_changed_at' not in columns:
         logger.info("Adding password_changed_at column to user_accounts table...")
         cursor.execute("ALTER TABLE user_accounts ADD COLUMN password_changed_at TEXT")
         conn.commit()
-    
+
     if 'password_expires_at' not in columns:
         logger.info("Adding password_expires_at column to user_accounts table...")
         cursor.execute("ALTER TABLE user_accounts ADD COLUMN password_expires_at TEXT")
         conn.commit()
-    
-    if 'password_plaintext' not in columns:
-        logger.info("Adding password_plaintext column to user_accounts table...")
-        cursor.execute("ALTER TABLE user_accounts ADD COLUMN password_plaintext TEXT")
+
+    # 安全迁移：清空并移除历史明文密码列（若存在）
+    if 'password_plaintext' in columns:
+        logger.info("Security migration: clearing legacy password_plaintext values...")
+        cursor.execute("UPDATE user_accounts SET password_plaintext = NULL WHERE password_plaintext IS NOT NULL")
         conn.commit()
-    
+        try:
+            if is_postgres():
+                cursor.execute("ALTER TABLE user_accounts DROP COLUMN IF EXISTS password_plaintext")
+            else:
+                cursor.execute("ALTER TABLE user_accounts DROP COLUMN password_plaintext")
+            conn.commit()
+            logger.info("Dropped password_plaintext column from user_accounts.")
+        except Exception as e:
+            logger.warning("Could not drop password_plaintext column (legacy column may remain empty): %s", e)
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
     # 创建其他表和触发器（无论表是否已更新）
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS user_job_access (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            job_no TEXT NOT NULL,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(user_id, job_no),
-            FOREIGN KEY(user_id) REFERENCES user_accounts(id) ON DELETE CASCADE
-        )
-        """
-    )
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS user_sessions (
-            token TEXT PRIMARY KEY,
-            user_id INTEGER NOT NULL,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            expires_at TEXT NOT NULL,
-            FOREIGN KEY(user_id) REFERENCES user_accounts(id) ON DELETE CASCADE
-        )
-        """
-    )
-    cursor.execute(
-        """
-        CREATE TRIGGER IF NOT EXISTS trg_user_accounts_updated
-        AFTER UPDATE ON user_accounts
-        FOR EACH ROW
-        BEGIN
-            UPDATE user_accounts
-            SET updated_at = CURRENT_TIMESTAMP
-            WHERE id = NEW.id;
-        END;
-        """
-    )
-    
-    # 创建PDF_Status表（如果不存在）
-    cursor.execute("""
-        SELECT name FROM sqlite_master 
-        WHERE type='table' AND name='PDF_Status'
-    """)
-    pdf_status_exists = cursor.fetchone() is not None
-    
-    if not pdf_status_exists:
+    if is_postgres():
+        # PostgreSQL: 使用 GENERATED BY DEFAULT AS IDENTITY
         cursor.execute(
             """
-            CREATE TABLE PDF_Status (
-                Order_No INTEGER PRIMARY KEY,
-                pdf_status TEXT NOT NULL DEFAULT 'pending',
-                pdf_path TEXT,
-                generated_at TEXT,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            CREATE TABLE IF NOT EXISTS user_job_access (
+                id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                job_no TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                CONSTRAINT uq_user_job_access_user_job UNIQUE (user_id, job_no),
+                FOREIGN KEY(user_id) REFERENCES user_accounts(id) ON DELETE CASCADE
             )
             """
         )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_sessions (
+                token TEXT PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                expires_at TIMESTAMPTZ NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES user_accounts(id) ON DELETE CASCADE
+            )
+            """
+        )
+        # PostgreSQL: 使用函数和触发器更新 updated_at
+        cursor.execute("""
+            CREATE OR REPLACE FUNCTION update_updated_at_column()
+            RETURNS TRIGGER AS $$
+            BEGIN
+                NEW.updated_at = NOW();
+                RETURN NEW;
+            END;
+            $$ language 'plpgsql';
+        """)
+        cursor.execute("""
+            DROP TRIGGER IF EXISTS trg_user_accounts_updated ON user_accounts;
+            CREATE TRIGGER trg_user_accounts_updated
+            BEFORE UPDATE ON user_accounts
+            FOR EACH ROW
+            EXECUTE FUNCTION update_updated_at_column();
+        """)
+    else:
+        # SQLite: 使用 AUTOINCREMENT
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_job_access (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                job_no TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, job_no),
+                FOREIGN KEY(user_id) REFERENCES user_accounts(id) ON DELETE CASCADE
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_sessions (
+                token TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                expires_at TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES user_accounts(id) ON DELETE CASCADE
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_user_accounts_updated
+            AFTER UPDATE ON user_accounts
+            FOR EACH ROW
+            BEGIN
+                UPDATE user_accounts
+                SET updated_at = CURRENT_TIMESTAMP
+                WHERE id = NEW.id;
+            END;
+            """
+        )
+    
+    # 创建PDF_Status表（如果不存在）
+    if is_postgres():
+        # PostgreSQL: 使用 pg_tables 检查表是否存在（支持区分大小写的表名）
+        cursor.execute("""
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_tables
+                WHERE schemaname = 'public' AND tablename = 'PDF_Status'
+            ) AS exists
+        """)
+        row = cursor.fetchone()
+        pdf_status_exists = bool(row.get('exists') if isinstance(row, dict) else row[0]) if row else False
+    else:
+        cursor.execute("""
+            SELECT name FROM sqlite_master 
+            WHERE type='table' AND name='PDF_Status'
+        """)
+        pdf_status_exists = cursor.fetchone() is not None
+    
+    if not pdf_status_exists:
+        if is_postgres():
+            cursor.execute(
+                """
+                CREATE TABLE "PDF_Status" (
+                    "Order_No" BIGINT PRIMARY KEY,
+                    pdf_status TEXT NOT NULL DEFAULT 'pending',
+                    pdf_path TEXT,
+                    generated_at TIMESTAMPTZ,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+        else:
+            cursor.execute(
+                """
+                CREATE TABLE PDF_Status (
+                    Order_No INTEGER PRIMARY KEY,
+                    pdf_status TEXT NOT NULL DEFAULT 'pending',
+                    pdf_path TEXT,
+                    generated_at TEXT,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
         logger.info("PDF_Status table created successfully")
     else:
         logger.info("PDF_Status table already exists, skipping creation")
-    
+
     # 创建PDF_Status表的更新触发器（如果不存在则创建，如果存在则先删除再创建以确保最新）
-    cursor.execute("DROP TRIGGER IF EXISTS trg_pdf_status_updated")
-    cursor.execute(
-        """
-        CREATE TRIGGER trg_pdf_status_updated
-        AFTER UPDATE ON PDF_Status
-        FOR EACH ROW
-        BEGIN
-            UPDATE PDF_Status
-            SET updated_at = CURRENT_TIMESTAMP
-            WHERE Order_No = NEW.Order_No;
-        END;
-        """
-    )
+    if is_postgres():
+        cursor.execute('DROP TRIGGER IF EXISTS trg_pdf_status_updated ON "PDF_Status"')
+        cursor.execute(
+            """
+            CREATE TRIGGER trg_pdf_status_updated
+            BEFORE UPDATE ON "PDF_Status"
+            FOR EACH ROW
+            EXECUTE FUNCTION update_updated_at_column()
+            """
+        )
+    else:
+        cursor.execute("DROP TRIGGER IF EXISTS trg_pdf_status_updated")
+        cursor.execute(
+            """
+            CREATE TRIGGER trg_pdf_status_updated
+            AFTER UPDATE ON PDF_Status
+            FOR EACH ROW
+            BEGIN
+                UPDATE PDF_Status
+                SET updated_at = CURRENT_TIMESTAMP
+                WHERE Order_No = NEW.Order_No;
+            END;
+            """
+        )
     
     conn.commit()
 
     # 确保至少存在一个可用的管理员账户
-    cursor.execute("SELECT id FROM user_accounts WHERE username = ?", ('admin',))
+    from db_adapter import placeholders
+    cursor.execute(f"SELECT id FROM user_accounts WHERE username = {placeholders(1)}", ('admin',))
     existing_admin = cursor.fetchone()
     new_password = 'Vschk!8866'
     salt, password_hash = _generate_password_hash(new_password)
     
     if not existing_admin:
         cursor.execute(
-            """
+            f"""
             INSERT INTO user_accounts (username, password_hash, password_salt, full_name, role, is_active)
-            VALUES (?, ?, ?, ?, 'admin', 1)
+            VALUES ({placeholders(4)}, 'admin', 1)
             """,
             ('admin', password_hash, salt, 'System Administrator')
         )
-        cursor.execute(
-            "UPDATE user_accounts SET password_plaintext = ? WHERE username = 'admin'",
-            (new_password,)
-        )
         conn.commit()
-        logger.info(f"Created default admin account (username: admin, password: {new_password})")
+        logger.info("Created default admin account (username: admin). Set initial password via deployment procedure; hash stored only.")
     else:
-        # 更新现有 admin 账户的密码
-        cursor.execute(
-            """
+        # 更新现有 admin 账户的密码哈希（不存储或记录明文）
+        if is_postgres():
+            cursor.execute(
+                f"""
             UPDATE user_accounts 
-            SET password_hash = ?, password_salt = ?, password_plaintext = ?, updated_at = CURRENT_TIMESTAMP
+                SET password_hash = {placeholders(1)}, password_salt = {placeholders(1)}, updated_at = NOW()
+                WHERE username = 'admin'
+                """,
+                (password_hash, salt)
+            )
+        else:
+            cursor.execute(
+                f"""
+                UPDATE user_accounts 
+                SET password_hash = {placeholders(1)}, password_salt = {placeholders(1)}, updated_at = CURRENT_TIMESTAMP
             WHERE username = 'admin'
             """,
-            (password_hash, salt, new_password)
+                (password_hash, salt)
         )
         conn.commit()
-        logger.info(f"Updated admin account password to: {new_password}")
+        logger.info("Updated default admin credentials (password hash only).")
     conn.close()
 
 
 def _fetch_user(conn, *, username=None, user_id=None):
     cursor = conn.cursor()
     if username is not None:
-        cursor.execute("SELECT * FROM user_accounts WHERE username = ?", (username,))
+        cursor.execute(f"SELECT * FROM user_accounts WHERE username = {db_placeholders(1)}", (username,))
     else:
-        cursor.execute("SELECT * FROM user_accounts WHERE id = ?", (user_id,))
+        cursor.execute(f"SELECT * FROM user_accounts WHERE id = {db_placeholders(1)}", (user_id,))
     return _row_to_dict(cursor.fetchone())
 
 
 def _fetch_user_job_nos(conn, user_id):
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT job_no FROM user_job_access WHERE user_id = ? ORDER BY job_no",
+        f"SELECT job_no FROM user_job_access WHERE user_id = {db_placeholders(1)} ORDER BY job_no",
         (user_id,)
     )
     return [row['job_no'] for row in cursor.fetchall()]
@@ -752,12 +1206,18 @@ def _fetch_user_job_nos(conn, user_id):
 
 def _replace_user_job_nos(conn, user_id, job_nos):
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM user_job_access WHERE user_id = ?", (user_id,))
+    cursor.execute(f"DELETE FROM user_job_access WHERE user_id = {db_placeholders(1)}", (user_id,))
     for job_no in _normalize_job_numbers(job_nos):
-        cursor.execute(
-            "INSERT OR IGNORE INTO user_job_access (user_id, job_no) VALUES (?, ?)",
-            (user_id, job_no)
-        )
+        if is_postgres():
+            cursor.execute(
+                f"INSERT INTO user_job_access (user_id, job_no) VALUES ({db_placeholders(2)}) ON CONFLICT DO NOTHING",
+                (user_id, job_no)
+            )
+        else:
+            cursor.execute(
+                f"INSERT OR IGNORE INTO user_job_access (user_id, job_no) VALUES ({db_placeholders(2)})",
+                (user_id, job_no)
+            )
 
 
 def _create_session(user_id):
@@ -767,11 +1227,11 @@ def _create_session(user_id):
     conn = get_db_connection()
     cursor = conn.cursor()
     # 清理该用户旧的会话
-    cursor.execute("DELETE FROM user_sessions WHERE user_id = ?", (user_id,))
+    cursor.execute(f"DELETE FROM user_sessions WHERE user_id = {db_placeholders(1)}", (user_id,))
     cursor.execute(
-        """
+        f"""
         INSERT INTO user_sessions (token, user_id, expires_at)
-        VALUES (?, ?, ?)
+        VALUES ({db_placeholders(3)})
         """,
         (token, user_id, expires_at)
     )
@@ -785,7 +1245,7 @@ def _delete_session(token):
         return
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM user_sessions WHERE token = ?", (token,))
+    cursor.execute(f"DELETE FROM user_sessions WHERE token = {db_placeholders(1)}", (token,))
     conn.commit()
     conn.close()
 
@@ -796,7 +1256,7 @@ def _get_session(token):
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT token, user_id, expires_at FROM user_sessions WHERE token = ?",
+        f"SELECT token, user_id, expires_at FROM user_sessions WHERE token = {db_placeholders(1)}",
         (token,)
     )
     row = cursor.fetchone()
@@ -805,20 +1265,28 @@ def _get_session(token):
         return None
     expires_at = row['expires_at']
     try:
-        # 处理时区：如果字符串以 'Z' 结尾，替换为 '+00:00'；如果没有时区信息，假设为 UTC
-        if expires_at.endswith('Z'):
-            expires_at_parsed = expires_at.replace('Z', '+00:00')
-        elif '+' in expires_at or expires_at.count('-') > 2:  # 已有时区信息
-            expires_at_parsed = expires_at
+        # PostgreSQL 可能返回 datetime 对象，SQLite 返回字符串
+        if isinstance(expires_at, datetime):
+            # 已经是 datetime 对象
+            expires = expires_at
         else:
-            # 没有时区信息，假设为 UTC
-            expires_at_parsed = expires_at + '+00:00'
+            # 字符串格式，需要解析
+            expires_at_str = str(expires_at)
+            # 处理时区：如果字符串以 'Z' 结尾，替换为 '+00:00'；如果没有时区信息，假设为 UTC
+            if expires_at_str.endswith('Z'):
+                expires_at_parsed = expires_at_str.replace('Z', '+00:00')
+            elif '+' in expires_at_str or expires_at_str.count('-') > 2:  # 已有时区信息
+                expires_at_parsed = expires_at_str
+            else:
+                # 没有时区信息，假设为 UTC
+                expires_at_parsed = expires_at_str + '+00:00'
+            
+            expires = datetime.fromisoformat(expires_at_parsed)
         
-        expires = datetime.fromisoformat(expires_at_parsed)
         # 转换为 naive datetime (UTC) 以便比较
         if expires.tzinfo:
             expires = expires.replace(tzinfo=None)
-    except (ValueError, AttributeError) as e:
+    except (ValueError, AttributeError, TypeError) as e:
         logger.warning(f"解析会话过期时间失败: {expires_at}, 错误: {e}")
         expires = datetime.utcnow()
     
@@ -826,7 +1294,7 @@ def _get_session(token):
     now_utc = datetime.utcnow()
     if expires < now_utc:
         logger.info(f"会话已过期: token={token[:8]}..., expires={expires_at}, now={now_utc.isoformat()}")
-        cursor.execute("DELETE FROM user_sessions WHERE token = ?", (token,))
+        cursor.execute(f"DELETE FROM user_sessions WHERE token = {db_placeholders(1)}", (token,))
         conn.commit()
         conn.close()
         return None
@@ -841,13 +1309,19 @@ def _get_session(token):
 
 
 def _resolve_token_from_request():
+    """
+    仅从 HTTP 头读取会话 token（M4：禁止 URL ?token=，避免进入历史、代理日志与 Referer）。
+    顺序：Authorization: Bearer <token>，其次 X-Auth-Token。
+    """
     auth_header = request.headers.get('Authorization')
     if isinstance(auth_header, str) and auth_header.lower().startswith('bearer '):
-        return auth_header.split(' ', 1)[1].strip()
+        t = auth_header.split(' ', 1)[1].strip()
+        return t or None
     token = request.headers.get('X-Auth-Token')
     if token:
-        return token.strip()
-    return request.args.get('token')
+        t = token.strip()
+        return t or None
+    return None
 
 
 def get_current_user(optional=False):
@@ -906,35 +1380,51 @@ def require_auth(role=None):
 
 def _ensure_file_index_tables():
     """确保文件索引缓存表存在"""
+    from db_adapter import is_postgres
     conn = get_db_connection()
     cursor = conn.cursor()
     
     # 检查 file_index_cache 表是否存在
-    cursor.execute("""
-        SELECT name FROM sqlite_master 
-        WHERE type='table' AND name='file_index_cache'
-    """)
-    cache_table_exists = cursor.fetchone() is not None
+    cache_table_exists = _table_exists(cursor, 'file_index_cache')
     
     if not cache_table_exists:
         # 创建 file_index_cache 表
-        cursor.execute("""
-            CREATE TABLE file_index_cache (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                file_path TEXT NOT NULL UNIQUE,
-                file_name TEXT NOT NULL,
-                folder_path TEXT NOT NULL,
-                folder_type TEXT NOT NULL CHECK(folder_type IN ('Stockist Cert', 'Private Formal', 'Private Prelim', 'IAT Formal', 'IAT Prelim')),
-                file_size INTEGER,
-                modified_time REAL,
-                created_time TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                last_checked TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                extracted_keywords TEXT,
-                identifiers TEXT,
-                file_hash TEXT,
-                is_deleted INTEGER NOT NULL DEFAULT 0
-            )
-        """)
+        if is_postgres():
+            cursor.execute("""
+                CREATE TABLE file_index_cache (
+                    id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                    file_path TEXT NOT NULL UNIQUE,
+                    file_name TEXT NOT NULL,
+                    folder_path TEXT NOT NULL,
+                    folder_type TEXT NOT NULL CHECK(folder_type IN ('Stockist Cert', 'Private Formal', 'Private Prelim', 'IAT Formal', 'IAT Prelim')),
+                    file_size BIGINT,
+                    modified_time DOUBLE PRECISION,
+                    created_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    last_checked TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    extracted_keywords TEXT,
+                    identifiers TEXT,
+                    file_hash TEXT,
+                    is_deleted BOOLEAN NOT NULL DEFAULT FALSE
+                )
+            """)
+        else:
+            cursor.execute("""
+                CREATE TABLE file_index_cache (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    file_path TEXT NOT NULL UNIQUE,
+                    file_name TEXT NOT NULL,
+                    folder_path TEXT NOT NULL,
+                    folder_type TEXT NOT NULL CHECK(folder_type IN ('Stockist Cert', 'Private Formal', 'Private Prelim', 'IAT Formal', 'IAT Prelim')),
+                    file_size INTEGER,
+                    modified_time REAL,
+                    created_time TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    last_checked TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    extracted_keywords TEXT,
+                    identifiers TEXT,
+                    file_hash TEXT,
+                    is_deleted INTEGER NOT NULL DEFAULT 0
+                )
+            """)
         
         # 创建索引
         # 唯一索引：file_path
@@ -972,9 +1462,19 @@ def _ensure_file_index_tables():
     else:
         logger.info("file_index_cache table already exists, skipping creation")
         # 检查是否存在 identifiers 列，如果不存在则添加
-        cursor.execute("PRAGMA table_info(file_index_cache)")
-        columns = [row[1] for row in cursor.fetchall()]
-        if 'identifiers' not in columns:
+        if is_postgres():
+            cursor.execute("""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'file_index_cache' AND column_name = 'identifiers'
+            """)
+            has_identifiers = cursor.fetchone() is not None
+        else:
+            cursor.execute("PRAGMA table_info(file_index_cache)")
+            columns = [row[1] for row in cursor.fetchall()]
+            has_identifiers = 'identifiers' in columns
+        
+        if not has_identifiers:
             try:
                 cursor.execute("ALTER TABLE file_index_cache ADD COLUMN identifiers TEXT")
                 conn.commit()
@@ -983,37 +1483,50 @@ def _ensure_file_index_tables():
                 logger.warning(f"Failed to add 'identifiers' column: {e}")
         
         # 为 identifiers 列创建索引（用于快速查询）
-        cursor.execute("""
-            SELECT name FROM sqlite_master 
-            WHERE type='index' AND name='idx_file_index_cache_identifiers'
-        """)
+        from db_adapter import is_postgres
+        if is_postgres():
+            cursor.execute("""
+                SELECT indexname
+                FROM pg_indexes
+                WHERE schemaname = 'public' AND tablename = 'file_index_cache' AND indexname = 'idx_file_index_cache_identifiers'
+            """)
+        else:
+            cursor.execute("""
+                SELECT name FROM sqlite_master 
+                WHERE type='index' AND name='idx_file_index_cache_identifiers'
+            """)
         if cursor.fetchone() is None:
             try:
                 cursor.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_file_index_cache_identifiers 
-                    ON file_index_cache(identifiers)
-                """)
+                CREATE INDEX IF NOT EXISTS idx_file_index_cache_identifiers 
+                ON file_index_cache(identifiers)
+            """)
                 conn.commit()
                 logger.info("Created index on 'identifiers' column")
             except Exception as e:
                 logger.warning(f"Failed to create index on 'identifiers' column: {e}")
     
     # 检查 file_index_metadata 表是否存在
-    cursor.execute("""
-        SELECT name FROM sqlite_master 
-        WHERE type='table' AND name='file_index_metadata'
-    """)
-    metadata_table_exists = cursor.fetchone() is not None
+    metadata_table_exists = _table_exists(cursor, 'file_index_metadata')
     
     if not metadata_table_exists:
         # 创建 file_index_metadata 表
-        cursor.execute("""
-            CREATE TABLE file_index_metadata (
-                key TEXT PRIMARY KEY,
-                value TEXT,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
+        if is_postgres():
+            cursor.execute("""
+                CREATE TABLE file_index_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+        else:
+            cursor.execute("""
+                CREATE TABLE file_index_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
         
         # 初始化默认元数据
         default_metadata = [
@@ -1023,9 +1536,11 @@ def _ensure_file_index_tables():
             ('scan_status', 'idle')
         ]
         
-        cursor.executemany("""
-            INSERT INTO file_index_metadata (key, value) 
-            VALUES (?, ?)
+        from db_adapter import placeholders
+        placeholders_str = placeholders(2)
+        cursor.executemany(f"""
+                INSERT INTO file_index_metadata (key, value) 
+            VALUES ({placeholders_str})
         """, default_metadata)
         
         conn.commit()
@@ -1042,34 +1557,52 @@ def _ensure_download_tasks_table():
     cursor = conn.cursor()
     
     # 检查表是否存在
-    cursor.execute("""
-        SELECT name FROM sqlite_master 
-        WHERE type='table' AND name='download_tasks'
-    """)
-    table_exists = cursor.fetchone() is not None
+    table_exists = _table_exists(cursor, 'download_tasks')
     
     if not table_exists:
         # 创建 download_tasks 表
-        cursor.execute("""
-            CREATE TABLE download_tasks (
-                task_id TEXT PRIMARY KEY,
-                user_id INTEGER NOT NULL,
-                task_type TEXT NOT NULL,
-                request_params TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                progress INTEGER DEFAULT 0,
-                total_files INTEGER DEFAULT 0,
-                processed_files INTEGER DEFAULT 0,
-                zip_path TEXT,
-                zip_size INTEGER,
-                error_message TEXT,
-                warning_message TEXT,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                started_at TEXT,
-                completed_at TEXT,
-                expires_at TEXT
-            )
-        """)
+        if is_postgres():
+            cursor.execute("""
+                CREATE TABLE download_tasks (
+                    task_id TEXT PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    task_type TEXT NOT NULL,
+                    request_params JSONB NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    progress INTEGER NOT NULL DEFAULT 0,
+                    total_files INTEGER NOT NULL DEFAULT 0,
+                    processed_files INTEGER NOT NULL DEFAULT 0,
+                    zip_path TEXT,
+                    zip_size BIGINT,
+                    error_message TEXT,
+                    warning_message TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    started_at TIMESTAMPTZ,
+                    completed_at TIMESTAMPTZ,
+                    expires_at TIMESTAMPTZ
+                )
+            """)
+        else:
+            cursor.execute("""
+                CREATE TABLE download_tasks (
+                    task_id TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    task_type TEXT NOT NULL,
+                    request_params TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    progress INTEGER DEFAULT 0,
+                    total_files INTEGER DEFAULT 0,
+                    processed_files INTEGER DEFAULT 0,
+                    zip_path TEXT,
+                    zip_size INTEGER,
+                    error_message TEXT,
+                    warning_message TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    started_at TEXT,
+                    completed_at TEXT,
+                    expires_at TEXT
+                )
+            """)
         
         # 创建索引
         cursor.execute("""
@@ -1092,8 +1625,16 @@ def _ensure_download_tasks_table():
     else:
         logger.info("download_tasks table already exists, skipping creation")
         # 向后兼容：旧表增加 warning_message 字段
-        cursor.execute("PRAGMA table_info(download_tasks)")
-        existing_columns = {row[1] for row in cursor.fetchall()}
+        if is_postgres():
+            cursor.execute("""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'download_tasks'
+            """)
+            existing_columns = {row['column_name'] if isinstance(row, dict) else row[0] for row in cursor.fetchall()}
+        else:
+            cursor.execute("PRAGMA table_info(download_tasks)")
+            existing_columns = {row[1] for row in cursor.fetchall()}
         if 'warning_message' not in existing_columns:
             cursor.execute("ALTER TABLE download_tasks ADD COLUMN warning_message TEXT")
             conn.commit()
@@ -1108,30 +1649,44 @@ def _ensure_pdf_tasks_table():
     cursor = conn.cursor()
     
     # 检查表是否存在
-    cursor.execute("""
-        SELECT name FROM sqlite_master 
-        WHERE type='table' AND name='pdf_tasks'
-    """)
-    table_exists = cursor.fetchone() is not None
+    table_exists = _table_exists(cursor, 'pdf_tasks')
     
     if not table_exists:
         # 创建 pdf_tasks 表
-        cursor.execute("""
-            CREATE TABLE pdf_tasks (
-                task_id TEXT PRIMARY KEY,
-                user_id INTEGER NOT NULL,
-                order_no INTEGER NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                progress INTEGER DEFAULT 0,
-                message TEXT,
-                pdf_path TEXT,
-                error_message TEXT,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                started_at TEXT,
-                completed_at TEXT,
-                expires_at TEXT
-            )
-        """)
+        if is_postgres():
+            cursor.execute("""
+                CREATE TABLE pdf_tasks (
+                    task_id TEXT PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    order_no INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    progress INTEGER NOT NULL DEFAULT 0,
+                    message TEXT,
+                    pdf_path TEXT,
+                    error_message TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    started_at TIMESTAMPTZ,
+                    completed_at TIMESTAMPTZ,
+                    expires_at TIMESTAMPTZ
+                )
+            """)
+        else:
+            cursor.execute("""
+                CREATE TABLE pdf_tasks (
+                    task_id TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    order_no INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    progress INTEGER DEFAULT 0,
+                    message TEXT,
+                    pdf_path TEXT,
+                    error_message TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    started_at TEXT,
+                    completed_at TEXT,
+                    expires_at TEXT
+                )
+            """)
         
         # 创建索引
         cursor.execute("""
@@ -1180,16 +1735,37 @@ _ensure_pdf_tasks_table()
 
 def check_pdf_status_table_exists(conn):
     """检查PDF_Status表是否存在"""
+    """检查 PDF_Status 表是否存在（支持 SQLite 和 PostgreSQL）"""
     try:
+        from db_adapter import is_postgres
         cursor = conn.cursor()
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='PDF_Status'")
-        return cursor.fetchone() is not None
+        if is_postgres():
+            # PostgreSQL: 使用 information_schema
+            cursor.execute("""
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name = %s
+                ) AS exists
+            """, ('PDF_Status',))
+        else:
+            # SQLite: 使用 sqlite_master
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='PDF_Status'")
+        row = cursor.fetchone()
+        if is_postgres():
+            # PostgreSQL 返回 dict_row
+            if isinstance(row, dict):
+                return bool(row.get('exists'))
+            return bool(row[0]) if row else False
+        else:
+            # SQLite 返回 Row 或 tuple
+            return row is not None
     except:
         return False
 
 
 @app.route('/api/auth/login', methods=['POST'])
-@limiter.limit("5 per minute") if limiter else (lambda f: f)
+@_route_limit(RATE_LIMIT_LOGIN)
 def login():
     """登录并获取会话令牌"""
     request_id = request.headers.get('X-Request-ID') or str(uuid.uuid4())
@@ -1370,7 +1946,6 @@ def _list_users_from_db():
             'name': row_dict.get('full_name') or '',
             'role': row_dict['role'],
             'active': bool(row_dict.get('is_active')),
-            'current_password': row_dict.get('password_plaintext') or '',
             'job_nos': job_nos,
             'created_at': row_dict.get('created_at'),
             'updated_at': row_dict.get('updated_at'),
@@ -1407,7 +1982,7 @@ def list_users():
 
 @app.route('/api/admin/users', methods=['POST'])
 @require_auth('admin')
-@limiter.limit("10 per hour") if limiter else (lambda f: f)
+@_route_limit(RATE_LIMIT_ADMIN_CREATE_USER)
 def create_user():
     """管理员：新增普通账号"""
     data = request.get_json(silent=True) or {}
@@ -1425,7 +2000,7 @@ def create_user():
 
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT 1 FROM user_accounts WHERE username = ?", (username,))
+    cursor.execute(f"SELECT 1 FROM user_accounts WHERE username = {db_placeholders(1)}", (username,))
     if cursor.fetchone():
         conn.close()
         return jsonify({'success': False, 'error': 'Username already exists'}), 409
@@ -1447,14 +2022,24 @@ def create_user():
     if role in ('user', 'manager'):
         password_expires_at = (now + timedelta(days=PASSWORD_EXPIRY_DAYS)).isoformat()
     
-    cursor.execute(
-        """
-        INSERT INTO user_accounts (username, password_hash, password_salt, password_plaintext, full_name, role, is_active, password_changed_at, password_expires_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (username, password_hash, salt, password, full_name, role, 1 if active else 0, password_changed_at, password_expires_at)
-    )
-    user_id = cursor.lastrowid
+    is_active_val = bool(active) if is_postgres() else (1 if active else 0)
+    insert_sql = f"""
+        INSERT INTO user_accounts (username, password_hash, password_salt, full_name, role, is_active, password_changed_at, password_expires_at)
+        VALUES ({db_placeholders(8)})
+    """
+    if is_postgres():
+        cursor.execute(
+            insert_sql + " RETURNING id",
+            (username, password_hash, salt, full_name, role, is_active_val, password_changed_at, password_expires_at),
+        )
+        ret = cursor.fetchone()
+        user_id = ret["id"] if isinstance(ret, dict) else ret[0]
+    else:
+        cursor.execute(
+            insert_sql,
+            (username, password_hash, salt, full_name, role, is_active_val, password_changed_at, password_expires_at),
+        )
+        user_id = cursor.lastrowid
     # 只有user角色需要Job No，manager不需要
     if role == 'user' and job_nos:
         _replace_user_job_nos(conn, user_id, job_nos)
@@ -1476,7 +2061,6 @@ def create_user():
             'name': new_user.get('full_name') or '',
             'role': new_user['role'],
             'active': bool(new_user.get('is_active')),
-            'current_password': new_user.get('password_plaintext') or '',
             'job_nos': assigned_jobs,
             'created_at': new_user.get('created_at'),
             'updated_at': new_user.get('updated_at'),
@@ -1505,9 +2089,10 @@ def update_user(username):
     updates = []
     params = []
 
+    ph = sql_placeholder()
     if 'name' in data:
         full_name = (data.get('name') or '').strip()
-        updates.append("full_name = ?")
+        updates.append(f"full_name = {ph}")
         params.append(full_name if full_name else None)
 
     if 'active' in data:
@@ -1515,37 +2100,38 @@ def update_user(username):
         if user['username'] == 'admin' and not desired_active:
             conn.close()
             return jsonify({'success': False, 'error': 'Administrator account cannot be disabled'}), 400
-        updates.append("is_active = ?")
-        params.append(1 if desired_active else 0)
+        updates.append(f"is_active = {ph}")
+        params.append(desired_active if is_postgres() else (1 if desired_active else 0))
 
     password = data.get('password')
     if password:
         salt, password_hash = _generate_password_hash(password)
-        updates.append("password_hash = ?")
+        updates.append(f"password_hash = {ph}")
         params.append(password_hash)
-        updates.append("password_salt = ?")
+        updates.append(f"password_salt = {ph}")
         params.append(salt)
-        updates.append("password_plaintext = ?")
-        params.append(password)
         # 更新密码时，设置新的过期时间（仅对普通用户和manager）
         now = datetime.now()
         password_changed_at = now.isoformat()
-        updates.append("password_changed_at = ?")
+        updates.append(f"password_changed_at = {ph}")
         params.append(password_changed_at)
         if user['role'] in ('user', 'manager'):
             password_expires_at = (now + timedelta(days=PASSWORD_EXPIRY_DAYS)).isoformat()
-            updates.append("password_expires_at = ?")
+            updates.append(f"password_expires_at = {ph}")
             params.append(password_expires_at)
         else:
             # admin账户密码不过期
-            updates.append("password_expires_at = ?")
+            updates.append(f"password_expires_at = {ph}")
             params.append(None)
 
     if updates:
-        updates.append("updated_at = CURRENT_TIMESTAMP")
+        if is_postgres():
+            updates.append("updated_at = NOW()")
+        else:
+            updates.append("updated_at = CURRENT_TIMESTAMP")
         params.append(username)
         cursor.execute(
-            f"UPDATE user_accounts SET {', '.join(updates)} WHERE username = ?",
+            f"UPDATE user_accounts SET {', '.join(updates)} WHERE username = {ph}",
             params
         )
 
@@ -1571,7 +2157,6 @@ def update_user(username):
             'name': refreshed.get('full_name') or '',
             'role': refreshed['role'],
             'active': bool(refreshed.get('is_active')),
-            'current_password': refreshed.get('password_plaintext') or '',
             'job_nos': job_nos,
             'created_at': refreshed.get('created_at'),
             'updated_at': refreshed.get('updated_at'),
@@ -1598,7 +2183,7 @@ def delete_user(username):
 
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT id, role FROM user_accounts WHERE username = ?", (username,))
+    cursor.execute(f"SELECT id, role FROM user_accounts WHERE username = {db_placeholders(1)}", (username,))
     row = cursor.fetchone()
     if not row:
         conn.close()
@@ -1609,7 +2194,7 @@ def delete_user(username):
         conn.close()
         return jsonify({'success': False, 'error': 'Administrator account cannot be deleted'}), 400
 
-    cursor.execute("DELETE FROM user_accounts WHERE id = ?", (row['id'],))
+    cursor.execute(f"DELETE FROM user_accounts WHERE id = {db_placeholders(1)}", (row['id'],))
     conn.commit()
     conn.close()
     
@@ -1623,7 +2208,7 @@ def delete_user(username):
 
 @app.route('/api/admin/users/<username>/reset-password', methods=['POST'])
 @require_auth('admin')
-@limiter.limit("3 per hour") if limiter else (lambda f: f)
+@_route_limit(RATE_LIMIT_ADMIN_RESET_PASSWORD)
 def reset_user_password(username):
     """管理员：重置用户密码（自动生成10位强密码）"""
     username = (username or '').strip()
@@ -1651,13 +2236,15 @@ def reset_user_password(username):
     else:
         password_expires_at = None
     
+    ph = sql_placeholder()
+    ts = "NOW()" if is_postgres() else "CURRENT_TIMESTAMP"
     cursor.execute(
-        """
+        f"""
         UPDATE user_accounts 
-        SET password_hash = ?, password_salt = ?, password_plaintext = ?, password_changed_at = ?, password_expires_at = ?, updated_at = CURRENT_TIMESTAMP
-        WHERE username = ?
+        SET password_hash = {ph}, password_salt = {ph}, password_changed_at = {ph}, password_expires_at = {ph}, updated_at = {ts}
+        WHERE username = {ph}
         """,
-        (password_hash, salt, new_password, password_changed_at, password_expires_at, username)
+        (password_hash, salt, password_changed_at, password_expires_at, username)
     )
     
     conn.commit()
@@ -1681,8 +2268,8 @@ def regenerate_orders_gen_pdf():
         cursor = conn.cursor()
         
         # 检查TR_Fill_in表是否存在
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='TR_Fill_in'")
-        if cursor.fetchone() is None:
+        from db_adapter import is_postgres
+        if not _table_exists(cursor, 'TR_Fill_in'):
             logger.warning("TR_Fill_in表不存在，跳过Orders_gen_pdf更新")
             conn.close()
             return {'success': False, 'reason': 'TR_Fill_in表不存在'}
@@ -1698,13 +2285,12 @@ def regenerate_orders_gen_pdf():
             return {'success': True, 'reason': 'TR_Fill_in表为空，已清空Orders_gen_pdf表', 'count': 0}
         
         # 检查orders_com表是否存在
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='orders_com'")
-        if cursor.fetchone() is None:
+        if not _table_exists(cursor, 'orders_com'):
             logger.warning("orders_com表不存在，跳过Orders_gen_pdf更新")
             conn.close()
             return {'success': False, 'reason': 'orders_com表不存在'}
         
-        print(f"[INFO] 开始重新生成Orders_gen_pdf表，TR_Fill_in有 {tr_fill_in_count} 条记录")
+        logger.info(f"开始重新生成Orders_gen_pdf表，TR_Fill_in有 {tr_fill_in_count} 条记录")
         
         # 删除已存在的表
         cursor.execute("DROP TABLE IF EXISTS Orders_gen_pdf")
@@ -1746,7 +2332,7 @@ def regenerate_orders_gen_pdf():
         cursor.execute("SELECT COUNT(*) FROM Orders_gen_pdf")
         count = cursor.fetchone()[0]
         
-        print(f"[OK] Orders_gen_pdf表重新生成成功: {count} 行")
+        logger.info(f"Orders_gen_pdf表重新生成成功: {count} 行")
         conn.close()
         
         return {'success': True, 'count': count}
@@ -1759,7 +2345,7 @@ def regenerate_orders_gen_pdf():
             conn.close()
         except:
             pass
-        return {'success': False, 'error': str(e)}
+        return {'success': False, 'error': _safe_error_message(e)}
 
 
 @app.route('/api/tr-fill-in/data', methods=['GET'])
@@ -1785,7 +2371,7 @@ def get_all_data():
     except Exception as e:
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': _safe_error_message(e)
         }), 500
 
 
@@ -1866,7 +2452,7 @@ def save_data():
         
         # 如果成功插入新记录，触发Orders_gen_pdf表的更新
         if inserted_count > 0:
-            print(f"[INFO] TR_Fill_in表已更新（新增{inserted_count}条记录），开始同步Orders_gen_pdf表...")
+            logger.info(f"TR_Fill_in表已更新（新增{inserted_count}条记录），开始同步Orders_gen_pdf表...")
             regenerate_result = regenerate_orders_gen_pdf()
             if regenerate_result['success']:
                 logger.info(f"Orders_gen_pdf表同步成功，当前记录数: {regenerate_result.get('count', 0)}")
@@ -1883,7 +2469,7 @@ def save_data():
     except Exception as e:
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': _safe_error_message(e)
         }), 500
 
 
@@ -1916,7 +2502,7 @@ def delete_data():
         
         # 如果成功删除记录，触发Orders_gen_pdf表的更新
         if deleted_count > 0:
-            print(f"[INFO] TR_Fill_in表已更新（删除{deleted_count}条记录），开始同步Orders_gen_pdf表...")
+            logger.info(f"TR_Fill_in表已更新（删除{deleted_count}条记录），开始同步Orders_gen_pdf表...")
             regenerate_result = regenerate_orders_gen_pdf()
             if regenerate_result['success']:
                 logger.info(f"Orders_gen_pdf表同步成功，当前记录数: {regenerate_result.get('count', 0)}")
@@ -1936,7 +2522,7 @@ def delete_data():
     except Exception as e:
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': _safe_error_message(e)
         }), 500
 
 
@@ -1951,12 +2537,12 @@ def clear_data():
         conn.close()
         
         # 清空TR_Fill_in表后，触发Orders_gen_pdf表的更新（会清空Orders_gen_pdf表）
-        print(f"[INFO] TR_Fill_in表已清空，开始同步Orders_gen_pdf表...")
+        logger.info("TR_Fill_in表已清空，开始同步Orders_gen_pdf表...")
         regenerate_result = regenerate_orders_gen_pdf()
         if regenerate_result['success']:
-            print(f"[OK] Orders_gen_pdf表同步成功，当前记录数: {regenerate_result.get('count', 0)}")
+            logger.info(f"Orders_gen_pdf表同步成功，当前记录数: {regenerate_result.get('count', 0)}")
         else:
-            print(f"[WARNING] Orders_gen_pdf表同步失败: {regenerate_result.get('error', '未知错误')}")
+            logger.warning(f"Orders_gen_pdf表同步失败: {regenerate_result.get('error', '未知错误')}")
         
         # 清除訂單列表緩存（數據已更新）
         cache.delete('orders:list:*')
@@ -1970,7 +2556,7 @@ def clear_data():
     except Exception as e:
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': _safe_error_message(e)
         }), 500
 
 
@@ -2029,7 +2615,7 @@ def update_data():
         
         # 如果成功更新记录，触发Orders_gen_pdf表的更新
         if updated_count > 0:
-            print(f"[INFO] TR_Fill_in表已更新（更新{updated_count}条记录），开始同步Orders_gen_pdf表...")
+            logger.info(f"TR_Fill_in表已更新（更新{updated_count}条记录），开始同步Orders_gen_pdf表...")
             regenerate_result = regenerate_orders_gen_pdf()
             if regenerate_result['success']:
                 logger.info(f"Orders_gen_pdf表同步成功，当前记录数: {regenerate_result.get('count', 0)}")
@@ -2049,18 +2635,19 @@ def update_data():
     except Exception as e:
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': _safe_error_message(e)
         }), 500
 
 
 @app.route('/api/orders-gen-pdf/regenerate', methods=['POST'])
+@_route_limit(RATE_LIMIT_SYSTEM_POST)
 def regenerate_orders_gen_pdf_endpoint():
     """
     手动触发Orders_gen_pdf表的重新生成
     用于手动同步或批量修改后的同步
     """
     try:
-        print("[INFO] 收到手动触发Orders_gen_pdf表重新生成的请求")
+        logger.info("收到手动触发Orders_gen_pdf表重新生成的请求")
         result = regenerate_orders_gen_pdf()
         
         if result['success']:
@@ -2081,7 +2668,7 @@ def regenerate_orders_gen_pdf_endpoint():
         traceback.print_exc()
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': _safe_error_message(e)
         }), 500
 
 
@@ -2103,29 +2690,43 @@ def search_material(tag_no):
         
         # 调试：打印实际使用的数据库路径
         if DEBUG_MODE:
-            print(f"[DEBUG] Using database: {DB_PATH}")
-            print(f"[DEBUG] Database exists: {os.path.exists(DB_PATH)}")
+            logger.debug(f"Using database: {DB_PATH}")
+            logger.debug(f"Database exists: {os.path.exists(DB_PATH)}")
         
         conn = get_db_connection()
         cursor = conn.cursor()
         
         # 检查表是否存在
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='materials_com'")
-        table_exists = cursor.fetchone() is not None
+        from db_adapter import is_postgres
+        table_exists = _table_exists(cursor, 'materials_com')
         
         if not table_exists:
             # 列出所有表以便调试
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-            all_tables = [row[0] for row in cursor.fetchall()]
+            if is_postgres():
+                cursor.execute("""
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema = 'public'
+                    ORDER BY table_name
+                """)
+                all_tables = [row['table_name'] if isinstance(row, dict) else row[0] for row in cursor.fetchall()]
+            else:
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+                all_tables = [row[0] for row in cursor.fetchall()]
             error_msg = f"Table 'materials_com' does not exist in database. Available tables: {', '.join(all_tables)}"
             logger.error(error_msg)
             logger.error(f"Database path: {DB_PATH}")
             conn.close()
+            if DEBUG_MODE:
+                return jsonify({
+                    'found': False,
+                    'error': error_msg,
+                    'database_path': DB_PATH,
+                    'available_tables': all_tables,
+                }), 500
             return jsonify({
                 'found': False,
-                'error': error_msg,
-                'database_path': DB_PATH,
-                'available_tables': all_tables
+                'error': '材料数据暂不可用，请稍后重试或联系管理员',
             }), 500
         
         # 尝试将tag_no转换为整数（因为Tag_No在数据库中是INTEGER类型）
@@ -2161,8 +2762,8 @@ def search_material(tag_no):
         
         # 调试日志（仅在DEBUG模式下）
         if DEBUG_MODE:
-            print(f"[DEBUG] Searching Tag_No: {tag_no} (as int: {tag_no_int})")
-            print(f"[DEBUG] Query returned: {row is not None}")
+            logger.debug(f"Searching Tag_No: {tag_no} (as int: {tag_no_int})")
+            logger.debug(f"Query returned: {row is not None}")
         
         if row:
             # 将Row对象转换为字典
@@ -2209,12 +2810,10 @@ def search_material(tag_no):
             return jsonify(result)
             
     except Exception as e:
-        import traceback
-        error_msg = str(e)
-        traceback.print_exc()
+        logger.error("材料搜索失败: %s", e, exc_info=True)
         return jsonify({
             'found': False,
-            'error': error_msg
+            'error': _safe_error_message(e),
         }), 500
 
 
@@ -2230,6 +2829,9 @@ def get_bbs_dd_list(page, per_page_param, order_no, job_no, dn_no, start_date, e
         # 检查PDF_Status表是否存在
         pdf_status_exists = check_pdf_status_table_exists(conn)
         
+        # PostgreSQL 表名需要引号包裹
+        table_pdf = '"PDF_Status"' if is_postgres() else 'PDF_Status'
+        
         # 构建WHERE子句（优化：减少 CAST 操作）
         where_conditions = []
         params = []
@@ -2238,50 +2840,95 @@ def get_bbs_dd_list(page, per_page_param, order_no, job_no, dn_no, start_date, e
             # 优化：尝试使用数值比较，避免 CAST
             try:
                 order_no_int = int(order_no)
-                where_conditions.append("b.bbs_no = ?")
+                where_conditions.append(f"b.bbs_no = {db_placeholders(1)}")
                 params.append(order_no_int)
             except (ValueError, TypeError):
                 # 如果不是纯数字，使用 LIKE（但避免通配符开头以使用索引）
-                where_conditions.append("CAST(b.bbs_no AS TEXT) LIKE ?")
+                where_conditions.append(f"CAST(b.bbs_no AS TEXT) LIKE {db_placeholders(1)}")
                 params.append(f"{order_no}%")  # 改为 value% 而不是 %value%
         
         if job_no:
-            # 优化：尝试使用数值比较
+            # PostgreSQL 中 jobsite_no 是 SMALLINT 类型，需要确保参数类型匹配
             try:
                 job_no_int = int(job_no)
-                where_conditions.append("b.jobsite_no = ?")
-                params.append(job_no_int)
+                if is_postgres():
+                    # PostgreSQL: 将字段转换为 TEXT，然后与字符串参数比较，避免类型不匹配
+                    where_conditions.append(f"CAST(b.jobsite_no AS TEXT) = {db_placeholders(1)}")
+                    params.append(str(job_no_int))
+                else:
+                    where_conditions.append(f"b.jobsite_no = {db_placeholders(1)}")
+                    params.append(job_no_int)
             except (ValueError, TypeError):
-                where_conditions.append("CAST(b.jobsite_no AS TEXT) LIKE ?")
+                # 如果不是纯数字，使用 LIKE（但避免通配符开头以使用索引）
+                where_conditions.append(f"CAST(b.jobsite_no AS TEXT) LIKE {db_placeholders(1)}")
                 params.append(f"{job_no}%")  # 改为 value% 而不是 %value%
         
         if dn_no:
-            # 优化：尝试使用数值比较
-            try:
-                dn_no_int = int(dn_no)
-                where_conditions.append("b.dd_no = ?")
-                params.append(dn_no_int)
-            except (ValueError, TypeError):
-                where_conditions.append("CAST(b.dd_no AS TEXT) LIKE ?")
-                params.append(f"{dn_no}%")  # 改为 value% 而不是 %value%
+            # PostgreSQL 中需要处理类型转换问题
+            # dd_no 字段可能是 TEXT 或 INTEGER，需要统一处理
+            if is_postgres():
+                # PostgreSQL: 无论字段类型如何，都使用文本比较以确保兼容性
+                # 将字段转换为文本，参数也作为文本传递
+                where_conditions.append(f"CAST(b.dd_no AS TEXT) = {db_placeholders(1)}")
+                params.append(str(dn_no).strip())
+            else:
+                # SQLite: 尝试使用数值比较
+                try:
+                    dn_no_int = int(dn_no)
+                    where_conditions.append(f"b.dd_no = {db_placeholders(1)}")
+                    params.append(dn_no_int)
+                except (ValueError, TypeError):
+                    # 如果不是纯数字，使用文本 LIKE 匹配
+                    where_conditions.append(f"b.dd_no LIKE {db_placeholders(1)}")
+                    params.append(f"{dn_no}%")  # 改为 value% 而不是 %value%
         
         if start_date:
-            where_conditions.append("b.dd_delivery_date >= ?")
-            params.append(start_date)
+            # PostgreSQL 需要将字符串日期转换为 DATE 类型进行比较
+            if is_postgres():
+                where_conditions.append(f"CAST(b.dd_delivery_date AS DATE) >= CAST({db_placeholders(1)} AS DATE)")
+            else:
+                where_conditions.append(f"b.dd_delivery_date >= {db_placeholders(1)}")
+            # 标准化日期格式为 YYYY-MM-DD
+            start_date_normalized = start_date.replace('/', '-')
+            params.append(start_date_normalized)
         
         if end_date:
-            where_conditions.append("b.dd_delivery_date <= ?")
-            params.append(end_date)
-        
+            # PostgreSQL 需要将字符串日期转换为 DATE 类型进行比较
+            if is_postgres():
+                where_conditions.append(f"CAST(b.dd_delivery_date AS DATE) <= CAST({db_placeholders(1)} AS DATE)")
+            else:
+                where_conditions.append(f"b.dd_delivery_date <= {db_placeholders(1)}")
+            # 标准化日期格式为 YYYY-MM-DD
+            end_date_normalized = end_date.replace('/', '-')
+            params.append(end_date_normalized)
+
         # 普通账号只能看到授权范围内的Job No
         # 优化：使用数值比较而不是 CAST
         current_user = get_current_user(optional=True)
         if current_user and current_user.get('role') == 'user':
             scoped_jobs = _fetch_user_job_nos(conn, current_user['id'])
             if scoped_jobs:
-                placeholders = ','.join('?' * len(scoped_jobs))
-                where_conditions.append(f"b.jobsite_no IN ({placeholders})")
-                params.extend(scoped_jobs)  # 直接使用数值，不需要转换为字符串
+                # 将字符串 job_no 转换为整数，以便与 SMALLINT 类型的 jobsite_no 比较
+                scoped_jobs_int = []
+                for job_no in scoped_jobs:
+                    try:
+                        scoped_jobs_int.append(int(job_no))
+                    except (ValueError, TypeError):
+                        # 如果无法转换为整数，跳过（或使用 CAST 进行比较）
+                        continue
+                
+                if scoped_jobs_int:
+                    if is_postgres():
+                        # PostgreSQL: 将字段转换为 TEXT，然后与字符串参数比较，避免类型不匹配
+                        placeholders = ','.join([db_placeholders(1)] * len(scoped_jobs_int))
+                        where_conditions.append(f"CAST(b.jobsite_no AS TEXT) IN ({placeholders})")
+                        params.extend([str(j) for j in scoped_jobs_int])
+                    else:
+                        placeholders = ','.join([db_placeholders(1)] * len(scoped_jobs_int))
+                        where_conditions.append(f"b.jobsite_no IN ({placeholders})")
+                        params.extend(scoped_jobs_int)
+                else:
+                    where_conditions.append("1 = 0")
             else:
                 where_conditions.append("1 = 0")
         
@@ -2295,7 +2942,7 @@ def get_bbs_dd_list(page, per_page_param, order_no, job_no, dn_no, start_date, e
         if pdf_status_exists:
             # COUNT 查询：不需要 JOIN，提升性能
             count_query = f"""
-                SELECT COUNT(*) 
+                SELECT COUNT(*) as count
                 FROM bbs_dd b
                 {where_clause}
             """
@@ -2304,24 +2951,24 @@ def get_bbs_dd_list(page, per_page_param, order_no, job_no, dn_no, start_date, e
             # 直接使用数值比较，避免 CAST
             query = f"""
             SELECT 
-                b.bbs_no AS Order_No,
-                b.jobsite_no AS Job_No,
-                b.order_desc AS Order_Description,
-                b.jobsite_type AS Jobsite_Type,
-                b.dd_no AS rm_dn_no,
-                b.dd_delivery_date AS Del_Date,
-                COALESCE(p.pdf_status, 'pending') as pdf_status,
-                p.pdf_path,
-                p.generated_at
+                b.bbs_no AS "Order_No",
+                b.jobsite_no AS "Job_No",
+                b.order_desc AS "Order_Description",
+                b.jobsite_type AS "Jobsite_Type",
+                b.dd_no AS "rm_dn_no",
+                b.dd_delivery_date AS "Del_Date",
+                COALESCE(p."pdf_status", 'pending') as pdf_status,
+                p."pdf_path",
+                p."generated_at"
             FROM bbs_dd b
-            LEFT JOIN PDF_Status p ON b.bbs_no = p.Order_No
+            LEFT JOIN {table_pdf} p ON b.bbs_no = p."Order_No"
             {where_clause}
             ORDER BY b.dd_delivery_date DESC
-            LIMIT ? OFFSET ?
+            LIMIT {db_placeholders(1)} OFFSET {db_placeholders(1)}
             """
         else:
             count_query = f"""
-                SELECT COUNT(*) 
+                SELECT COUNT(*) as count
                 FROM bbs_dd b
                 {where_clause}
             """
@@ -2339,22 +2986,23 @@ def get_bbs_dd_list(page, per_page_param, order_no, job_no, dn_no, start_date, e
             FROM bbs_dd b
             {where_clause}
             ORDER BY b.dd_delivery_date DESC
-            LIMIT ? OFFSET ?
+            LIMIT {db_placeholders(1)} OFFSET {db_placeholders(1)}
             """
         
         # 添加调试信息
-        try:
-            print("[DEBUG] /api/orders/list (bbs_dd) - Executing count query")
-        except (UnicodeEncodeError, UnicodeDecodeError):
-            pass
+        logger.debug("/api/orders/list (bbs_dd) - Executing count query")
         
         cursor.execute(count_query, params)
-        total_records = cursor.fetchone()[0]
+        row = cursor.fetchone()
+        # PostgreSQL 返回 dict_row，SQLite 返回 tuple
+        if isinstance(row, dict):
+            # PostgreSQL: COUNT(*) 返回的列名是 'count'
+            total_records = row.get('count', 0) if 'count' in row else (list(row.values())[0] if row else 0)
+        else:
+            # SQLite: 返回 tuple，第一个元素是计数
+            total_records = row[0] if row else 0
         
-        try:
-            print(f"[DEBUG] /api/orders/list (bbs_dd) - Total records: {total_records}")
-        except (UnicodeEncodeError, UnicodeDecodeError):
-            pass
+        logger.debug(f"/api/orders/list (bbs_dd) - Total records: {total_records}")
         
         # 处理 per_page 参数
         try:
@@ -2373,25 +3021,16 @@ def get_bbs_dd_list(page, per_page_param, order_no, job_no, dn_no, start_date, e
         
         # 执行查询
         query_params = params + [per_page, offset]
-        try:
-            print(f"[DEBUG] /api/orders/list (bbs_dd) - Executing query with limit={per_page}, offset={offset}")
-        except (UnicodeEncodeError, UnicodeDecodeError):
-            pass
+        logger.debug(f"/api/orders/list (bbs_dd) - Executing query with limit={per_page}, offset={offset}")
         
         import time
         start_time = time.time()
         cursor.execute(query, query_params)
         execution_time = time.time() - start_time
-        try:
-            print(f"[DEBUG] /api/orders/list (bbs_dd) - Query executed in {execution_time:.2f} seconds")
-        except (UnicodeEncodeError, UnicodeDecodeError):
-            pass
+        logger.debug(f"/api/orders/list (bbs_dd) - Query executed in {execution_time:.2f} seconds")
         
         rows = cursor.fetchall()
-        try:
-            print(f"[DEBUG] /api/orders/list (bbs_dd) - Fetched {len(rows)} rows")
-        except (UnicodeEncodeError, UnicodeDecodeError):
-            pass
+        logger.debug(f"/api/orders/list (bbs_dd) - Fetched {len(rows)} rows")
         
         # 转换为字典列表
         data = []
@@ -2428,15 +3067,10 @@ def get_bbs_dd_list(page, per_page_param, order_no, job_no, dn_no, start_date, e
     except Exception as e:
         if conn:
             conn.close()
-        import traceback
-        error_trace = traceback.format_exc()
-        try:
-            print(f"Error getting bbs_dd list: {error_trace}")
-        except (UnicodeEncodeError, UnicodeDecodeError):
-            logger.error(f"Error getting bbs_dd list: {str(e)}")
+        logger.error("Error getting bbs_dd list: %s", e, exc_info=True)
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': _safe_error_message(e)
         }), 500
 
 
@@ -2520,32 +3154,44 @@ def get_orders_list():
         params = []
         
         if order_no:
-            where_conditions.append("CAST(o.Order_No AS TEXT) LIKE ?")
+            where_conditions.append(f"CAST(o.\"Order_No\" AS TEXT) LIKE {db_placeholders(1)}")
             params.append(f"%{order_no}%")
         
         if job_no:
-            where_conditions.append("o.Job_No LIKE ?")
+            where_conditions.append(f"o.\"Job_No\" LIKE {db_placeholders(1)}")
             params.append(f"%{job_no}%")
         
         if dn_no:
-            where_conditions.append("CAST(o.rm_dn_no AS TEXT) LIKE ?")
+            where_conditions.append(f"CAST(o.\"rm_dn_no\" AS TEXT) LIKE {db_placeholders(1)}")
             params.append(f"%{dn_no}%")
         
         if start_date:
-            where_conditions.append("o.Del_Date >= ?")
-            params.append(start_date)
+            # PostgreSQL 需要将字符串日期转换为 DATE 类型进行比较
+            if is_postgres():
+                where_conditions.append(f"CAST(o.\"Del_Date\" AS DATE) >= CAST({db_placeholders(1)} AS DATE)")
+            else:
+                where_conditions.append(f"o.\"Del_Date\" >= {db_placeholders(1)}")
+            # 标准化日期格式为 YYYY-MM-DD
+            start_date_normalized = start_date.replace('/', '-')
+            params.append(start_date_normalized)
         
         if end_date:
-            where_conditions.append("o.Del_Date <= ?")
-            params.append(end_date)
+            # PostgreSQL 需要将字符串日期转换为 DATE 类型进行比较
+            if is_postgres():
+                where_conditions.append(f"CAST(o.\"Del_Date\" AS DATE) <= CAST({db_placeholders(1)} AS DATE)")
+            else:
+                where_conditions.append(f"o.\"Del_Date\" <= {db_placeholders(1)}")
+            # 标准化日期格式为 YYYY-MM-DD
+            end_date_normalized = end_date.replace('/', '-')
+            params.append(end_date_normalized)
 
         # 普通账号只能看到授权范围内的Job No
         # manager和admin可以看到所有记录
         if current_user and current_user.get('role') == 'user':
             scoped_jobs = _fetch_user_job_nos(conn, current_user['id'])
             if scoped_jobs:
-                placeholders = ','.join('?' * len(scoped_jobs))
-                where_conditions.append(f"o.Job_No IN ({placeholders})")
+                placeholders = ','.join([db_placeholders(1)] * len(scoped_jobs))
+                where_conditions.append(f"o.\"Job_No\" IN ({placeholders})")
                 params.extend(scoped_jobs)
             else:
                 where_conditions.append("1 = 0")
@@ -2557,75 +3203,86 @@ def get_orders_list():
         
         # 根据PDF_Status表是否存在构建不同的查询
         # DD_No和Del_Date优先从bbs_dd表获取，如果不存在则使用TR_Report_Deduplication表的值
+        # PostgreSQL 表名需要引号包裹
+        table_dedup = '"TR_Report_Deduplication"' if is_postgres() else 'TR_Report_Deduplication'
+        table_pdf = '"PDF_Status"' if is_postgres() else 'PDF_Status'
+        
         if pdf_status_exists:
             # PDF_Status表存在：使用LEFT JOIN
             count_query = f"""
-                SELECT COUNT(*) 
-                FROM TR_Report_Deduplication o
-                LEFT JOIN PDF_Status p ON o.Order_No = p.Order_No
+                SELECT COUNT(*) as count
+                FROM {table_dedup} o
+                LEFT JOIN {table_pdf} p ON o."Order_No" = p."Order_No"
                 {where_clause}
             """
             # 简化查询：先不使用 bbs_dd JOIN，确保查询快速返回
             query = f"""
             SELECT 
-                o.Order_No, 
-                o.Client, 
-                o.Jobsite,
-                o.Jobsite_Type,
-                o.Job_No, 
-                o.PO_No, 
-                o.Del_Date, 
-                o.Ref_No, 
-                o.Order_Description, 
-                o.Grade, 
-                o.Wt,
-                o.rm_dn_no,
-                COALESCE(p.pdf_status, 'pending') as pdf_status,
-                p.pdf_path,
-                p.generated_at
-            FROM TR_Report_Deduplication o
-            LEFT JOIN PDF_Status p ON o.Order_No = p.Order_No
+                o."Order_No", 
+                o."Client", 
+                o."Jobsite",
+                o."Jobsite_Type",
+                o."Job_No", 
+                o."PO_No", 
+                o."Del_Date", 
+                o."Ref_No", 
+                o."Order_Description", 
+                o."Grade", 
+                o."Wt",
+                o."rm_dn_no",
+                COALESCE(p."pdf_status", 'pending') as pdf_status,
+                p."pdf_path",
+                p."generated_at"
+            FROM {table_dedup} o
+            LEFT JOIN {table_pdf} p ON o."Order_No" = p."Order_No"
             {where_clause}
-            ORDER BY o.Del_Date DESC, o.Order_No DESC
-            LIMIT ? OFFSET ?
+            ORDER BY o."Del_Date" DESC, o."Order_No" DESC
+            LIMIT {db_placeholders(1)} OFFSET {db_placeholders(1)}
             """
         else:
             # PDF_Status表不存在：不JOIN任何表，直接查询
             count_query = f"""
-                SELECT COUNT(*) 
-                FROM TR_Report_Deduplication o
+                SELECT COUNT(*) as count
+                FROM {table_dedup} o
                 {where_clause}
             """
             # 简化查询：暂时不 JOIN bbs_dd，直接使用 TR_Report_Deduplication 表的数据
             # 这样可以确保查询快速返回
             query = f"""
             SELECT 
-                o.Order_No, 
-                o.Client, 
-                o.Jobsite,
-                o.Jobsite_Type,
-                o.Job_No, 
-                o.PO_No, 
-                o.Del_Date, 
-                o.Ref_No, 
-                o.Order_Description, 
-                o.Grade, 
-                o.Wt,
-                o.rm_dn_no,
+                o."Order_No", 
+                o."Client", 
+                o."Jobsite",
+                o."Jobsite_Type",
+                o."Job_No", 
+                o."PO_No", 
+                o."Del_Date", 
+                o."Ref_No", 
+                o."Order_Description", 
+                o."Grade", 
+                o."Wt",
+                o."rm_dn_no",
                 'pending' as pdf_status,
                 NULL as pdf_path,
                 NULL as generated_at
-            FROM TR_Report_Deduplication o
+            FROM {table_dedup} o
             {where_clause}
-            ORDER BY o.Del_Date DESC, o.Order_No DESC
-            LIMIT ? OFFSET ?
+            ORDER BY o."Del_Date" DESC, o."Order_No" DESC
+            LIMIT {db_placeholders(1)} OFFSET {db_placeholders(1)}
             """
         
         cursor.execute(count_query, params)
-        total_records = cursor.fetchone()[0]
+        row = cursor.fetchone()
+        # PostgreSQL 返回 dict_row，SQLite 返回 tuple
+        if isinstance(row, dict):
+            # PostgreSQL: COUNT(*) 返回的列名是 'count'
+            total_records = row.get('count', 0) if 'count' in row else (list(row.values())[0] if row else 0)
+        else:
+            # SQLite: 返回 tuple，第一个元素是计数
+            total_records = row[0] if row else 0
         
         # 调试信息：打印总记录数和用户信息
-        print(f"[DEBUG] /api/orders/list - User: {user_role}, Total records: {total_records}, Params: {params}")
+        logger.debug(f"/api/orders/list - User: {user_role}, Total records: {total_records}, Params: {params}")
         
         # 处理 per_page 参数
         try:
@@ -2655,23 +3312,26 @@ def get_orders_list():
         query_params = params + [per_page, offset]
         
         # 调试信息：打印查询参数
-        print(f"[DEBUG] /api/orders/list - Executing query with params: limit={per_page}, offset={offset}, param_count={len(params)}")
-        print(f"[DEBUG] /api/orders/list - Query preview (first 200 chars): {query[:200]}")
+        logger.debug(f"/api/orders/list - Executing query with params: limit={per_page}, offset={offset}, param_count={len(params)}")
+        try:
+            logger.debug(f"/api/orders/list - Query preview (first 200 chars): {query[:200]}")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            logger.debug(f"/api/orders/list - Query preview (first 200 chars): {repr(query[:200])}")
         
         try:
             # 设置查询超时（SQLite的busy_timeout已经在连接时设置了，但这里添加额外的超时检查）
             import time
             start_time = time.time()
-            print(f"[DEBUG] /api/orders/list - Starting query execution at {start_time}")
+            logger.debug(f"/api/orders/list - Starting query execution at {start_time}")
             
             cursor.execute(query, query_params)
             
             execution_time = time.time() - start_time
-            print(f"[DEBUG] /api/orders/list - Query executed in {execution_time:.2f} seconds")
+            logger.debug(f"/api/orders/list - Query executed in {execution_time:.2f} seconds")
             
             rows = cursor.fetchall()
             fetch_time = time.time() - start_time - execution_time
-            print(f"[DEBUG] /api/orders/list - Fetched {len(rows)} rows (fetch took {fetch_time:.2f}s, total {time.time() - start_time:.2f}s)")
+            logger.debug(f"/api/orders/list - Fetched {len(rows)} rows (fetch took {fetch_time:.2f}s, total {time.time() - start_time:.2f}s)")
             
             # 如果查询返回空结果，打印警告
             if len(rows) == 0:
@@ -2691,18 +3351,25 @@ def get_orders_list():
             row_dict = dict(row)
             # 调试：打印第一条记录的Client字段
             if len(data) == 0:
-                print(f"[DEBUG] /api/orders/list - First record: Order_No={row_dict.get('Order_No')}, Client={row_dict.get('Client')}, Jobsite={row_dict.get('Jobsite')}")
+                try:
+                    logger.debug(f"/api/orders/list - First record: Order_No={row_dict.get('Order_No')}, Client={row_dict.get('Client')}, Jobsite={row_dict.get('Jobsite')}")
+                except (UnicodeEncodeError, UnicodeDecodeError):
+                    # 如果包含无法编码的字符，使用 repr 或跳过
+                    logger.debug(f"/api/orders/list - First record: Order_No={row_dict.get('Order_No')}, Client={repr(row_dict.get('Client'))}, Jobsite={repr(row_dict.get('Jobsite'))}")
             data.append(row_dict)
         
         conn.close()
         
         # 调试信息：打印分页信息
-        print(f"[DEBUG] /api/orders/list - Returning pagination: total_records={total_records}, total_pages={total_pages}, current_page={page}, per_page={per_page}, data_count={len(data)}")
+        logger.debug(f"/api/orders/list - Returning pagination: total_records={total_records}, total_pages={total_pages}, current_page={page}, per_page={per_page}, data_count={len(data)}")
         
         # 检查Client字段
         if len(data) > 0:
             sample_client = data[0].get('Client')
-            print(f"[DEBUG] /api/orders/list - Sample Client value: '{sample_client}' (type: {type(sample_client)})")
+            try:
+                logger.debug(f"/api/orders/list - Sample Client value: '{sample_client}' (type: {type(sample_client)})")
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                logger.debug(f"/api/orders/list - Sample Client value: {repr(sample_client)} (type: {type(sample_client)})")
         
         # 構建響應
         response_data = {
@@ -2735,7 +3402,7 @@ def get_orders_list():
         logger.error(f"Traceback:\n{error_trace}")
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': _safe_error_message(e)
         }), 500
 
 
@@ -2764,19 +3431,19 @@ def group_by_job_no():
         params = []
         
         if order_no:
-            where_conditions.append("Order_No LIKE ?")
+            where_conditions.append(f'"Order_No" LIKE {db_placeholders(1)}')
             params.append(f"%{order_no}%")
         
         if job_no:
-            where_conditions.append("Job_No LIKE ?")
+            where_conditions.append(f'"Job_No" LIKE {db_placeholders(1)}')
             params.append(f"%{job_no}%")
         
         if start_date:
-            where_conditions.append("Del_Date >= ?")
+            where_conditions.append(f'"Del_Date" >= {db_placeholders(1)}')
             params.append(start_date)
         
         if end_date:
-            where_conditions.append("Del_Date <= ?")
+            where_conditions.append(f'"Del_Date" <= {db_placeholders(1)}')
             params.append(end_date)
 
         # manager和admin可以看到所有记录
@@ -2784,8 +3451,8 @@ def group_by_job_no():
         if current_user and current_user.get('role') == 'user':
             scoped_jobs = _fetch_user_job_nos(conn, current_user['id'])
             if scoped_jobs:
-                placeholders = ','.join('?' * len(scoped_jobs))
-                where_conditions.append(f"Job_No IN ({placeholders})")
+                placeholders = ','.join([db_placeholders(1)] * len(scoped_jobs))
+                where_conditions.append(f'"Job_No" IN ({placeholders})')
                 params.extend(scoped_jobs)
             else:
                 where_conditions.append("1 = 0")
@@ -2795,18 +3462,23 @@ def group_by_job_no():
         if where_conditions:
             where_clause = "WHERE " + " AND ".join(where_conditions)
         
+        # PostgreSQL 表名需要引号包裹
+        table_dedup = '"TR_Report_Deduplication"' if is_postgres() else 'TR_Report_Deduplication'
+        
         # 按Job_No分组统计
+        # PostgreSQL 使用 string_agg，SQLite 使用 GROUP_CONCAT
+        group_concat_func = 'string_agg(DISTINCT "Client", \',\')' if is_postgres() else 'GROUP_CONCAT(DISTINCT Client)'
         query = f"""
         SELECT 
-            Job_No,
+            "Job_No",
             COUNT(*) as record_count,
-            SUM(Wt) as total_weight,
-            MIN(Del_Date) as earliest_date,
-            MAX(Del_Date) as latest_date,
-            GROUP_CONCAT(DISTINCT Client) as clients
-        FROM TR_Report_Deduplication
+            SUM("Wt") as total_weight,
+            MIN("Del_Date") as earliest_date,
+            MAX("Del_Date") as latest_date,
+            {group_concat_func} as clients
+        FROM {table_dedup}
         {where_clause}
-        GROUP BY Job_No
+        GROUP BY "Job_No"
         ORDER BY record_count DESC
         """
         
@@ -2816,14 +3488,25 @@ def group_by_job_no():
         # 转换为字典列表
         data = []
         for row in rows:
-            data.append({
-                'Job_No': row[0],
-                'record_count': row[1],
-                'total_weight': row[2],
-                'earliest_date': row[3],
-                'latest_date': row[4],
-                'clients': row[5] if row[5] else ''
-            })
+            # PostgreSQL 返回 dict_row，SQLite 返回 tuple
+            if isinstance(row, dict):
+                data.append({
+                    'Job_No': row.get('Job_No', row.get('job_no')),
+                    'record_count': row.get('record_count', 0),
+                    'total_weight': row.get('total_weight', 0),
+                    'earliest_date': row.get('earliest_date'),
+                    'latest_date': row.get('latest_date'),
+                    'clients': row.get('clients', '') or ''
+                })
+            else:
+                data.append({
+                    'Job_No': row[0],
+                    'record_count': row[1],
+                    'total_weight': row[2],
+                    'earliest_date': row[3],
+                    'latest_date': row[4],
+                    'clients': row[5] if row[5] else ''
+                })
         
         conn.close()
         
@@ -2841,12 +3524,13 @@ def group_by_job_no():
     except Exception as e:
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': _safe_error_message(e)
         }), 500
 
 
 @app.route('/api/pdf/generate', methods=['POST'])
 @require_auth()
+@_route_limit(RATE_LIMIT_PDF_GENERATE)
 def generate_pdf():
     """
     创建 PDF 生成任务（异步模式）
@@ -2932,7 +3616,7 @@ def generate_pdf():
         traceback.print_exc()
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': _safe_error_message(e)
         }), 500
 
 
@@ -3012,12 +3696,13 @@ def get_pdf_task_status(task_id):
         traceback.print_exc()
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': _safe_error_message(e)
         }), 500
 
 
 @app.route('/api/pdf/download/<int:order_no>', methods=['GET'])
 @require_auth()
+@_route_limit(RATE_LIMIT_DOWNLOAD_GET)
 def download_pdf(order_no):
     """下载单个PDF文件"""
     try:
@@ -3036,15 +3721,19 @@ def download_pdf(order_no):
                     'error': 'No authorized Job No assigned to this account'
                 }), 403
 
-        cursor.execute("""
+        # PostgreSQL 表名需要引号包裹
+        table_pdf = '"PDF_Status"' if is_postgres() else 'PDF_Status'
+        table_dedup = '"TR_Report_Deduplication"' if is_postgres() else 'TR_Report_Deduplication'
+        
+        cursor.execute(f"""
             SELECT 
-                s.pdf_path, 
-                s.pdf_status,
-                d.Job_No,
-                d.Del_Date
-            FROM PDF_Status s
-            LEFT JOIN TR_Report_Deduplication d ON d.Order_No = s.Order_No
-            WHERE s.Order_No = ?
+                s."pdf_path", 
+                s."pdf_status",
+                d."Job_No",
+                d."Del_Date"
+            FROM {table_pdf} s
+            LEFT JOIN {table_dedup} d ON d."Order_No" = s."Order_No"
+            WHERE s."Order_No" = {db_placeholders(1)}
         """, (order_no,))
         result = cursor.fetchone()
         
@@ -3071,8 +3760,9 @@ def download_pdf(order_no):
         if not abs_pdf_path or not os.path.exists(abs_pdf_path):
             if not del_date:
                 # 如果没有Del_Date，从TR_Report_Deduplication获取
-                cursor.execute("""
-                    SELECT Del_Date FROM TR_Report_Deduplication WHERE Order_No = ? LIMIT 1
+                table_dedup = '"TR_Report_Deduplication"' if is_postgres() else 'TR_Report_Deduplication'
+                cursor.execute(f"""
+                    SELECT "Del_Date" FROM {table_dedup} WHERE "Order_No" = {db_placeholders(1)} LIMIT 1
                 """, (order_no,))
                 del_date_result = cursor.fetchone()
                 if del_date_result:
@@ -3154,9 +3844,9 @@ def download_pdf(order_no):
         
         if not abs_pdf_path or not os.path.exists(abs_pdf_path):
             conn.close()
-            print(f"[DEBUG] PDF path from DB: {pdf_path}")
-            print(f"[DEBUG] Converted absolute path: {abs_pdf_path}")
-            print(f"[DEBUG] File exists: {os.path.exists(abs_pdf_path) if abs_pdf_path else False}")
+            logger.debug(f"PDF path from DB: {pdf_path}")
+            logger.debug(f"Converted absolute path: {abs_pdf_path}")
+            logger.debug(f"File exists: {os.path.exists(abs_pdf_path) if abs_pdf_path else False}")
             return jsonify({
                 'success': False,
                 'error': 'PDF file not found on server. The file may have been moved or deleted. Please regenerate the PDF.',
@@ -3173,9 +3863,9 @@ def download_pdf(order_no):
         # 验证路径在允许目录内
         if not abs_pdf_path.startswith(abs_allowed_dir):
             conn.close()
-            print(f"[DEBUG] Path validation failed:")
-            print(f"[DEBUG] PDF path: {abs_pdf_path}")
-            print(f"[DEBUG] Allowed dir: {abs_allowed_dir}")
+            logger.debug("Path validation failed:")
+            logger.debug(f"PDF path: {abs_pdf_path}")
+            logger.debug(f"Allowed dir: {abs_allowed_dir}")
             return jsonify({
                 'success': False,
                 'error': 'Invalid file path'
@@ -3196,15 +3886,23 @@ def download_pdf(order_no):
     except Exception as e:
         import traceback
         error_trace = traceback.format_exc()
-        print(f"Error downloading PDF: {error_trace}")
+        # Use logger instead of print to avoid Windows service encoding issues
+        try:
+            logger.error(f"Error downloading PDF: {error_trace}")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            try:
+                logger.error(f"Error downloading PDF: {str(e)}")
+            except Exception:
+                pass
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': _safe_error_message(e)
         }), 500
 
 
 @app.route('/api/pdf/batch-download', methods=['POST'])
 @require_auth()
+@_route_limit(RATE_LIMIT_HEAVY_POST)
 def batch_download_pdf():
     """批量下载PDF文件（打包为ZIP）"""
     try:
@@ -3244,17 +3942,22 @@ def batch_download_pdf():
         # 查询所有订单的PDF路径
         # 统一转换为字符串，确保类型一致
         order_nos_str = [str(ono) for ono in order_nos]
-        placeholders = ','.join('?' * len(order_nos_str))
+        placeholders = ','.join([db_placeholders(1)] * len(order_nos_str))
+        
+        # PostgreSQL 表名需要引号包裹
+        table_pdf = '"PDF_Status"' if is_postgres() else 'PDF_Status'
+        table_dedup = '"TR_Report_Deduplication"' if is_postgres() else 'TR_Report_Deduplication'
+        
         query = f"""
             SELECT 
-                s.Order_No,
-                s.pdf_path,
-                s.pdf_status,
-                d.Del_Date,
-                d.Job_No
-            FROM PDF_Status s
-            LEFT JOIN TR_Report_Deduplication d ON CAST(d.Order_No AS TEXT) = CAST(s.Order_No AS TEXT)
-            WHERE CAST(s.Order_No AS TEXT) IN ({placeholders})
+                s."Order_No",
+                s."pdf_path",
+                s."pdf_status",
+                d."Del_Date",
+                d."Job_No"
+            FROM {table_pdf} s
+            LEFT JOIN {table_dedup} d ON CAST(d."Order_No" AS TEXT) = CAST(s."Order_No" AS TEXT)
+            WHERE CAST(s."Order_No" AS TEXT) IN ({placeholders})
         """
         
         try:
@@ -3268,7 +3971,7 @@ def batch_download_pdf():
             conn.close()
             return jsonify({
                 'success': False,
-                'error': f'Database query failed: {str(e)}'
+                'error': _safe_error_message(e),
             }), 500
         
         if not results:
@@ -3452,9 +4155,9 @@ def batch_download_pdf():
         ))
         conn.close()
 
-        print(f"[批量下载] 准备打包 {len(pdf_files)} 个PDF文件")
+        logger.info(f"[BATCH DOWNLOAD] Preparing to package {len(pdf_files)} PDF files")
         for pdf_file in pdf_files:
-            print(f"[批量下载] - Order {pdf_file['order_no']}: {pdf_file['path']} (Date: {pdf_file.get('del_date')}, Job: {pdf_file.get('job_no')})")
+            logger.debug(f"[BATCH DOWNLOAD] - Order {pdf_file['order_no']}: {pdf_file['path']} (Date: {pdf_file.get('del_date')}, Job: {pdf_file.get('job_no')})")
 
         # 创建临时ZIP文件
         temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
@@ -3463,7 +4166,7 @@ def batch_download_pdf():
         
         try:
             # 创建ZIP文件
-            print(f"[批量下载] 创建ZIP文件: {temp_zip_path}")
+            logger.info(f"[BATCH DOWNLOAD] Creating ZIP file: {temp_zip_path}")
             with zipfile.ZipFile(temp_zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
                 for pdf_file in pdf_files:
                     order_no = pdf_file['order_no']
@@ -3476,10 +4179,10 @@ def batch_download_pdf():
                     job_folder = f"Job_No_{job_no_folder}".replace('\\', '-').replace('/', '-')
                     arcname = f"{date_folder}/{job_folder}/TR_{order_no}.pdf"
                     if not os.path.exists(pdf_path):
-                        print(f"[批量下载] 警告: PDF文件不存在: {pdf_path}")
+                        logger.warning(f"[BATCH DOWNLOAD] WARNING: PDF file does not exist: {pdf_path}")
                         continue
                     zipf.write(pdf_path, arcname)
-                    print(f"[批量下载] 已添加: {arcname}")
+                    logger.debug(f"[BATCH DOWNLOAD] Added: {arcname}")
             
             # 检查ZIP文件是否存在且不为空
             if not os.path.exists(temp_zip_path):
@@ -3489,13 +4192,13 @@ def batch_download_pdf():
             if zip_size == 0:
                 raise ValueError(f"ZIP file is empty: {temp_zip_path}")
             
-            print(f"[批量下载] ZIP文件已创建: {temp_zip_path}, 大小: {zip_size} bytes")
+            logger.info(f"[BATCH DOWNLOAD] ZIP file created: {temp_zip_path}, size: {zip_size} bytes")
             
             # 返回ZIP文件
             # Flask的send_file会在文件发送完成后自动清理临时文件
             zip_filename = f'Orders_{datetime.now().strftime("%Y%m%d_%H%M%S")}.zip'
             
-            print(f"[批量下载] 返回ZIP文件: {zip_filename}, 路径: {temp_zip_path}")
+            logger.info(f"[BATCH DOWNLOAD] Returning ZIP file: {zip_filename}, path: {temp_zip_path}")
             
             return send_file(
                 temp_zip_path,
@@ -3515,10 +4218,17 @@ def batch_download_pdf():
     except Exception as e:
         import traceback
         error_trace = traceback.format_exc()
-        print(f"Error batch downloading PDFs: {error_trace}")
+        # Use logger instead of print to avoid Windows service encoding issues
+        try:
+            logger.error(f"Error batch downloading PDFs: {error_trace}")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            try:
+                logger.error(f"Error batch downloading PDFs: {str(e)}")
+            except Exception:
+                pass
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': _safe_error_message(e)
         }), 500
 
 
@@ -3538,6 +4248,7 @@ def health_check():
 
 @app.route('/api/system/update-all-tables', methods=['POST'])
 @require_auth(role='admin')
+@_route_limit(RATE_LIMIT_SYSTEM_POST)
 def update_all_tables():
     """
     执行数据更新（调用批处理文件）
@@ -3600,7 +4311,7 @@ def update_all_tables():
                 stdout, stderr = process.communicate()
                 return process.returncode == 0, stdout.decode('utf-8', errors='ignore'), stderr.decode('utf-8', errors='ignore')
             except Exception as e:
-                return False, '', str(e)
+                return False, '', _safe_error_message(e)
         
         # 启动后台线程执行
         result_container = {'success': None, 'stdout': '', 'stderr': '', 'error': None}
@@ -3612,7 +4323,7 @@ def update_all_tables():
                 result_container['stdout'] = stdout
                 result_container['stderr'] = stderr
             except Exception as e:
-                result_container['error'] = str(e)
+                result_container['error'] = _safe_error_message(e)
         
         thread = threading.Thread(target=execute, daemon=True)
         thread.start()
@@ -3626,11 +4337,11 @@ def update_all_tables():
         
     except Exception as e:
         import traceback
-        print(f"[错误] 启动数据更新失败: {e}")
+        logger.error(f"启动数据更新失败: {e}")
         traceback.print_exc()
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': _safe_error_message(e)
         }), 500
 
 
@@ -3718,11 +4429,11 @@ def check_update_status():
         
     except Exception as e:
         import traceback
-        print(f"[错误] 检查更新状态失败: {e}")
+        logger.error(f"检查更新状态失败: {e}")
         traceback.print_exc()
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': _safe_error_message(e)
         }), 500
 
 
@@ -3774,16 +4485,17 @@ def get_file_index_status():
         })
     except Exception as e:
         import traceback
-        print(f"[错误] 获取文件索引状态失败: {e}")
+        logger.error(f"获取文件索引状态失败: {e}")
         traceback.print_exc()
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': _safe_error_message(e)
         }), 500
 
 
 @app.route('/api/file-index/rebuild', methods=['POST'])
 @require_auth(role='admin')
+@_route_limit(RATE_LIMIT_SYSTEM_POST)
 def rebuild_file_index():
     """
     手动触发全量索引重建（仅管理员）
@@ -3818,9 +4530,9 @@ def rebuild_file_index():
         def build_index_async():
             try:
                 result = builder.build_index(clear_existing=clear_existing)
-                print(f"[索引建立] 完成: {result}")
+                logger.info(f"索引建立完成: {result}")
             except Exception as e:
-                print(f"[索引建立] 失败: {e}")
+                logger.error(f"索引建立失败: {e}")
                 import traceback
                 traceback.print_exc()
         
@@ -3834,16 +4546,17 @@ def rebuild_file_index():
         })
     except Exception as e:
         import traceback
-        print(f"[错误] 启动索引重建失败: {e}")
+        logger.error(f"启动索引重建失败: {e}")
         traceback.print_exc()
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': _safe_error_message(e)
         }), 500
 
 
 @app.route('/api/file-index/update', methods=['POST'])
 @require_auth(role='admin')
+@_route_limit(RATE_LIMIT_SYSTEM_POST)
 def update_file_index():
     """
     手动触发增量索引更新（仅管理员）
@@ -3885,8 +4598,8 @@ def update_file_index():
                 result = updater.update_index(folder_type=folder_type)
                 result_container['result'] = result
             except Exception as e:
-                result_container['error'] = str(e)
-                print(f"[索引更新] 失败: {e}")
+                result_container['error'] = _safe_error_message(e)
+                logger.error(f"索引更新失败: {e}")
                 import traceback
                 traceback.print_exc()
         
@@ -3916,16 +4629,17 @@ def update_file_index():
             })
     except Exception as e:
         import traceback
-        print(f"[错误] 启动增量更新失败: {e}")
+        logger.error(f"启动增量更新失败: {e}")
         traceback.print_exc()
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': _safe_error_message(e)
         }), 500
 
 
 @app.route('/api/file-index/cleanup', methods=['POST'])
 @require_auth(role='admin')
+@_route_limit(RATE_LIMIT_SYSTEM_POST)
 def cleanup_file_index():
     """
     清理无效记录（仅管理员）
@@ -3965,16 +4679,17 @@ def cleanup_file_index():
         })
     except Exception as e:
         import traceback
-        print(f"[错误] 清理索引失败: {e}")
+        logger.error(f"清理索引失败: {e}")
         traceback.print_exc()
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': _safe_error_message(e)
         }), 500
 
 
 @app.route('/api/stockist-test/download-by-order/<int:order_no>', methods=['GET'])
 @require_auth()
+@_route_limit(RATE_LIMIT_DOWNLOAD_GET)
 def download_stockist_test_by_order(order_no):
     """
     按 Order 下载 Stockist&Test Report PDF 文件（异步任务）
@@ -4017,19 +4732,26 @@ def download_stockist_test_by_order(order_no):
     except RuntimeError as e:
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': _safe_error_message(e)
         }), 503
     except Exception as e:
         import traceback
-        logger.error(f"创建下载任务失败: {e}", exc_info=True)
+        try:
+            logger.error("Failed to create download task: " + str(e), exc_info=True)
+        except (UnicodeEncodeError, UnicodeDecodeError, Exception):
+            try:
+                logger.error("Failed to create download task: " + str(e))
+            except Exception:
+                pass
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': _safe_error_message(e)
         }), 500
 
 
 @app.route('/api/stockist-test/download-by-dd-no/<dd_no>', methods=['GET'])
 @require_auth()
+@_route_limit(RATE_LIMIT_DOWNLOAD_GET)
 def download_stockist_test_by_dd_no(dd_no):
     """
     按 DD_No 下载 Stockist&Test Report PDF 文件
@@ -4064,20 +4786,28 @@ def download_stockist_test_by_dd_no(dd_no):
     except ValueError as e:
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': _safe_error_message(e)
         }), 404
     except Exception as e:
         import traceback
         error_trace = traceback.format_exc()
-        print(f"[错误] 按 Order 下载失败: {error_trace}")
+        # Use logger instead of print to avoid Windows service encoding issues
+        try:
+            logger.error(f"[ERROR] Order download failed: {error_trace}")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            try:
+                logger.error(f"[ERROR] Order download failed: {str(e)}")
+            except Exception:
+                pass
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': _safe_error_message(e)
         }), 500
 
 
 @app.route('/api/stockist-test/download-by-order-nos-grouped-by-dd-no', methods=['POST'])
 @require_auth()
+@_route_limit(RATE_LIMIT_HEAVY_POST)
 def download_stockist_test_by_order_nos_grouped_by_dd_no():
     """
     批量按多个 Order No 下载，按 DD_No 分组
@@ -4152,19 +4882,26 @@ def download_stockist_test_by_order_nos_grouped_by_dd_no():
     except RuntimeError as e:
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': _safe_error_message(e)
         }), 503
     except Exception as e:
         import traceback
-        logger.error(f"创建下载任务失败: {e}", exc_info=True)
+        try:
+            logger.error("Failed to create download task: " + str(e), exc_info=True)
+        except (UnicodeEncodeError, UnicodeDecodeError, Exception):
+            try:
+                logger.error("Failed to create download task: " + str(e))
+            except Exception:
+                pass
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': _safe_error_message(e)
         }), 500
 
 
 @app.route('/api/stockist-test/get-date-count', methods=['POST'])
 @require_auth()
+@_route_limit(RATE_LIMIT_HEAVY_POST)
 def get_date_count():
     """
     获取订单对应的日期数量（用于前端进度显示）
@@ -4216,7 +4953,10 @@ def get_date_count():
         # 获取日期数量（使用批量查询优化性能）
         # 使用批量查询一次性获取所有订单的日期，而不是逐个查询
         unique_dates = set()
-        print(f"[API] 开始批量查询 {len(order_nos)} 个订单的日期...")
+        try:
+            logger.info("[API] Starting batch query for " + str(len(order_nos)) + " orders dates...")
+        except (UnicodeEncodeError, UnicodeDecodeError, Exception):
+            pass
         
         try:
             # 直接使用数据库连接进行批量查询
@@ -4224,11 +4964,12 @@ def get_date_count():
             cursor = conn.cursor()
             
             # 构建批量查询，一次性获取所有订单的日期
-            placeholders = ','.join('?' * len(order_nos))
+            placeholders = ','.join([db_placeholders(1)] * len(order_nos))
+            table_tr_report = '"TR_Report"' if is_postgres() else 'TR_Report'
             query = f"""
-                SELECT DISTINCT order_no, del_date
-                FROM TR_Report
-                WHERE order_no IN ({placeholders}) AND del_date IS NOT NULL
+                SELECT DISTINCT "order_no", "del_date"
+                FROM {table_tr_report}
+                WHERE "order_no" IN ({placeholders}) AND "del_date" IS NOT NULL
             """
             
             cursor.execute(query, order_nos)
@@ -4263,9 +5004,15 @@ def get_date_count():
                 
                 unique_dates.add(date_str)
             
-            print(f"[API] 批量查询完成，找到 {len(unique_dates)} 个唯一日期")
+            try:
+                logger.info("[API] Batch query completed, found " + str(len(unique_dates)) + " unique dates")
+            except (UnicodeEncodeError, UnicodeDecodeError, Exception):
+                pass
         except Exception as e:
-            print(f"[API] 批量查询失败，回退到逐个查询: {e}")
+            try:
+                logger.warning("[API] Batch query failed, falling back to individual queries: " + str(e))
+            except (UnicodeEncodeError, UnicodeDecodeError, Exception):
+                pass
             # 如果批量查询失败，回退到逐个查询
             for order_no in order_nos:
                 try:
@@ -4294,14 +5041,24 @@ def get_date_count():
                     
                     unique_dates.add(date_str)
                 except Exception as e2:
-                    print(f"[API] 处理 Order {order_no} 时出错: {e2}")
+                    try:
+                        logger.warning("[API] Error processing Order " + str(order_no) + ": " + str(e2))
+                    except (UnicodeEncodeError, UnicodeDecodeError, Exception):
+                        pass
                     continue
         
         date_count = len(unique_dates)
         if date_count == 0:
             date_count = 1  # 至少为1，避免前端显示 0/1
-            print(f"[API] 警告: 没有找到任何日期，使用默认值 1")
-        print(f"[API] 找到 {date_count} 个唯一的日期: {sorted(unique_dates) if unique_dates else '无'}")
+            try:
+                logger.warning("[API] Warning: No dates found, using default value 1")
+            except (UnicodeEncodeError, UnicodeDecodeError, Exception):
+                pass
+        try:
+            dates_str = str(sorted(unique_dates)) if unique_dates else "none"
+            logger.info("[API] Found " + str(date_count) + " unique dates: " + dates_str)
+        except (UnicodeEncodeError, UnicodeDecodeError, Exception):
+            pass
         
         return jsonify({
             'success': True,
@@ -4311,15 +5068,23 @@ def get_date_count():
     except Exception as e:
         import traceback
         error_trace = traceback.format_exc()
-        print(f"[错误] 获取日期数量失败: {error_trace}")
+        # Use logger instead of print to avoid Windows service encoding issues
+        try:
+            logger.error(f"[ERROR] Failed to get date count: {error_trace}")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            try:
+                logger.error(f"[ERROR] Failed to get date count: {str(e)}")
+            except Exception:
+                pass
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': _safe_error_message(e)
         }), 500
 
 
 @app.route('/api/stockist-test/download-by-order-nos-grouped-by-date', methods=['POST'])
 @require_auth()
+@_route_limit(RATE_LIMIT_HEAVY_POST)
 def download_stockist_test_by_order_nos_grouped_by_date():
     """
     批量按多个 Order No 下载，按日期分组
@@ -4394,25 +5159,33 @@ def download_stockist_test_by_order_nos_grouped_by_date():
     except ValueError as e:
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': _safe_error_message(e)
         }), 404
     except RuntimeError as e:
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': _safe_error_message(e)
         }), 503
     except Exception as e:
         import traceback
         error_trace = traceback.format_exc()
-        print(f"[错误] 批量按日期下载失败: {error_trace}")
+        # Use logger instead of print to avoid Windows service encoding issues
+        try:
+            logger.error(f"[ERROR] Batch download by date failed: {error_trace}")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            try:
+                logger.error(f"[ERROR] Batch download by date failed: {str(e)}")
+            except Exception:
+                pass
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': _safe_error_message(e)
         }), 500
 
 
 @app.route('/api/download/create-task', methods=['POST'])
 @require_auth()
+@_route_limit(RATE_LIMIT_HEAVY_POST)
 def create_download_task():
     """
     创建下载任务（异步模式）
@@ -4500,15 +5273,22 @@ def create_download_task():
     except RuntimeError as e:
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': _safe_error_message(e)
         }), 503
     except Exception as e:
         import traceback
-        print(f"[错误] 创建下载任务失败: {e}")
-        traceback.print_exc()
+        error_trace = traceback.format_exc()
+        # Use logger instead of print to avoid Windows service encoding issues
+        try:
+            logger.error(f"[ERROR] Failed to create download task: {error_trace}")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            try:
+                logger.error(f"[ERROR] Failed to create download task: {str(e)}")
+            except Exception:
+                pass
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': _safe_error_message(e)
         }), 500
 
 
@@ -4585,11 +5365,11 @@ def get_download_task_status(task_id):
         
     except Exception as e:
         import traceback
-        print(f"[错误] 查询任务状态失败: {e}")
+        logger.error(f"查询任务状态失败: {e}")
         traceback.print_exc()
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': _safe_error_message(e)
         }), 500
 
 
@@ -4597,6 +5377,7 @@ def get_download_task_status(task_id):
 
 @app.route('/api/download/download/<task_id>', methods=['GET'])
 @require_auth()
+@_route_limit(RATE_LIMIT_DOWNLOAD_GET)
 def download_task_file(task_id):
     """
     下载任务生成的ZIP文件
@@ -4713,16 +5494,24 @@ def download_task_file(task_id):
         
     except Exception as e:
         import traceback
-        print(f"[错误] 下载文件失败: {e}")
-        traceback.print_exc()
+        error_trace = traceback.format_exc()
+        # Use logger instead of print to avoid Windows service encoding issues
+        try:
+            logger.error(f"[ERROR] Failed to download file: {error_trace}")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            try:
+                logger.error(f"[ERROR] Failed to download file: {str(e)}")
+            except Exception:
+                pass
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': _safe_error_message(e)
         }), 500
 
 
 @app.route('/api/stockist-test/download-by-order-nos', methods=['POST'])
 @require_auth()
+@_route_limit(RATE_LIMIT_HEAVY_POST)
 def download_stockist_test_by_order_nos():
     """
     批量按多个 Order No 下载 Stockist&Test Report PDF 文件
@@ -4797,19 +5586,26 @@ def download_stockist_test_by_order_nos():
     except RuntimeError as e:
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': _safe_error_message(e)
         }), 503
     except Exception as e:
         import traceback
-        logger.error(f"创建下载任务失败: {e}", exc_info=True)
+        try:
+            logger.error("Failed to create download task: " + str(e), exc_info=True)
+        except (UnicodeEncodeError, UnicodeDecodeError, Exception):
+            try:
+                logger.error("Failed to create download task: " + str(e))
+            except Exception:
+                pass
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': _safe_error_message(e)
         }), 500
 
 
 @app.route('/api/stockist-test/download-all-stockist-nos', methods=['POST'])
 @require_auth()
+@_route_limit(RATE_LIMIT_HEAVY_POST)
 def download_stockist_test_all_stockist_nos():
     """
     批量按多个 Order No 下载并按 Stockist No 扁平组织（不按 Item 分类）
@@ -4874,13 +5670,13 @@ def download_stockist_test_all_stockist_nos():
     except RuntimeError as e:
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': _safe_error_message(e)
         }), 503
     except Exception as e:
         logger.error(f"创建扁平Stockist下载任务失败: {e}", exc_info=True)
         return jsonify({
             'success': False,
-            'error': str(e)
+            'error': _safe_error_message(e)
         }), 500
 
 
@@ -4936,7 +5732,8 @@ def get_orders_gen_pdf(order_no: int):
         conn.close()
         return jsonify({'success': True, 'data': {'header': header, 'lines': lines}})
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        logger.error("orders_gen_pdf get: %s", e, exc_info=True)
+        return jsonify({'success': False, 'error': _safe_error_message(e)}), 500
 
 
 @app.route('/api/orders-gen-pdf/<int:order_no>/edit', methods=['POST'])
@@ -5021,11 +5818,11 @@ def edit_orders_gen_pdf(order_no: int):
         return jsonify({'success': True, 'changed': max(changed, 0)})
     except Exception as e:
         import traceback
-        # 生产环境不应返回详细的错误堆栈给前端
+        logger.error("orders_gen_pdf edit: %s", e, exc_info=True)
+        payload = {'success': False, 'error': _safe_error_message(e)}
         if DEBUG_MODE:
-            return jsonify({'success': False, 'error': str(e), 'trace': traceback.format_exc()}), 500
-        else:
-            return jsonify({'success': False, 'error': '操作失败，请稍后重试或联系管理员'}), 500
+            payload['traceback'] = traceback.format_exc()
+        return jsonify(payload), 500
 
 if __name__ == '__main__':
     # 检查数据库是否存在
@@ -5034,22 +5831,8 @@ if __name__ == '__main__':
         logger.error("Please ensure data_3years.db exists in the TR database directory.")
         exit(1)
     
-    # 初始化數據庫連接池（在應用啟動時）
-    _ensure_pool_initialized()
-    
-    # 可选：启动文件索引定时任务
-    # 从环境变量读取是否启用定时任务
-    enable_scheduler = os.getenv('ENABLE_FILE_INDEX_SCHEDULER', 'False').lower() == 'true'
-    if enable_scheduler:
-        try:
-            from file_index_scheduler import start_file_index_scheduler
-            base_folder = os.getenv('STOCKIST_TEST_FOLDER', r'D:\Stockist&Test Report')
-            update_interval = int(os.getenv('FILE_INDEX_UPDATE_INTERVAL_HOURS', '1'))
-            start_file_index_scheduler(DB_PATH, base_folder, update_interval)
-            print(f"[调度器] 文件索引定时任务已启动，更新间隔: {update_interval} 小时")
-        except Exception as e:
-            print(f"[警告] 启动文件索引定时任务失败: {e}")
-    
+    start_background_services()
+
     logger.info("=" * 50)
     logger.info("TR Fill In API Server")
     logger.info(f"Database: {DB_PATH}")

@@ -40,13 +40,13 @@ createApp({
                 { username: 'viewer02', name: '资料员B', role: 'user', jobNos: [], active: false }
             ],
             systemTasks: [
-                { id: 1, name: '每日数据更新', schedule: '每天 06:30', description: '同步 Orders 与 Materials，刷新 Orders_gen_pdf', statusText: '下一次运行：明日 06:30', statusClass: 'tag--pending' },
+                { id: 1, name: '每日数据更新', schedule: '每天 06:30', description: '同步系统基础数据并刷新索引缓存', statusText: '下一次运行：明日 06:30', statusClass: 'tag--pending' },
                 { id: 2, name: 'PDF 生成状态巡检', schedule: '每小时', description: '检查 PDF_Status 表，统计失败记录并发送提醒', statusText: '上一次成功：09:00', statusClass: 'tag--generated' },
                 { id: 3, name: '日志归档', schedule: '每周一 00:30', description: '压缩 logs 目录，归档任务执行记录', statusText: '即将执行', statusClass: 'tag--pending' }
             ],
             activityLogs: [
                 { id: 1, icon: '📄', title: 'TR_127712 PDF 已生成', detail: '由 auto_update_all_tables.py 于 2025-11-10 06:35 自动生成', time: '2小时前' },
-                { id: 2, icon: '🔁', title: '自动任务运行完成', detail: '全量数据同步成功，更新 orders / materials / Orders_gen_pdf', time: '3小时前' },
+                { id: 2, icon: '🔁', title: '自动任务运行完成', detail: '全量数据同步成功，系统缓存与任务状态已刷新', time: '3小时前' },
                 { id: 3, icon: '👤', title: '新账号创建：operator02', detail: '账号管理员 Henry 添加了新普通用户并分配 Job TR-1271', time: '昨天' }
             ],
             modal: {

@@ -6,7 +6,7 @@ Waitress 啟動腳本
 """
 
 from waitress import serve
-from tr_fill_in_api import app
+from tr_fill_in_api import app, start_background_services
 import os
 
 if __name__ == '__main__':
@@ -35,7 +35,10 @@ if __name__ == '__main__':
         print("Server starting...")
         print("=" * 60)
         print()
-    
+
+    # 与直接运行 tr_fill_in_api.py 一致：连接池（SQLite）+ 文件索引调度器（若 .env 启用）
+    start_background_services()
+
     try:
         serve(
             app,

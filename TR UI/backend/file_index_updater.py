@@ -6,7 +6,6 @@
 """
 
 import os
-import sqlite3
 import json
 from typing import List, Dict, Tuple, Optional
 from datetime import datetime, timedelta
@@ -14,6 +13,7 @@ import time
 
 # 导入索引建立器以重用关键词提取功能
 from file_index_builder import FileIndexBuilder
+from db_adapter import get_connection as get_db_connection, is_postgres
 
 
 class FileIndexUpdater:
@@ -40,12 +40,25 @@ class FileIndexUpdater:
     
     def _get_connection(self):
         """获取数据库连接"""
-        conn = sqlite3.connect(self.db_path, timeout=30.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA busy_timeout=30000")
-        return conn
+        return get_db_connection()
+
+    def _sql(self, sql_text: str) -> str:
+        if is_postgres():
+            return sql_text.replace('?', '%s')
+        return sql_text
+
+    def _execute(self, cursor, sql_text: str, params=()):
+        return cursor.execute(self._sql(sql_text), params)
+
+    def _placeholders(self, count: int) -> str:
+        return ','.join(['%s' if is_postgres() else '?'] * count)
+    
+    def _bool_value(self, value: bool) -> str:
+        """Convert boolean to database-specific value"""
+        if is_postgres():
+            return 'true' if value else 'false'
+        else:
+            return '1' if value else '0'
     
     def get_files_to_check(self, folder_type: str, limit: int = None) -> List[Dict]:
         """
@@ -65,11 +78,11 @@ class FileIndexUpdater:
             # 计算阈值时间
             threshold_time = (datetime.now() - timedelta(hours=self.update_threshold_hours)).isoformat()
             
-            query = """
+            query = f"""
                 SELECT file_path, file_size, modified_time, last_checked
                 FROM file_index_cache
                 WHERE folder_type = ? 
-                  AND is_deleted = 0
+                  AND is_deleted = {self._bool_value(False)}
                   AND last_checked < ?
                 ORDER BY last_checked ASC
             """
@@ -79,7 +92,7 @@ class FileIndexUpdater:
                 query += " LIMIT ?"
                 params.append(limit)
             
-            cursor.execute(query, params)
+            self._execute(cursor, query, params)
             rows = cursor.fetchall()
             
             return [dict(row) for row in rows]
@@ -191,10 +204,10 @@ class FileIndexUpdater:
             conn = self._get_connection()
             cursor = conn.cursor()
             
-            cursor.execute("""
+            self._execute(cursor, f"""
                 SELECT file_path, file_size, modified_time
                 FROM file_index_cache
-                WHERE folder_type = ? AND is_deleted = 0
+                WHERE folder_type = ? AND is_deleted = {self._bool_value(False)}
             """, (folder_type,))
             
             db_files = {row['file_path']: {
@@ -244,7 +257,7 @@ class FileIndexUpdater:
                     try:
                         file_info = self.builder.get_file_info(file_path, folder_type)
                         if file_info:
-                            cursor.execute("""
+                            self._execute(cursor, """
                                 UPDATE file_index_cache
                                 SET file_size = ?,
                                     modified_time = ?,
@@ -270,10 +283,10 @@ class FileIndexUpdater:
             # 处理删除文件（标记为已删除）
             if deleted_files:
                 print(f"  [删除] 标记 {len(deleted_files)} 个文件为已删除...")
-                placeholders = ','.join(['?'] * len(deleted_files))
-                cursor.execute(f"""
+                placeholders = self._placeholders(len(deleted_files))
+                self._execute(cursor, f"""
                     UPDATE file_index_cache
-                    SET is_deleted = 1,
+                    SET is_deleted = {self._bool_value(True)},
                         last_checked = CURRENT_TIMESTAMP
                     WHERE file_path IN ({placeholders})
                 """, list(deleted_files))
@@ -281,10 +294,10 @@ class FileIndexUpdater:
                 stats['files_deleted'] += len(deleted_files)
             
             # 更新所有文件的 last_checked（即使未变化）
-            cursor.execute("""
+            self._execute(cursor, f"""
                 UPDATE file_index_cache
                 SET last_checked = CURRENT_TIMESTAMP
-                WHERE folder_type = ? AND is_deleted = 0
+                WHERE folder_type = ? AND is_deleted = {self._bool_value(False)}
             """, (folder_type,))
             conn.commit()
             

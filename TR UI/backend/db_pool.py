@@ -5,16 +5,15 @@ Database Connection Pool Module
 Provides database connection pool management for improved concurrency and stability
 """
 
-import sqlite3
 import threading
 from queue import Queue, Empty
 from contextlib import contextmanager
-import os
-import time
+
+from db_adapter import get_connection as adapter_get_connection, is_postgres
 
 
 class ConnectionPool:
-    """SQLite Connection Pool"""
+    """SQLite connection pool."""
     
     def __init__(self, db_path, max_connections=10, timeout=30.0):
         """
@@ -43,17 +42,9 @@ class ConnectionPool:
     def _create_connection(self):
         """Create new database connection"""
         try:
-            conn = sqlite3.connect(self.db_path, timeout=self.timeout)
-            conn.row_factory = sqlite3.Row
-            
-            # Optimization settings
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA busy_timeout=30000")
-            conn.execute("PRAGMA foreign_keys = ON")
-            conn.execute("PRAGMA optimize")
-            
-            return conn
+            if is_postgres():
+                raise RuntimeError("ConnectionPool is SQLite-only and should not be used with PostgreSQL")
+            return adapter_get_connection()
         except Exception as e:
             try:
                 print(f"[ERROR] Failed to create database connection: {e}")
@@ -170,6 +161,8 @@ _pool = None
 def init_pool(db_path, max_connections=10):
     """Initialize global connection pool"""
     global _pool
+    if is_postgres():
+        raise RuntimeError("db_pool.init_pool() should not be used when DB_BACKEND=postgres")
     if _pool is None:
         _pool = ConnectionPool(db_path, max_connections)
         try:

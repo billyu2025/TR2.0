@@ -53,7 +53,16 @@
                 <div class="page-header">
                     <h1>TR記錄管理</h1>
                     <div class="system-update-notice">
-                        提示：每天 13:05-13:15、16:20-16:30，系統處於更新狀態，更新完成後方可使用。
+                        <div class="notice-title">
+                            <span class="notice-icon">⚠</span>
+                            <span>系統更新時段</span>
+                        </div>
+                        <div class="notice-slots">
+                            <span class="notice-slot">13:05 - 13:15</span>
+                            <span class="notice-separator">，</span>
+                            <span class="notice-slot">16:20 - 16:30</span>
+                        </div>
+                        <div class="notice-text">更新期間功能可能短暫受影響，請於更新完成後再操作。</div>
                     </div>
                     <button 
                         class="update-data-btn" 
@@ -423,69 +432,6 @@
                 </div>
                 </div>
             </main>
-        <!-- 编辑弹窗（放在根容器内） -->
-        <div v-if="editModalVisible" class="download-progress-overlay" @click="closeEditModal">
-            <div class="download-progress-content edit-modal" @click.stop>
-                <div class="edit-modal-header">
-                    <h3>編輯訂單 {{ editData.header?.Order_No || '' }}</h3>
-                    <button class="edit-close-btn" @click="closeEditModal">✕</button>
-                </div>
-                <div class="form-grid">
-                    <div class="form-row"><label>Client</label><input type="text" v-model="editData.header.Client"></div>
-                    <div class="form-row"><label>Jobsite</label><input type="text" v-model="editData.header.Jobsite"></div>
-                    <div class="form-row"><label>Job No</label><input type="text" v-model="editData.header.Job_No"></div>
-                    <div class="form-row"><label>PO No(2)</label><input type="text" v-model="editData.header.PO_No_2"></div>
-                    <div class="form-row"><label>Del Date</label><input type="date" v-model="editData.header.Del_Date"></div>
-                    <div class="form-row"><label>Ref No</label><input type="text" v-model="editData.header.Ref_No"></div>
-                    <div class="form-row full"><label>Order Description</label><input type="text" v-model="editData.header.Order_Description"></div>
-                    <div class="form-row"><label>Supplier</label><input type="text" v-model="editData.header.Supplier"></div>
-                </div>
-                <div class="edit-section-title">行明細</div>
-                <div class="table-container edit-lines-table">
-                    <table class="tr-table">
-                        <thead>
-                            <tr>
-                                <th>Dia</th>
-                                <th>Wt(ton)</th>
-                                <th>Product</th>
-                                <th>Grade</th>
-                                <th>Pattern</th>
-                                <th>Mill_Cert</th>
-                                <th>Test_Cert2</th>
-                                <th>Test_Cert1</th>
-                                <th>Supplier</th>
-                                <th>Stockist_Cert</th>
-                                <th>PO_No(1)</th>
-                                <th>Tag_No</th>
-                                <th>DN_No</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <tr v-for="(line, idx) in editData.lines" :key="line.id">
-                                <td><input type="text" v-model="line.Dia"></td>
-                                <td><input type="number" step="0.001" v-model.number="line.Wt"></td>
-                                <td><input type="text" v-model="line.Product"></td>
-                                <td><input type="text" v-model="line.Grade"></td>
-                                <td><input type="text" v-model="line.Pattern"></td>
-                                <td><input type="text" v-model="line.Mill_Cert"></td>
-                                <td><input type="text" v-model="line.Test_Cert2"></td>
-                                <td><input type="text" v-model="line.Test_Cert1"></td>
-                                <td><input type="text" v-model="line.Supplier"></td>
-                                <td><input type="text" v-model="line.Stockist_Cert"></td>
-                                <td><input type="text" v-model="line.PO_No_1"></td>
-                                <td><input type="text" v-model="line.Tag_No"></td>
-                                <td><input type="text" v-model="line.DN_No"></td>
-                            </tr>
-                        </tbody>
-                    </table>
-                </div>
-                <div class="edit-actions">
-                    <button class="save-btn" @click="saveEdits">保存</button>
-                    <button class="cancel-btn" @click="closeEditModal">取消</button>
-                </div>
-            </div>
-        </div>
-
         <!-- 设置弹窗 -->
         <div v-if="showSettings" class="modal-overlay" @click="closeSettings">
             <div class="modal-content" @click.stop>

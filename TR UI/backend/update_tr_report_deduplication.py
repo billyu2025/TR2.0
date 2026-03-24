@@ -8,11 +8,13 @@
 """
 
 import pandas as pd
-import sqlite3
 import logging
 import os
 import sys
 from datetime import datetime
+from sqlalchemy import create_engine, text
+
+from db_adapter import DB_PATH, POSTGRES_DSN, is_postgres
 
 # 配置日志
 def setup_logging():
@@ -33,34 +35,78 @@ def setup_logging():
     )
     return logging.getLogger(__name__)
 
-# SQLite数据库配置 - 指向data_3years.db
-SQLITE_DB_PATH = os.path.join(os.path.dirname(__file__), 'TR database', 'data_3years.db')
-
 class TRReportDeduplicationUpdater:
     """TR_Report_Deduplication表更新器"""
     
     def __init__(self):
         self.logger = setup_logging()
-        self.sqlite_conn = None
+        self.engine = None
+        self.table_tr_report = '"TR_Report"' if is_postgres() else 'TR_Report'
+        self.table_dedup = '"TR_Report_Deduplication"' if is_postgres() else 'TR_Report_Deduplication'
         
-    def create_sqlite_connection(self):
-        """创建SQLite数据库连接"""
+    def create_connection(self):
+        """创建数据库连接"""
         try:
-            # 确保目录存在
-            db_dir = os.path.dirname(SQLITE_DB_PATH)
-            if not os.path.exists(db_dir):
-                os.makedirs(db_dir)
-            
-            self.sqlite_conn = sqlite3.connect(SQLITE_DB_PATH, timeout=30.0)
-            # 启用 WAL 模式以提高并发性能
-            self.sqlite_conn.execute("PRAGMA journal_mode=WAL")
-            self.sqlite_conn.execute("PRAGMA synchronous=NORMAL")
-            self.sqlite_conn.execute("PRAGMA busy_timeout=30000")
-            self.logger.info(f"✅ SQLite数据库连接成功（WAL模式）: {SQLITE_DB_PATH}")
+            if is_postgres():
+                if not POSTGRES_DSN:
+                    raise RuntimeError("POSTGRES_DSN 未配置")
+                self.engine = create_engine(POSTGRES_DSN)
+                self.logger.info("✅ PostgreSQL 数据库连接成功")
+            else:
+                db_dir = os.path.dirname(DB_PATH)
+                if db_dir and not os.path.exists(db_dir):
+                    os.makedirs(db_dir)
+                self.engine = create_engine(f"sqlite:///{DB_PATH}")
+                self.logger.info(f"✅ SQLite数据库连接成功: {DB_PATH}")
             return True
         except Exception as e:
-            self.logger.error(f"❌ SQLite数据库连接失败: {e}")
+            self.logger.error(f"❌ 数据库连接失败: {e}")
             return False
+
+    def _table_exists(self, conn, table_name: str) -> bool:
+        if is_postgres():
+            # PostgreSQL: 使用 pg_tables 查询，正确处理带引号的表名
+            result = conn.execute(
+                text("""
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM pg_tables
+                        WHERE schemaname = 'public' AND tablename = :table_name
+                    ) AS exists
+                """),
+                {"table_name": table_name}
+            ).mappings().first()
+            return bool(result["exists"]) if result else False
+        result = conn.execute(
+            text("""
+                SELECT EXISTS (
+                    SELECT 1 FROM sqlite_master
+                    WHERE type='table' AND name=:table_name
+                ) AS exists
+            """),
+            {"table_name": table_name}
+        ).mappings().first()
+        return bool(result["exists"]) if result else False
+
+    def _normalize_records(self, grouped_df):
+        grouped_df = grouped_df.where(pd.notna(grouped_df), None)
+        records = []
+        for row in grouped_df.to_dict(orient='records'):
+            records.append({
+                "Order_No": row.get("Order_No"),
+                "Job_No": row.get("Job_No"),
+                "Jobsite": row.get("Jobsite"),
+                "Order_Description": row.get("Order_Description"),
+                "Client": row.get("Client"),
+                "Del_Date": row.get("Del_Date"),
+                "Ref_No": row.get("Ref_No"),
+                "PO_No": row.get("PO_No"),
+                "Jobsite_Type": row.get("Jobsite_Type"),
+                "Wt": row.get("Wt"),
+                "Grade": row.get("Grade"),
+                "rm_dn_no": row.get("rm_dn_no"),
+            })
+        return records
     
     def create_tr_report_deduplication(self):
         """创建 TR_Report_Deduplication 表 - 从 TR_Report 表按 Order_No 去重生成"""
@@ -69,87 +115,123 @@ class TRReportDeduplicationUpdater:
             self.logger.info("开始创建 TR_Report_Deduplication 表")
             self.logger.info("=" * 60)
             
-            # 检查 TR_Report 表是否存在
-            cursor = self.sqlite_conn.cursor()
-            cursor.execute("""
-                SELECT name FROM sqlite_master 
-                WHERE type='table' AND name='TR_Report'
-            """)
-            if not cursor.fetchone():
-                self.logger.error("❌ TR_Report 表不存在，请先创建 TR_Report 表")
-                return False
+            with self.engine.begin() as conn:
+                if not self._table_exists(conn, 'TR_Report'):
+                    self.logger.error("❌ TR_Report 表不存在，请先创建 TR_Report 表")
+                    return False
+                
+                self.logger.info("从 TR_Report 表读取数据...")
+                tr_report_df = pd.read_sql_query(f"SELECT * FROM {self.table_tr_report}", conn)
+                self.logger.info(f"从 TR_Report 读取了 {len(tr_report_df):,} 条记录")
             
-            # 读取 TR_Report 表数据
-            self.logger.info("从 TR_Report 表读取数据...")
-            tr_report_df = pd.read_sql("SELECT * FROM TR_Report", self.sqlite_conn)
-            self.logger.info(f"从 TR_Report 读取了 {len(tr_report_df):,} 条记录")
+                if tr_report_df.empty:
+                    self.logger.warning("⚠️ TR_Report 表为空，TR_Report_Deduplication 也将为空")
             
-            if tr_report_df.empty:
-                self.logger.warning("⚠️ TR_Report 表为空，TR_Report_Deduplication 也将为空")
+                self.logger.info("按 order_no 分组并聚合...")
+                grouped = tr_report_df.groupby('order_no').agg({
+                    'Job_No': 'first',
+                    'jobsite': 'first',
+                    'order_describution': 'first',
+                    'client': 'first',
+                    'del_date': 'first',
+                    'ref_no': 'first',
+                    'bbs_po_no': 'first',
+                    'jobsite_type': 'first',
+                    'wt_ton': 'sum',
+                    'grade': 'first',
+                    'rm_dn_no': 'first',
+                }).reset_index()
             
-            # 按 order_no 分组去重
-            self.logger.info("按 order_no 分组并聚合...")
-            grouped = tr_report_df.groupby('order_no').agg({
-                'Job_No': 'first',
-                'jobsite': 'first',
-                'order_describution': 'first',
-                'client': 'first',
-                'del_date': 'first',
-                'ref_no': 'first',
-                'bbs_po_no': 'first',
-                'jobsite_type': 'first',
-                'wt_ton': 'sum',  # 累加重量
-                'grade': 'first',
-                'rm_dn_no': 'first',
-            }).reset_index()
+                grouped = grouped.rename(columns={
+                    'order_no': 'Order_No',
+                    'jobsite': 'Jobsite',
+                    'order_describution': 'Order_Description',
+                    'client': 'Client',
+                    'del_date': 'Del_Date',
+                    'ref_no': 'Ref_No',
+                    'bbs_po_no': 'PO_No',
+                    'jobsite_type': 'Jobsite_Type',
+                    'wt_ton': 'Wt',
+                    'grade': 'Grade',
+                    'rm_dn_no': 'rm_dn_no'
+                })
             
-            # 重命名列以匹配 TR_Report_Deduplication 的命名风格
-            grouped = grouped.rename(columns={
-                'order_no': 'Order_No',
-                'jobsite': 'Jobsite',
-                'order_describution': 'Order_Description',
-                'client': 'Client',
-                'del_date': 'Del_Date',
-                'ref_no': 'Ref_No',
-                'bbs_po_no': 'PO_No',
-                'jobsite_type': 'Jobsite_Type',
-                'wt_ton': 'Wt',
-                'grade': 'Grade',
-                'rm_dn_no': 'rm_dn_no'
-            })
-            # Job_No 已经是正确名称，不需要重命名
+                self.logger.info(f"聚合为 {len(grouped):,} 个唯一订单")
             
-            self.logger.info(f"聚合为 {len(grouped):,} 个唯一订单")
-            
-            # 按 Del_Date 降序排列
-            self.logger.info("按 Del_Date 降序排列...")
-            grouped = grouped.sort_values('Del_Date', ascending=False, na_position='last')
-            
-            # 如果表已存在，先删除
-            cursor.execute("DROP TABLE IF EXISTS TR_Report_Deduplication")
-            self.sqlite_conn.commit()
-            self.logger.info("已删除旧的 TR_Report_Deduplication 表（如果存在）")
-            
-            # 写入 SQLite 数据库
-            self.logger.info("写入 TR_Report_Deduplication 表...")
-            grouped.to_sql('TR_Report_Deduplication', self.sqlite_conn, if_exists='replace', index=False)
-            self.sqlite_conn.commit()
-            
-            # 验证数据
-            verify_count = pd.read_sql("SELECT COUNT(*) as cnt FROM TR_Report_Deduplication", self.sqlite_conn).iloc[0]['cnt']
-            self.logger.info(f"✅ TR_Report_Deduplication 表创建成功: {verify_count:,} 条记录")
-            
-            # 显示统计信息
-            stats = pd.read_sql("""
-                SELECT 
-                    MIN(Del_Date) as earliest_date,
-                    MAX(Del_Date) as latest_date,
-                    COUNT(DISTINCT Order_No) as unique_orders,
-                    COUNT(DISTINCT Job_No) as unique_jobsites,
-                    SUM(Wt) as total_weight,
-                    COUNT(DISTINCT Jobsite_Type) as unique_jobsite_types
-                FROM TR_Report_Deduplication
-            """, self.sqlite_conn).iloc[0]
+                self.logger.info("按 Del_Date 降序排列...")
+                grouped = grouped.sort_values('Del_Date', ascending=False, na_position='last')
+
+                conn.execute(text(f"DROP TABLE IF EXISTS {self.table_dedup}"))
+                if is_postgres():
+                    conn.execute(text(f"""
+                        CREATE TABLE {self.table_dedup} (
+                            id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                            "Order_No" BIGINT NOT NULL,
+                            "Job_No" TEXT,
+                            "Jobsite" TEXT,
+                            "Order_Description" TEXT,
+                            "Client" TEXT,
+                            "Del_Date" DATE,
+                            "Ref_No" TEXT,
+                            "PO_No" TEXT,
+                            "Jobsite_Type" TEXT,
+                            "Wt" DOUBLE PRECISION,
+                            "Grade" TEXT,
+                            "rm_dn_no" TEXT
+                        )
+                    """))
+                else:
+                    conn.execute(text(f"""
+                        CREATE TABLE {self.table_dedup} (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            "Order_No" INTEGER NOT NULL,
+                            "Job_No" TEXT,
+                            "Jobsite" TEXT,
+                            "Order_Description" TEXT,
+                            "Client" TEXT,
+                            "Del_Date" TEXT,
+                            "Ref_No" TEXT,
+                            "PO_No" TEXT,
+                            "Jobsite_Type" TEXT,
+                            "Wt" REAL,
+                            "Grade" TEXT,
+                            "rm_dn_no" TEXT
+                        )
+                    """))
+                self.logger.info("已删除并重建 TR_Report_Deduplication 表")
+
+                records = self._normalize_records(grouped)
+                if records:
+                    conn.execute(
+                        text(f"""
+                            INSERT INTO {self.table_dedup} (
+                                "Order_No", "Job_No", "Jobsite", "Order_Description", "Client",
+                                "Del_Date", "Ref_No", "PO_No", "Jobsite_Type", "Wt", "Grade", "rm_dn_no"
+                            ) VALUES (
+                                :Order_No, :Job_No, :Jobsite, :Order_Description, :Client,
+                                :Del_Date, :Ref_No, :PO_No, :Jobsite_Type, :Wt, :Grade, :rm_dn_no
+                            )
+                        """),
+                        records
+                    )
+
+                verify_count = conn.execute(
+                    text(f'SELECT COUNT(*) AS cnt FROM {self.table_dedup}')
+                ).mappings().first()['cnt']
+                self.logger.info(f"✅ TR_Report_Deduplication 表创建成功: {verify_count:,} 条记录")
+
+                stats = conn.execute(
+                    text(f"""
+                        SELECT 
+                            MIN("Del_Date") as earliest_date,
+                            MAX("Del_Date") as latest_date,
+                            COUNT(DISTINCT "Order_No") as unique_orders,
+                            COUNT(DISTINCT "Job_No") as unique_jobsites,
+                            SUM("Wt") as total_weight,
+                            COUNT(DISTINCT "Jobsite_Type") as unique_jobsite_types
+                        FROM {self.table_dedup}
+                    """)
+                ).mappings().first()
             
             self.logger.info("=" * 60)
             self.logger.info("表统计信息:")
@@ -178,11 +260,9 @@ class TRReportDeduplicationUpdater:
         self.logger.info("=" * 60)
         
         try:
-            # 1. 连接SQLite数据库
-            if not self.create_sqlite_connection():
-                raise Exception("无法连接SQLite数据库")
+            if not self.create_connection():
+                raise Exception("无法连接数据库")
             
-            # 2. 创建TR_Report_Deduplication表
             if self.create_tr_report_deduplication():
                 self.logger.info("🎉 TR_Report_Deduplication 表更新成功！")
             else:
@@ -199,9 +279,8 @@ class TRReportDeduplicationUpdater:
             self.logger.error(traceback.format_exc())
         
         finally:
-            # 关闭连接
-            if self.sqlite_conn:
-                self.sqlite_conn.close()
+            if self.engine:
+                self.engine.dispose()
             
             self.logger.info("=" * 60)
             self.logger.info("TR_Report_Deduplication 表更新流程结束")

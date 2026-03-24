@@ -19,11 +19,31 @@ createApp({
         this.restoreRememberedUser();
         sessionStorage.removeItem('authInfo');
         sessionStorage.removeItem('userSettings');
+        this.ensureHttpAccess();
     },
     methods: {
+        ensureHttpAccess() {
+            if (window.location.protocol !== 'file:') return;
+
+            const redirected = sessionStorage.getItem('loginRedirectTried') === '1';
+            const targetUrl = 'http://localhost:8000/login.html';
+
+            if (!redirected) {
+                sessionStorage.setItem('loginRedirectTried', '1');
+                window.location.href = targetUrl;
+                return;
+            }
+
+            this.errorMessage = '請使用 HTTP 地址訪問： http://localhost:8000/login.html（不要直接雙擊打開 login.html）';
+        },
         async handleLogin() {
             this.errorMessage = '';
             this.successMessage = '';
+
+            if (window.location.protocol === 'file:') {
+                this.errorMessage = '當前是 file:// 打開方式，瀏覽器會攔截登入請求。請改用 http://localhost:8000/login.html';
+                return;
+            }
 
             if (!this.loginForm.username || !this.loginForm.password) {
                 this.errorMessage = '請輸入帳號名稱和密碼';
@@ -32,11 +52,12 @@ createApp({
 
             this.loading = true;
             try {
-                // 获取 API 基础 URL，如果是相对路径（以 / 开头），直接使用；否则拼接 /api
-                const apiBaseUrl = window.API_BASE_URL || 'http://127.0.0.1:5000';
-                const apiUrl = apiBaseUrl.startsWith('/') 
-                    ? `${apiBaseUrl}/auth/login`  // 相对路径，去掉 /api 前缀（因为 apiBaseUrl 已经是 /api）
-                    : `${apiBaseUrl}/api/auth/login`;  // 绝对路径，需要加上 /api
+                // 统一规范 API URL，兼容: /api, /api/, http://host:5000, http://host:5000/api
+                const apiBaseUrlRaw = (window.API_BASE_URL || 'http://127.0.0.1:5000').trim();
+                const apiBaseUrl = apiBaseUrlRaw.replace(/\/+$/, '');
+                const hasApiSuffix = /\/api$/i.test(apiBaseUrl);
+                const apiUrl = `${apiBaseUrl}${hasApiSuffix ? '' : '/api'}/auth/login`;
+
                 const response = await fetch(apiUrl, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -46,10 +67,16 @@ createApp({
                     })
                 });
 
-                const result = await response.json();
+                const responseText = await response.text();
+                let result = {};
+                try {
+                    result = responseText ? JSON.parse(responseText) : {};
+                } catch (parseError) {
+                    throw new Error(`登入服務回應格式錯誤（HTTP ${response.status}）`);
+                }
 
                 if (!response.ok || !result.success) {
-                    throw new Error(result.error || '登入失敗');
+                    throw new Error(result.error || `登入失敗（HTTP ${response.status}）`);
                 }
 
                 this.successMessage = `歡迎回來，${result.user.name || result.user.username}！`;

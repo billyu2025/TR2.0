@@ -1,27 +1,10 @@
 @echo off
-REM TR Backend 服务重启脚本
-REM 使用方法：双击运行此脚本
-
-echo ========================================
-echo Restarting TR Backend Service
-echo ========================================
-echo.
-
-echo Stopping service...
-net stop TR-Backend
+REM 简单的服务重启脚本
+cd /d "%~dp0"
+echo 正在重启 TR-Backend 服务...
+nssm-2.24\win64\nssm.exe restart TR-Backend
 timeout /t 3 /nobreak >nul
-
-echo Starting service...
-net start TR-Backend
-timeout /t 3 /nobreak >nul
-
+nssm-2.24\win64\nssm.exe status TR-Backend
 echo.
-echo Checking service status...
-sc query TR-Backend | findstr "STATE"
-
-echo.
-echo ========================================
-echo Service restarted!
-echo ========================================
-echo.
+echo 完成！
 pause

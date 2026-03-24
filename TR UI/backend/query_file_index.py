@@ -4,9 +4,10 @@
 查询文件索引表中的 file_path 数据
 """
 
-import sqlite3
 import os
 import sys
+
+from db_adapter import get_connection as get_db_connection, is_postgres
 
 # 设置输出编码为 UTF-8
 if sys.platform == 'win32':
@@ -20,6 +21,16 @@ _project_root = os.path.normpath(os.path.join(_current_dir, '..', '..'))
 _default_db_path = os.path.join(_project_root, 'TR database', 'data_3years.db')
 DB_PATH = os.path.abspath(_default_db_path)
 
+
+def _sql(sql_text):
+    if is_postgres():
+        return sql_text.replace('?', '%s')
+    return sql_text
+
+
+def _execute(cursor, sql_text, params=()):
+    return cursor.execute(_sql(sql_text), params)
+
 def query_file_paths(limit=50, folder_type=None, folder_path_filter=None):
     """
     查询索引表中的 file_path 数据
@@ -30,8 +41,7 @@ def query_file_paths(limit=50, folder_type=None, folder_path_filter=None):
         folder_path_filter: 文件夹路径过滤（如包含 'HL2310'）
     """
     try:
-        conn = sqlite3.connect(DB_PATH, timeout=30.0)
-        conn.row_factory = sqlite3.Row
+        conn = get_db_connection()
         cursor = conn.cursor()
         
         # 构建查询
@@ -49,7 +59,7 @@ def query_file_paths(limit=50, folder_type=None, folder_path_filter=None):
         query += " LIMIT ?"
         params.append(limit)
         
-        cursor.execute(query, params)
+        _execute(cursor, query, params)
         rows = cursor.fetchall()
         
         print(f"数据库路径: {DB_PATH}")
@@ -75,12 +85,12 @@ def query_file_paths(limit=50, folder_type=None, folder_path_filter=None):
         print("=" * 100)
         
         # 统计信息
-        cursor.execute("SELECT COUNT(*) as cnt FROM file_index_cache WHERE is_deleted = 0")
+        _execute(cursor, "SELECT COUNT(*) as cnt FROM file_index_cache WHERE is_deleted = 0")
         total = cursor.fetchone()['cnt']
         print(f"\n总记录数: {total}")
         
         if folder_type:
-            cursor.execute("SELECT COUNT(*) as cnt FROM file_index_cache WHERE is_deleted = 0 AND folder_type = ?", (folder_type,))
+            _execute(cursor, "SELECT COUNT(*) as cnt FROM file_index_cache WHERE is_deleted = 0 AND folder_type = ?", (folder_type,))
             filtered_total = cursor.fetchone()['cnt']
             print(f"{folder_type} 类型记录数: {filtered_total}")
         
@@ -95,10 +105,9 @@ if __name__ == "__main__":
     # 查询 HL2310 文件夹（通过 file_name）
     print("查询 file_name 包含 HL2310 的记录:")
     try:
-        conn = sqlite3.connect(DB_PATH, timeout=30.0)
-        conn.row_factory = sqlite3.Row
+        conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("""
+        _execute(cursor, """
             SELECT file_path, folder_path, folder_type, file_name 
             FROM file_index_cache 
             WHERE is_deleted = 0 AND file_name LIKE '%HL2310%'

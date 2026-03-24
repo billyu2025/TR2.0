@@ -75,16 +75,13 @@ def generate_pdf_task(self, order_no):
             tr_api = importlib.import_module('tr_fill_in_api')
             get_db_connection = tr_api.get_db_connection
             cache = tr_api.cache
+            upsert_pdf_status = tr_api._upsert_pdf_status
             
             conn = get_db_connection()
             cursor = conn.cursor()
             
             try:
-                cursor.execute("""
-                    INSERT OR REPLACE INTO PDF_Status 
-                    (Order_No, pdf_status, pdf_path, generated_at, updated_at)
-                    VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                """, (order_no, 'generated', pdf_path))
+                upsert_pdf_status(cursor, order_no, 'generated', pdf_path=pdf_path, generated_at=True)
                 
                 conn.commit()
                 
@@ -115,16 +112,13 @@ def generate_pdf_task(self, order_no):
             tr_api = importlib.import_module('tr_fill_in_api')
             get_db_connection = tr_api.get_db_connection
             cache = tr_api.cache
+            upsert_pdf_status = tr_api._upsert_pdf_status
             
             conn = get_db_connection()
             cursor = conn.cursor()
             
             try:
-                cursor.execute("""
-                    INSERT OR REPLACE INTO PDF_Status 
-                    (Order_No, pdf_status, updated_at)
-                    VALUES (?, ?, CURRENT_TIMESTAMP)
-                """, (order_no, 'failed'))
+                upsert_pdf_status(cursor, order_no, 'failed')
                 
                 conn.commit()
                 
@@ -152,14 +146,11 @@ def generate_pdf_task(self, order_no):
             tr_api = importlib.import_module('tr_fill_in_api')
             get_db_connection = tr_api.get_db_connection
             cache = tr_api.cache
+            upsert_pdf_status = tr_api._upsert_pdf_status
             
             conn = get_db_connection()
             cursor = conn.cursor()
-            cursor.execute("""
-                INSERT OR REPLACE INTO PDF_Status 
-                (Order_No, pdf_status, updated_at)
-                VALUES (?, ?, CURRENT_TIMESTAMP)
-            """, (order_no, 'failed'))
+            upsert_pdf_status(cursor, order_no, 'failed')
             conn.commit()
             
             try:

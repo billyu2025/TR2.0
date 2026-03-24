@@ -9,6 +9,19 @@ function getAuthInfo() {
     }
 }
 
+/** 從 session 同步角色，避免首屏 userInfo.role 為空時側欄管理入口被 v-if 隱藏 */
+function getSessionUserRole() {
+    try {
+        const authInfo = getAuthInfo();
+        if (authInfo.user && authInfo.user.role) {
+            return authInfo.user.role;
+        }
+    } catch (e) {
+        /* ignore */
+    }
+    return '';
+}
+
 // 辅助函数：构建正确的 API URL，避免路径重复
 function buildApiUrl(path) {
     const apiBaseUrl = window.API_BASE_URL || 'http://127.0.0.1:5000';
@@ -70,6 +83,33 @@ async function fetchWithRetry(url, options = {}, maxRetries = 3, retryDelay = 10
         }
     }
     throw lastError;
+}
+
+// 日期格式化函数：将各种日期格式转换为 YYYY-MM-DD
+function formatDateToYYYYMMDD(dateValue) {
+    if (!dateValue) return '';
+    
+    // 如果已经是 YYYY-MM-DD 格式的字符串，直接返回
+    if (typeof dateValue === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(dateValue)) {
+        return dateValue;
+    }
+    
+    try {
+        // 尝试解析为 Date 对象
+        const date = new Date(dateValue);
+        // 检查日期是否有效
+        if (isNaN(date.getTime())) {
+            return '';
+        }
+        // 格式化为 YYYY-MM-DD
+        const year = date.getFullYear();
+        const month = String(date.getMonth() + 1).padStart(2, '0');
+        const day = String(date.getDate()).padStart(2, '0');
+        return `${year}-${month}-${day}`;
+    } catch (error) {
+        console.warn('日期格式化失败:', dateValue, error);
+        return '';
+    }
 }
 
 async function apiFetch(path, options = {}) {
@@ -134,7 +174,7 @@ createApp({
             userInfo: {
                 username: '',
                 name: '',
-                role: '',
+                role: getSessionUserRole(),
                 jobNos: []
             },
             defaultPageSize: 100,
@@ -172,9 +212,6 @@ createApp({
             },
             isSearching: false,
             _searchDebounce: null,
-            editModalVisible: false,
-            editData: { header: {}, lines: [] },
-            _editOriginal: null,
             isCancelling: false,
             currentAbortController: null,
             // 更新数据相关
@@ -417,7 +454,7 @@ createApp({
                         jobNo: order.Job_No ? order.Job_No.toString() : '',
                         jobsiteType: order.Jobsite_Type || '',
                         rmDnNo: order.rm_dn_no || '',
-                        delDate: order.Del_Date || '',
+                        delDate: formatDateToYYYYMMDD(order.Del_Date),
                         status: (order.pdf_status || '').toLowerCase() || 'pending',
                         pdfPath: order.pdf_path || null,
                         generatedAt: order.generated_at || null
@@ -432,7 +469,7 @@ createApp({
                         client: order.Client || '',
                         jobsite: order.Jobsite || '',
                         jobsiteType: order.Jobsite_Type || '',
-                        delDate: order.Del_Date || '',
+                        delDate: formatDateToYYYYMMDD(order.Del_Date),
                         wt: order.Wt || 0,
                         rmDnNo: order.rm_dn_no || '',
                         status: (order.pdf_status || '').toLowerCase() || 'pending',
@@ -505,7 +542,7 @@ createApp({
                         jobNo: order.Job_No ? order.Job_No.toString() : '',
                         jobsiteType: order.Jobsite_Type || '',
                         rmDnNo: order.rm_dn_no || '',
-                        delDate: order.Del_Date || '',
+                        delDate: formatDateToYYYYMMDD(order.Del_Date),
                         status: (order.pdf_status || '').toLowerCase() || 'pending',
                         pdfPath: order.pdf_path || null,
                         generatedAt: order.generated_at || null
@@ -520,7 +557,7 @@ createApp({
                         client: order.Client || '',
                         jobsite: order.Jobsite || '',
                         jobsiteType: order.Jobsite_Type || '',
-                        delDate: order.Del_Date || '',
+                        delDate: formatDateToYYYYMMDD(order.Del_Date),
                         wt: order.Wt || 0,
                         rmDnNo: order.rm_dn_no || '',
                         status: (order.pdf_status || '').toLowerCase() || 'pending',
@@ -548,75 +585,6 @@ createApp({
             this.isSearching = false;
             this.pageSize = this.defaultPageSize;
             await this.loadOrdersFromAPI();
-        },
-
-        editRecord(record) {
-            this.openEditModal(record.orderNo);
-        },
-
-        async openEditModal(orderNo) {
-            if (this.userInfo.role !== 'admin') {
-                alert('只有管理员可以编辑记录');
-                return;
-            }
-            try {
-                const result = await apiFetch(`/api/orders-gen-pdf/${orderNo}`);
-                this.editData = JSON.parse(JSON.stringify(result.data));
-                this._editOriginal = JSON.parse(JSON.stringify(result.data));
-                this.editModalVisible = true;
-            } catch (error) {
-                console.error('加载编辑数据失败', error);
-                alert(error.message || '加载编辑数据失败');
-            }
-        },
-
-        closeEditModal() {
-            this.editModalVisible = false;
-            this.editData = { header: {}, lines: [] };
-            this._editOriginal = null;
-        },
-
-        async saveEdits() {
-            try {
-                const orderNo = this.editData.header.Order_No;
-                const header_updates = {};
-                const headerKeys = ['Client','Jobsite','Job_No','PO_No_2','Del_Date','Ref_No','Order_Description','Supplier','Order_No'];
-                headerKeys.forEach(k => {
-                    const cur = this.editData.header[k];
-                    const prev = this._editOriginal.header[k];
-                    if (cur !== prev && cur !== undefined) header_updates[k] = cur;
-                });
-                const line_updates = [];
-                for (let i = 0; i < this.editData.lines.length; i++) {
-                    const cur = this.editData.lines[i];
-                    const prev = (this._editOriginal.lines.find(l => l.id === cur.id)) || {};
-                    const fields = ['Dia','Wt','Product','Grade','Pattern','Mill_Cert','Test_Cert2','Test_Cert1','Supplier','Stockist_Cert','PO_No_1','Tag_No','DN_No'];
-                    const diff = { id: cur.id };
-                    let changed = false;
-                    fields.forEach(f => {
-                        if (cur[f] !== prev[f]) { diff[f] = cur[f]; changed = true; }
-                    });
-                    if (changed) line_updates.push(diff);
-                }
-                if (Object.keys(header_updates).length === 0 && line_updates.length === 0) {
-                    alert('未检测到变更');
-                    return;
-                }
-                await apiFetch(`/api/orders-gen-pdf/${orderNo}/edit`, {
-                    method: 'POST',
-                    body: JSON.stringify({ header_updates, line_updates })
-                });
-                this.closeEditModal();
-                if (this.isSearching) {
-                    await this.executeSearch();
-            } else {
-                    await this.loadOrdersFromAPI(this.currentPage);
-                }
-                alert('已保存修改，状态已置为未生成');
-            } catch (error) {
-                console.error('保存失败', error);
-                alert(error.message || '保存失败，请重试');
-            }
         },
 
         async regeneratePDF(record) {
@@ -924,7 +892,7 @@ createApp({
                         jobNo: String(order.Job_No || ''),
                         jobsiteType: order.Jobsite_Type || '',
                         rmDnNo: order.rm_dn_no || '',
-                        delDate: order.Del_Date || '',
+                        delDate: formatDateToYYYYMMDD(order.Del_Date),
                         status: (order.pdf_status || 'pending').toLowerCase(),
                         pdfPath: order.pdf_path || null,
                         generatedAt: order.generated_at || null
@@ -937,7 +905,7 @@ createApp({
                         client: order.Client || '',
                         jobsite: order.Jobsite || '',
                         jobsiteType: order.Jobsite_Type || '',
-                        delDate: order.Del_Date || '',
+                        delDate: formatDateToYYYYMMDD(order.Del_Date),
                         wt: order.Wt || 0,
                         rmDnNo: order.rm_dn_no || '',
                         status: (order.pdf_status || 'pending').toLowerCase(),

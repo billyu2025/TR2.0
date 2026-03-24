@@ -4,9 +4,9 @@
 测试文件索引缓存表是否创建成功
 """
 
-import sqlite3
 import os
 from dotenv import load_dotenv
+from db_adapter import get_connection as get_db_connection, is_postgres
 
 # 加载环境变量
 load_dotenv()
@@ -22,6 +22,89 @@ if not os.path.isabs(DB_PATH):
     DB_PATH = os.path.abspath(os.path.join(_project_root, DB_PATH))
 
 
+def _sql(sql_text):
+    if is_postgres():
+        return sql_text.replace('?', '%s')
+    return sql_text
+
+
+def _execute(cursor, sql_text, params=()):
+    return cursor.execute(_sql(sql_text), params)
+
+
+def _table_exists(cursor, table_name):
+    if is_postgres():
+        _execute(
+            cursor,
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = ?
+            ) AS exists
+            """,
+            (table_name.lower(),)
+        )
+    else:
+        _execute(
+            cursor,
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM sqlite_master
+                WHERE type='table' AND name=?
+            ) AS exists
+            """,
+            (table_name,)
+        )
+    row = cursor.fetchone()
+    if isinstance(row, dict):
+        return bool(row.get('exists'))
+    if hasattr(row, 'keys'):
+        return bool(row['exists'])
+    return bool(row[0]) if row else False
+
+
+def _get_table_columns(cursor, table_name):
+    if is_postgres():
+        _execute(
+            cursor,
+            """
+            SELECT column_name, data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = ?
+            ORDER BY ordinal_position
+            """,
+            (table_name.lower(),)
+        )
+        return cursor.fetchall()
+    _execute(cursor, f"PRAGMA table_info({table_name})")
+    return cursor.fetchall()
+
+
+def _get_indexes(cursor, table_name):
+    if is_postgres():
+        _execute(
+            cursor,
+            """
+            SELECT indexname AS name, indexdef AS sql
+            FROM pg_indexes
+            WHERE schemaname = 'public' AND tablename = ?
+            ORDER BY indexname
+            """,
+            (table_name.lower(),)
+        )
+        return cursor.fetchall()
+    _execute(
+        cursor,
+        """
+        SELECT name, sql FROM sqlite_master
+        WHERE type='index' AND tbl_name=?
+        """,
+        (table_name,)
+    )
+    return cursor.fetchall()
+
+
 def test_file_index_tables():
     """测试文件索引缓存表"""
     print("=" * 60)
@@ -31,43 +114,39 @@ def test_file_index_tables():
     print(f"数据库存在: {os.path.exists(DB_PATH)}")
     print()
     
-    if not os.path.exists(DB_PATH):
+    if not is_postgres() and not os.path.exists(DB_PATH):
         print("❌ 错误: 数据库文件不存在!")
         return False
     
     try:
-        conn = sqlite3.connect(DB_PATH, timeout=30.0)
-        conn.row_factory = sqlite3.Row
+        conn = get_db_connection()
         cursor = conn.cursor()
         
         # 检查 file_index_cache 表
         print("1. 检查 file_index_cache 表...")
-        cursor.execute("""
-            SELECT name FROM sqlite_master 
-            WHERE type='table' AND name='file_index_cache'
-        """)
-        if cursor.fetchone():
+        if _table_exists(cursor, 'file_index_cache'):
             print("   ✅ file_index_cache 表存在")
             
             # 获取表结构
-            cursor.execute("PRAGMA table_info(file_index_cache)")
-            columns = cursor.fetchall()
+            columns = _get_table_columns(cursor, 'file_index_cache')
             print(f"   📋 表结构 ({len(columns)} 个字段):")
             for col in columns:
-                print(f"      - {col['name']}: {col['type']} {'NOT NULL' if col['notnull'] else 'NULL'} {'PRIMARY KEY' if col['pk'] else ''}")
+                if is_postgres():
+                    col_name = col['column_name']
+                    col_type = col['data_type']
+                    nullable = col['is_nullable'] != 'NO'
+                    print(f"      - {col_name}: {col_type} {'NULL' if nullable else 'NOT NULL'}")
+                else:
+                    print(f"      - {col['name']}: {col['type']} {'NOT NULL' if col['notnull'] else 'NULL'} {'PRIMARY KEY' if col['pk'] else ''}")
             
             # 获取索引信息
-            cursor.execute("""
-                SELECT name, sql FROM sqlite_master 
-                WHERE type='index' AND tbl_name='file_index_cache'
-            """)
-            indexes = cursor.fetchall()
+            indexes = _get_indexes(cursor, 'file_index_cache')
             print(f"   📊 索引数量: {len(indexes)}")
             for idx in indexes:
                 print(f"      - {idx['name']}")
             
             # 获取记录数
-            cursor.execute("SELECT COUNT(*) as cnt FROM file_index_cache")
+            _execute(cursor, "SELECT COUNT(*) as cnt FROM file_index_cache")
             count = cursor.fetchone()['cnt']
             print(f"   📈 当前记录数: {count}")
         else:
@@ -78,22 +157,23 @@ def test_file_index_tables():
         
         # 检查 file_index_metadata 表
         print("2. 检查 file_index_metadata 表...")
-        cursor.execute("""
-            SELECT name FROM sqlite_master 
-            WHERE type='table' AND name='file_index_metadata'
-        """)
-        if cursor.fetchone():
+        if _table_exists(cursor, 'file_index_metadata'):
             print("   ✅ file_index_metadata 表存在")
             
             # 获取表结构
-            cursor.execute("PRAGMA table_info(file_index_metadata)")
-            columns = cursor.fetchall()
+            columns = _get_table_columns(cursor, 'file_index_metadata')
             print(f"   📋 表结构 ({len(columns)} 个字段):")
             for col in columns:
-                print(f"      - {col['name']}: {col['type']} {'NOT NULL' if col['notnull'] else 'NULL'} {'PRIMARY KEY' if col['pk'] else ''}")
+                if is_postgres():
+                    col_name = col['column_name']
+                    col_type = col['data_type']
+                    nullable = col['is_nullable'] != 'NO'
+                    print(f"      - {col_name}: {col_type} {'NULL' if nullable else 'NOT NULL'}")
+                else:
+                    print(f"      - {col['name']}: {col['type']} {'NOT NULL' if col['notnull'] else 'NULL'} {'PRIMARY KEY' if col['pk'] else ''}")
             
             # 获取元数据
-            cursor.execute("SELECT * FROM file_index_metadata ORDER BY key")
+            _execute(cursor, "SELECT * FROM file_index_metadata ORDER BY key")
             metadata = cursor.fetchall()
             print(f"   📊 元数据记录 ({len(metadata)} 条):")
             for row in metadata:

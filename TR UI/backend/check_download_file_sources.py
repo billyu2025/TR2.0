@@ -6,7 +6,6 @@
 """
 
 import os
-import sqlite3
 import sys
 
 # 添加当前目录到路径
@@ -14,6 +13,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, current_dir)
 
 from stockist_test_download import StockistTestDownloader
+from db_adapter import get_connection as get_db_connection, is_postgres
 
 # 数据库路径（TR_Report 表在 data_3years.db 中）
 # 从 backend 目录向上两级到项目根目录
@@ -26,6 +26,16 @@ if not os.path.isabs(DB_PATH):
 
 # 基础文件夹路径
 BASE_FOLDER = os.getenv('STOCKIST_TEST_FOLDER', r'D:\Stockist&Test Report')
+
+
+def _sql(sql_text):
+    if is_postgres():
+        return sql_text.replace('?', '%s')
+    return sql_text
+
+
+def _execute(cursor, sql_text, params=()):
+    return cursor.execute(_sql(sql_text), params)
 
 def check_order_files(order_no: int):
     """检查订单的文件来源"""
@@ -136,23 +146,23 @@ def check_order_files(order_no: int):
     if downloader.index_query and downloader.index_query.is_index_available():
         print("\n[步骤 5] 检查文件索引中的信息...")
         try:
-            conn = sqlite3.connect(DB_PATH)
-            conn.row_factory = sqlite3.Row
+            conn = get_db_connection()
             cursor = conn.cursor()
             
             for file_path in all_files[:5]:  # 只检查前5个文件
                 file_name = os.path.basename(file_path)
-                cursor.execute("""
+                _execute(cursor, """
                     SELECT file_path, file_name, folder_path, folder_type, identifiers
                     FROM file_index_cache
                     WHERE file_path = ? AND is_deleted = 0
                 """, (file_path,))
                 row = cursor.fetchone()
                 if row:
+                    identifiers = row.get('identifiers', 'N/A') if isinstance(row, dict) else (row['identifiers'] if hasattr(row, 'keys') else 'N/A')
                     print(f"  ✅ {file_name}")
                     print(f"     索引中的路径: {row['file_path']}")
                     print(f"     文件夹类型: {row['folder_type']}")
-                    print(f"     标识符: {row.get('identifiers', 'N/A')}")
+                    print(f"     标识符: {identifiers}")
                 else:
                     print(f"  ⚠️  {file_name} 不在索引中")
             

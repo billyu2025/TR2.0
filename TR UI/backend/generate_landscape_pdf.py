@@ -6,6 +6,30 @@ import re
 
 import pandas as pd
 
+# 导入日志器（安全导入，如果不可用则使用 print）
+try:
+    from logger_config import get_logger
+    logger = get_logger('pdf_generator')
+    _has_logger = True
+except ImportError:
+    _has_logger = False
+    logger = None
+
+def _safe_log(level, message):
+    """安全日志输出，如果 logger 不可用则跳过"""
+    if _has_logger and logger:
+        try:
+            if level == 'info':
+                logger.info(message)
+            elif level == 'debug':
+                logger.debug(message)
+            elif level == 'warning':
+                logger.warning(message)
+            elif level == 'error':
+                logger.error(message)
+        except Exception:
+            pass  # 如果日志失败，静默忽略
+
 try:
     from weasyprint import HTML, CSS
     WEASYPRINT_AVAILABLE = True
@@ -234,7 +258,7 @@ class OrderTraceabilityPDFGenerator:
     def generate_pdf(self, order_no: int, output_path: str | None = None):
         order_info, materials_data, use_test_cert1 = self.get_order_data(order_no)
         if order_info is None:
-            print(f"Order {order_no} not found in database!")
+            _safe_log('warning', f"Order {order_no} not found in database!")
             return False, None
 
         empty_key_rows = self._count_empty_key_rows(materials_data)
@@ -257,8 +281,8 @@ class OrderTraceabilityPDFGenerator:
             output_path = os.path.join(pdf_dir, f"TR_{order_no}.pdf")
             # Output absolute path for debugging
             abs_output_path = os.path.abspath(output_path)
-            print(f"PDF output path (relative): {output_path}")
-            print(f"PDF output path (absolute): {abs_output_path}")
+            _safe_log('debug', f"PDF output path (relative): {output_path}")
+            _safe_log('debug', f"PDF output path (absolute): {abs_output_path}")
         logo_path = os.path.join(backend_dir, "VSC Logo.png")
         logo_exists = os.path.exists(logo_path)
         if not logo_exists:
@@ -315,9 +339,9 @@ class OrderTraceabilityPDFGenerator:
             if os.path.exists(output_path):
                 try:
                     os.remove(output_path)
-                    print(f"[INFO] Deleted existing PDF file: {output_path}")
+                    _safe_log('info', f"Deleted existing PDF file: {output_path}")
                 except Exception as e:
-                    print(f"[WARNING] Failed to delete existing file, will continue: {e}")
+                    _safe_log('warning', f"Failed to delete existing file, will continue: {e}")
             
             # Generate complete PDF
             html_doc = HTML(string=html_content, base_url=base_url)
@@ -360,31 +384,31 @@ class OrderTraceabilityPDFGenerator:
             # Note: Now using CSS header-spacer to handle Header space on subsequent pages
             # No longer using PyPDF2 for page processing
             
-            print(f"PDF generated successfully: {output_path}")
-            print(f"Order: {order_no}")
-            print(f"Client: {order_info_dict.get('Client', 'N/A')}")
-            print(f"Materials: {len(materials_data)} items")
+            _safe_log('info', f"PDF generated successfully: {output_path}")
+            _safe_log('debug', f"Order: {order_no}")
+            _safe_log('debug', f"Client: {order_info_dict.get('Client', 'N/A')}")
+            _safe_log('debug', f"Materials: {len(materials_data)} items")
             
             if os.path.exists(output_path):
                 file_size = os.path.getsize(output_path)
-                print(f"File verified: {output_path} ({file_size} bytes)")
+                _safe_log('debug', f"File verified: {output_path} ({file_size} bytes)")
                 # Return relative path (relative to backend directory), for database storage and download API
                 # This way download API can correctly find the file
                 try:
                     rel_path = os.path.relpath(output_path, backend_dir)
                     # On Windows, use forward slash to ensure cross-platform compatibility
                     rel_path = rel_path.replace("\\", "/")
-                    print(f"Returning relative path for database: {rel_path}")
+                    _safe_log('debug', f"Returning relative path for database: {rel_path}")
                     return True, rel_path, warning_message
                 except ValueError:
                     # If cannot convert to relative path (e.g., on different drive), return absolute path
-                    print(f"Warning: Cannot convert to relative path, returning absolute path")
+                    _safe_log('warning', f"Warning: Cannot convert to relative path, returning absolute path")
                     return True, output_path, warning_message
             else:
-                print(f"WARNING: File does not exist: {output_path}")
+                _safe_log('warning', f"WARNING: File does not exist: {output_path}")
                 return False, None
         except Exception as e:
-            print(f"Error generating PDF: {e}")
+            _safe_log('error', f"Error generating PDF: {e}")
             import traceback
             traceback.print_exc()
             return False, None
@@ -1143,10 +1167,13 @@ ET
                 os.remove(temp_header_path)
                 
         except Exception as e:
-            print(f"Warning: Failed to add header to all pages: {e}")
-            print("Falling back to original PDF without header insertion.")
+            _safe_log('warning', f"Warning: Failed to add header to all pages: {e}")
+            _safe_log('warning', "Falling back to original PDF without header insertion.")
             import traceback
-            traceback.print_exc()
+            try:
+                _safe_log('error', traceback.format_exc())
+            except:
+                pass
             # If failed, copy original file directly
             import shutil
             shutil.copy(input_pdf_path, output_pdf_path)

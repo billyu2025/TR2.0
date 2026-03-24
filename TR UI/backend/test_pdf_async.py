@@ -5,15 +5,62 @@ PDF 异步生成测试脚本
 用于测试 PDF 异步生成功能是否正常工作
 """
 
-import sqlite3
 import sys
 import os
 from pdf_task_manager import PDFTaskManager
+from db_adapter import get_connection as get_db_connection, is_postgres
 
 # 获取数据库路径
 _current_dir = os.path.dirname(os.path.abspath(__file__))
 _project_root = os.path.normpath(os.path.join(_current_dir, '..', '..'))
 _db_path = os.path.join(_project_root, 'TR database', 'data_3years.db')
+
+
+def _sql(sql_text):
+    if is_postgres():
+        return sql_text.replace('?', '%s')
+    return sql_text
+
+
+def _execute(cursor, sql_text, params=()):
+    return cursor.execute(_sql(sql_text), params)
+
+
+def _table_exists(table_name):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        if is_postgres():
+            _execute(
+                cursor,
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name = ?
+                ) AS exists
+                """,
+                (table_name.lower(),)
+            )
+        else:
+            _execute(
+                cursor,
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM sqlite_master
+                    WHERE type='table' AND name=?
+                ) AS exists
+                """,
+                (table_name,)
+            )
+        row = cursor.fetchone()
+        if isinstance(row, dict):
+            return bool(row.get('exists'))
+        if hasattr(row, 'keys'):
+            return bool(row['exists'])
+        return bool(row[0]) if row else False
+    finally:
+        conn.close()
 
 def test_pdf_task_manager():
     """测试 PDF 任务管理器"""
@@ -22,12 +69,14 @@ def test_pdf_task_manager():
     print("=" * 60)
     print()
     
-    # 检查数据库是否存在
-    if not os.path.exists(_db_path):
+    # SQLite 模式下检查数据库文件；PostgreSQL 模式下只输出连接信息
+    if not is_postgres() and not os.path.exists(_db_path):
         print(f"❌ 错误：数据库不存在: {_db_path}")
         return False
     
-    print(f"✅ 数据库路径: {_db_path}")
+    print(f"✅ 数据库后端: {'PostgreSQL' if is_postgres() else 'SQLite'}")
+    if not is_postgres():
+        print(f"✅ 数据库路径: {_db_path}")
     print()
     
     # 创建任务管理器
@@ -39,14 +88,7 @@ def test_pdf_task_manager():
         return False
     
     # 检查表是否存在
-    conn = sqlite3.connect(_db_path)
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT name FROM sqlite_master 
-        WHERE type='table' AND name='pdf_tasks'
-    """)
-    table_exists = cursor.fetchone() is not None
-    conn.close()
+    table_exists = _table_exists('pdf_tasks')
     
     if not table_exists:
         print("❌ 错误：pdf_tasks 表不存在")

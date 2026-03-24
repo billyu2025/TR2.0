@@ -6,6 +6,7 @@ import { Trend, Rate, Counter } from "k6/metrics";
  * ====== 配置 ======
  * 运行前可用环境变量覆盖：
  * BASE_URL, MODE, ORDER_NOS, USERS, DURATION, THINK_TIME
+ * DOWNLOAD_RETRIES (default 3), DOWNLOAD_RETRY_SLEEP (seconds, default 3)
  * USER_LIST_JSON='[{"username":"u1","password":"p1"}, ...]'
  */
 
@@ -305,14 +306,36 @@ function pollTaskUntilDone(token, taskId) {
   fail(`Task polling timeout. taskId=${taskId}`);
 }
 
+// Retry download on connection-level failures (status=0 / unexpected EOF); do not retry on 4xx/5xx
+const DOWNLOAD_MAX_ATTEMPTS = Number(__ENV.DOWNLOAD_RETRIES || "3"); // total attempts including first
+const DOWNLOAD_RETRY_SLEEP_SEC = Number(__ENV.DOWNLOAD_RETRY_SLEEP || "3");
+
 function downloadZip(token, taskId) {
-  const res = requestWithAuthRetry(
-    "GET",
-    `${BASE_URL}/api/download/download/${taskId}`,
-    null,
-    { name: "download_zip" },
-    { responseType: "binary", timeout: "30m" }
-  );
+  let res = null;
+  let lastErr = "";
+
+  for (let attempt = 1; attempt <= DOWNLOAD_MAX_ATTEMPTS; attempt++) {
+    res = requestWithAuthRetry(
+      "GET",
+      `${BASE_URL}/api/download/download/${taskId}`,
+      null,
+      { name: "download_zip" },
+      { responseType: "binary", timeout: "30m" }
+    );
+
+    // Retry only on connection failure (no valid HTTP response). Do not retry on 4xx/5xx.
+    if (res.status === 0) {
+      lastErr = `status=0 (connection closed, e.g. unexpected EOF), headers=${JSON.stringify(res.headers)}`;
+      if (attempt < DOWNLOAD_MAX_ATTEMPTS) {
+        sleep(DOWNLOAD_RETRY_SLEEP_SEC);
+        continue;
+      }
+      break;
+    }
+
+    // Got a real HTTP response; no retry
+    break;
+  }
 
   downloadDuration.add(res.timings.duration);
 
@@ -327,7 +350,7 @@ function downloadZip(token, taskId) {
   downloadFailRate.add(!ok);
 
   if (!ok) {
-    fail(`Download failed. status=${res.status}, headers=${JSON.stringify(res.headers)}`);
+    fail(`Download failed. ${lastErr || `status=${res.status}, headers=${JSON.stringify(res.headers)}`}`);
   }
 }
 

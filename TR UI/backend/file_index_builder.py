@@ -6,12 +6,13 @@
 """
 
 import os
-import sqlite3
 import json
 import re
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime
 import time
+
+from db_adapter import get_connection as get_db_connection, is_postgres
 
 
 class FileIndexBuilder:
@@ -53,6 +54,20 @@ class FileIndexBuilder:
         
         # 批量插入大小
         self.batch_size = 1000
+
+    def _get_connection(self):
+        return get_db_connection()
+
+    def _sql(self, sql_text: str) -> str:
+        if is_postgres():
+            return sql_text.replace('?', '%s')
+        return sql_text
+
+    def _execute(self, cursor, sql_text: str, params=()):
+        return cursor.execute(self._sql(sql_text), params)
+
+    def _executemany(self, cursor, sql_text: str, seq_of_params):
+        return cursor.executemany(self._sql(sql_text), seq_of_params)
         
     def extract_keywords(self, file_name: str, file_path: str = '') -> List[str]:
         """
@@ -186,7 +201,8 @@ class FileIndexBuilder:
                 'modified_time': stat.st_mtime,  # Unix时间戳
                 'extracted_keywords': keywords_json,
                 'identifiers': identifiers_str,
-                'is_deleted': 0
+                # 这里统一使用布尔类型，PostgreSQL 中是 BOOLEAN，SQLite 中会自动存为 0/1
+                'is_deleted': False
             }
         except (OSError, PermissionError) as e:
             print(f"[警告] 无法访问文件 {file_path}: {e}")
@@ -264,12 +280,7 @@ class FileIndexBuilder:
         if not file_infos:
             return 0
         
-        conn = sqlite3.connect(self.db_path, timeout=30.0)
-        # 启用 WAL 模式
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA busy_timeout=30000")
-        
+        conn = self._get_connection()
         cursor = conn.cursor()
         inserted_count = 0
         error_count = 0
@@ -280,14 +291,7 @@ class FileIndexBuilder:
                 batch = file_infos[i:i + self.batch_size]
                 
                 try:
-                    # 使用 INSERT OR REPLACE 处理重复
-                    cursor.executemany("""
-                        INSERT OR REPLACE INTO file_index_cache (
-                            file_path, file_name, folder_path, folder_type,
-                            file_size, modified_time, extracted_keywords, identifiers,
-                            is_deleted, last_checked
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                    """, [
+                    batch_values = [
                         (
                             info['file_path'],
                             info['file_name'],
@@ -296,11 +300,45 @@ class FileIndexBuilder:
                             info['file_size'],
                             info['modified_time'],
                             info['extracted_keywords'],
-                            info.get('identifiers', ''),  # 使用 get 以兼容旧数据
+                            info.get('identifiers', ''),
                             info['is_deleted']
                         )
                         for info in batch
-                    ])
+                    ]
+                    if is_postgres():
+                        self._executemany(
+                            cursor,
+                            """
+                            INSERT INTO file_index_cache (
+                                file_path, file_name, folder_path, folder_type,
+                                file_size, modified_time, extracted_keywords, identifiers,
+                                is_deleted, last_checked
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                            ON CONFLICT (file_path) DO UPDATE SET
+                                file_name = EXCLUDED.file_name,
+                                folder_path = EXCLUDED.folder_path,
+                                folder_type = EXCLUDED.folder_type,
+                                file_size = EXCLUDED.file_size,
+                                modified_time = EXCLUDED.modified_time,
+                                extracted_keywords = EXCLUDED.extracted_keywords,
+                                identifiers = EXCLUDED.identifiers,
+                                is_deleted = EXCLUDED.is_deleted,
+                                last_checked = CURRENT_TIMESTAMP
+                            """,
+                            batch_values
+                        )
+                    else:
+                        self._executemany(
+                            cursor,
+                            """
+                            INSERT OR REPLACE INTO file_index_cache (
+                                file_path, file_name, folder_path, folder_type,
+                                file_size, modified_time, extracted_keywords, identifiers,
+                                is_deleted, last_checked
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                            """,
+                            batch_values
+                        )
                     
                     conn.commit()
                     inserted_count += len(batch)
@@ -330,14 +368,31 @@ class FileIndexBuilder:
             key: 元数据键
             value: 元数据值
         """
-        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        conn = self._get_connection()
         cursor = conn.cursor()
         
         try:
-            cursor.execute("""
-                INSERT OR REPLACE INTO file_index_metadata (key, value, updated_at)
-                VALUES (?, ?, CURRENT_TIMESTAMP)
-            """, (key, value))
+            if is_postgres():
+                self._execute(
+                    cursor,
+                    """
+                    INSERT INTO file_index_metadata (key, value, updated_at)
+                    VALUES (?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT (key) DO UPDATE SET
+                        value = EXCLUDED.value,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (key, value)
+                )
+            else:
+                self._execute(
+                    cursor,
+                    """
+                    INSERT OR REPLACE INTO file_index_metadata (key, value, updated_at)
+                    VALUES (?, ?, CURRENT_TIMESTAMP)
+                    """,
+                    (key, value)
+                )
             conn.commit()
         except Exception as e:
             print(f"[错误] 更新元数据失败 ({key}): {e}")
@@ -356,13 +411,19 @@ class FileIndexBuilder:
         Returns:
             元数据值
         """
-        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        conn = self._get_connection()
         cursor = conn.cursor()
         
         try:
-            cursor.execute("SELECT value FROM file_index_metadata WHERE key = ?", (key,))
+            self._execute(cursor, "SELECT value FROM file_index_metadata WHERE key = ?", (key,))
             row = cursor.fetchone()
-            return row[0] if row else default
+            if not row:
+                return default
+            if isinstance(row, dict):
+                return row.get('value', default)
+            if hasattr(row, 'keys'):
+                return row['value']
+            return row[0]
         except Exception as e:
             print(f"[错误] 获取元数据失败 ({key}): {e}")
             return default
@@ -396,11 +457,11 @@ class FileIndexBuilder:
         # 如果清空现有索引
         if clear_existing:
             print("[清理] 清空现有索引...")
-            conn = sqlite3.connect(self.db_path, timeout=30.0)
+            conn = self._get_connection()
             cursor = conn.cursor()
             try:
-                cursor.execute("DELETE FROM file_index_cache")
-                cursor.execute("UPDATE file_index_metadata SET value = '0' WHERE key = 'total_files_indexed'")
+                self._execute(cursor, "DELETE FROM file_index_cache")
+                self._execute(cursor, "UPDATE file_index_metadata SET value = '0' WHERE key = 'total_files_indexed'")
                 conn.commit()
                 print("[清理] 已清空现有索引")
             except Exception as e:
@@ -452,7 +513,8 @@ class FileIndexBuilder:
                                     'file_size': 0,  # 文件夹没有大小
                                     'modified_time': os.path.getmtime(item_path) if os.path.exists(item_path) else 0,
                                     'extracted_keywords': self.extract_keywords(item, item_path),
-                                    'is_deleted': 0
+                                    # 同样使用布尔类型，兼容 PostgreSQL BOOLEAN 和 SQLite INTEGER
+                                    'is_deleted': False
                                 }
                                 folder_file_infos.append(folder_info)
                                 all_file_infos.append(folder_info)

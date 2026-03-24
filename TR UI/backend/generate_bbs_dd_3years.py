@@ -9,7 +9,6 @@
 
 import pandas as pd
 import numpy as np
-import sqlite3
 import logging
 import os
 import sys
@@ -17,6 +16,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import create_engine, text
 import pyodbc
 import warnings
+from db_adapter import DB_PATH, POSTGRES_DSN, is_postgres
 warnings.filterwarnings('ignore')
 
 # 配置日志
@@ -47,20 +47,39 @@ DB_CONFIG = {
     'driver': 'SQL Server'
 }
 
-# SQLite数据库配置 - 指向data_3years.db
-# 从backend目录向上两级到项目根目录，然后指向TR database/data_3years.db
-_current_dir = os.path.dirname(os.path.abspath(__file__))
-_project_root = os.path.normpath(os.path.join(_current_dir, '..', '..'))
-SQLITE_DB_PATH = os.path.join(_project_root, 'TR database', 'data_3years.db')
-SQLITE_DB_PATH = os.path.abspath(SQLITE_DB_PATH)
-
 class BBSDDGenerator3Years:
     """3年bbs_dd表生成器"""
     
     def __init__(self):
         self.logger = setup_logging()
         self.engine = None
-        self.sqlite_conn = None
+        self.target_engine = None
+        self.target_table_ref = 'bbs_dd'
+
+    def _target_table_exists(self) -> bool:
+        if not self.target_engine:
+            return False
+        with self.target_engine.connect() as conn:
+            if is_postgres():
+                row = conn.execute(
+                    text("""
+                        SELECT EXISTS (
+                            SELECT 1
+                            FROM information_schema.tables
+                            WHERE table_schema = 'public' AND table_name = 'bbs_dd'
+                        ) AS exists
+                    """)
+                ).mappings().first()
+            else:
+                row = conn.execute(
+                    text("""
+                        SELECT EXISTS (
+                            SELECT 1 FROM sqlite_master
+                            WHERE type='table' AND name='bbs_dd'
+                        ) AS exists
+                    """)
+                ).mappings().first()
+            return bool(row['exists']) if row else False
         
     def create_database_connection(self):
         """创建源数据库连接"""
@@ -79,23 +98,27 @@ class BBSDDGenerator3Years:
             self.logger.error(f"❌ 源数据库连接失败: {e}")
             return False
     
-    def create_sqlite_connection(self):
-        """创建SQLite数据库连接"""
+    def create_target_connection(self):
+        """创建目标数据库连接"""
         try:
-            # 确保目录存在
-            db_dir = os.path.dirname(SQLITE_DB_PATH)
-            if not os.path.exists(db_dir):
-                os.makedirs(db_dir)
-            
-            self.sqlite_conn = sqlite3.connect(SQLITE_DB_PATH, timeout=30.0)
-            # 启用 WAL 模式以提高并发性能
-            self.sqlite_conn.execute("PRAGMA journal_mode=WAL")
-            self.sqlite_conn.execute("PRAGMA synchronous=NORMAL")
-            self.sqlite_conn.execute("PRAGMA busy_timeout=30000")
-            self.logger.info(f"✅ SQLite数据库连接成功（WAL模式）: {SQLITE_DB_PATH}")
+            if is_postgres():
+                if not POSTGRES_DSN:
+                    raise RuntimeError("POSTGRES_DSN 未配置")
+                self.target_engine = create_engine(POSTGRES_DSN, echo=False)
+                with self.target_engine.connect() as conn:
+                    conn.execute(text("SELECT 1"))
+                self.logger.info("✅ PostgreSQL目标数据库连接成功")
+            else:
+                db_dir = os.path.dirname(DB_PATH)
+                if db_dir and not os.path.exists(db_dir):
+                    os.makedirs(db_dir)
+                self.target_engine = create_engine(f"sqlite:///{DB_PATH}", echo=False)
+                with self.target_engine.connect() as conn:
+                    conn.execute(text("SELECT 1"))
+                self.logger.info(f"✅ SQLite目标数据库连接成功: {DB_PATH}")
             return True
         except Exception as e:
-            self.logger.error(f"❌ SQLite数据库连接失败: {e}")
+            self.logger.error(f"❌ 目标数据库连接失败: {e}")
             return False
     
     def get_table_structure(self):
@@ -178,23 +201,20 @@ class BBSDDGenerator3Years:
                     self.logger.warning("⚠️ 没有获取到数据")
                     return False
                 
-                # 连接到 SQLite
-                if not self.sqlite_conn:
-                    self.create_sqlite_connection()
+                if not self.target_engine:
+                    self.create_target_connection()
+
+                with self.target_engine.begin() as target_conn:
+                    if self._target_table_exists():
+                        target_conn.execute(text(f"DELETE FROM {self.target_table_ref}"))
+                        self.logger.info("已清空旧的 bbs_dd 表数据，保留现有结构和索引")
+                    else:
+                        self.logger.info("bbs_dd 表不存在，将按 DataFrame 结构创建")
+
+                self.logger.info(f"写入数据到 {'PostgreSQL' if is_postgres() else 'SQLite'}...")
+                df.to_sql('bbs_dd', self.target_engine, if_exists='append', index=False, method='multi', chunksize=1000)
                 
-                # 如果表已存在，删除它
-                cursor = self.sqlite_conn.cursor()
-                cursor.execute("DROP TABLE IF EXISTS bbs_dd")
-                self.sqlite_conn.commit()
-                self.logger.info("已删除旧的 bbs_dd 表（如果存在）")
-                
-                # 将数据写入 SQLite
-                self.logger.info("写入数据到 SQLite...")
-                df.to_sql('bbs_dd', self.sqlite_conn, if_exists='replace', index=False)
-                self.sqlite_conn.commit()
-                
-                # 验证
-                verify_count = pd.read_sql("SELECT COUNT(*) as cnt FROM bbs_dd", self.sqlite_conn).iloc[0]['cnt']
+                verify_count = pd.read_sql("SELECT COUNT(*) as cnt FROM bbs_dd", self.target_engine).iloc[0]['cnt']
                 self.logger.info(f"✅ bbs_dd 表创建成功: {verify_count:,} 条记录")
                 
                 # 显示表的前几列信息
@@ -207,7 +227,7 @@ class BBSDDGenerator3Years:
                             MIN({date_columns[0]}) as earliest_date,
                             MAX({date_columns[0]}) as latest_date
                         FROM bbs_dd
-                    """, self.sqlite_conn).iloc[0]
+                    """, self.target_engine).iloc[0]
                     self.logger.info(f"  最早日期: {stats['earliest_date']}")
                     self.logger.info(f"  最晚日期: {stats['latest_date']}")
                 self.logger.info("=" * 60)
@@ -233,9 +253,9 @@ class BBSDDGenerator3Years:
             if not self.create_database_connection():
                 raise Exception("无法连接源数据库")
             
-            # 2. 连接SQLite数据库
-            if not self.create_sqlite_connection():
-                raise Exception("无法连接SQLite数据库")
+            # 2. 连接目标数据库
+            if not self.create_target_connection():
+                raise Exception("无法连接目标数据库")
             
             # 3. 创建bbs_dd表
             if self.create_bbs_dd_table():
@@ -257,8 +277,8 @@ class BBSDDGenerator3Years:
             # 关闭连接
             if self.engine:
                 self.engine.dispose()
-            if self.sqlite_conn:
-                self.sqlite_conn.close()
+            if self.target_engine:
+                self.target_engine.dispose()
             
             self.logger.info("=" * 60)
             self.logger.info("bbs_dd 表生成流程结束")

@@ -10,6 +10,16 @@ import hashlib
 from functools import wraps
 from typing import Any, Optional, Callable
 import os
+import sys
+
+# 安全日志输出函数（避免在后台线程中 stdout 关闭的问题）
+def _safe_print(message):
+    """安全输出，如果 stdout 不可用则跳过"""
+    try:
+        if sys.stdout is not None and not (hasattr(sys.stdout, 'closed') and sys.stdout.closed):
+            print(message)
+    except (ValueError, OSError, AttributeError):
+        pass  # 如果输出失败，静默忽略
 
 # 嘗試導入 Redis，如果未安裝則使用內存緩存
 try:
@@ -58,21 +68,12 @@ class CacheManager:
                 # 測試連接
                 self.redis_client.ping()
                 self.use_redis = True
-                try:
-                    print("[INFO] Redis cache enabled")
-                except (UnicodeEncodeError, UnicodeDecodeError):
-                    pass  # 忽略编码错误
+                _safe_print("[INFO] Redis cache enabled")
             except Exception as e:
-                try:
-                    print(f"[WARNING] Redis connection failed, using memory cache: {e}")
-                except (UnicodeEncodeError, UnicodeDecodeError):
-                    pass  # 忽略编码错误
+                _safe_print(f"[WARNING] Redis connection failed, using memory cache: {e}")
                 self.use_redis = False
         elif self.enabled and not REDIS_AVAILABLE:
-            try:
-                print("[WARNING] Redis not installed, using memory cache")
-            except (UnicodeEncodeError, UnicodeDecodeError):
-                pass  # 忽略编码错误
+            _safe_print("[WARNING] Redis not installed, using memory cache")
             self.use_redis = False
     
     def _get_memory_cache(self):
@@ -112,10 +113,7 @@ class CacheManager:
                         else:
                             del cache[key]
         except Exception as e:
-            try:
-                print(f"[ERROR] Cache read failed: {e}")
-            except (UnicodeEncodeError, UnicodeDecodeError):
-                pass
+            _safe_print(f"[ERROR] Cache read failed: {e}")
         
         return None
     
@@ -154,10 +152,7 @@ class CacheManager:
                     }
             return True
         except Exception as e:
-            try:
-                print(f"[ERROR] Cache write failed: {e}")
-            except (UnicodeEncodeError, UnicodeDecodeError):
-                pass
+            _safe_print(f"[ERROR] Cache write failed: {e}")
             return False
     
     def delete(self, key: str) -> bool:
@@ -176,31 +171,42 @@ class CacheManager:
         try:
             if self.use_redis and self.redis_client:
                 if '*' in key:
-                    # 支持通配符刪除
-                    pattern = key.replace('*', '*')
+                    # 支持通配符刪除 - Redis使用KEYS命令
+                    pattern = key.replace('*', '*')  # Redis pattern uses * directly
                     keys = self.redis_client.keys(pattern)
                     if keys:
-                        self.redis_client.delete(*keys)
+                        deleted_count = self.redis_client.delete(*keys)
+                        _safe_print(f"[INFO] Cache deleted {deleted_count} keys matching pattern: {pattern}")
+                    else:
+                        _safe_print(f"[INFO] No cache keys found matching pattern: {pattern}")
                 else:
-                    self.redis_client.delete(key)
+                    deleted = self.redis_client.delete(key)
+                    if deleted:
+                        _safe_print(f"[INFO] Cache deleted key: {key}")
             else:
                 # Use memory cache
                 with _cache_lock:
                     cache = self._get_memory_cache()
                     if '*' in key:
-                        # Simple wildcard matching
-                        pattern = key.replace('*', '')
-                        keys_to_delete = [k for k in cache.keys() if pattern in k]
+                        # Simple wildcard matching - match keys that start with the prefix
+                        prefix = key.replace('*', '')
+                        all_keys = list(cache.keys())
+                        keys_to_delete = [k for k in all_keys if k.startswith(prefix)]
+                        deleted_count = len(keys_to_delete)
                         for k in keys_to_delete:
                             del cache[k]
+                        _safe_print(f"[INFO] Memory cache deleted {deleted_count} keys matching pattern: {key}")
+                        if deleted_count > 0:
+                            _safe_print(f"[INFO] Deleted keys (first 5): {keys_to_delete[:5]}")
+                        else:
+                            _safe_print(f"[INFO] No keys found matching pattern. All cache keys: {all_keys[:10]}")
                     else:
-                        cache.pop(key, None)
+                        if key in cache:
+                            del cache[key]
+                            _safe_print(f"[INFO] Memory cache deleted key: {key}")
             return True
         except Exception as e:
-            try:
-                print(f"[ERROR] Cache delete failed: {e}")
-            except (UnicodeEncodeError, UnicodeDecodeError):
-                pass
+            _safe_print(f"[ERROR] Cache delete failed: {e}")
             return False
     
     def clear(self) -> bool:
@@ -223,10 +229,7 @@ class CacheManager:
                     cache.clear()
             return True
         except Exception as e:
-            try:
-                print(f"[ERROR] Cache clear failed: {e}")
-            except (UnicodeEncodeError, UnicodeDecodeError):
-                pass
+            _safe_print(f"[ERROR] Cache clear failed: {e}")
             return False
     
     def exists(self, key: str) -> bool:
@@ -257,10 +260,7 @@ class CacheManager:
                             del cache[key]
                     return False
         except Exception as e:
-            try:
-                print(f"[ERROR] Cache check failed: {e}")
-            except (UnicodeEncodeError, UnicodeDecodeError):
-                pass
+            _safe_print(f"[ERROR] Cache check failed: {e}")
             return False
     
     def generate_key(self, prefix: str, *args, **kwargs) -> str:
