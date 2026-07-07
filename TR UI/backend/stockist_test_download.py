@@ -6,20 +6,20 @@ Stockist&Test Report 按 Order 下载功能
 """
 
 import os
-import sqlite3
 import zipfile
 import tempfile
 import re
 from typing import List, Dict, Tuple, Optional
 
-# 尝试导入数据库适配器
-try:
-    from db_adapter import get_db_connection, is_postgres
-    DB_ADAPTER_AVAILABLE = True
-except ImportError:
-    DB_ADAPTER_AVAILABLE = False
-    def is_postgres():
-        return False
+from db_adapter import get_connection as get_db_connection, is_postgres
+
+
+def _require_postgres_backend() -> None:
+    """Stockist 下载仅支持 PostgreSQL（SQLite 已不再维护）。"""
+    if not is_postgres():
+        raise RuntimeError(
+            "Stockist download requires DB_BACKEND=postgres; SQLite is no longer supported."
+        )
 
 # 尝试导入文件索引查询器
 try:
@@ -41,9 +41,10 @@ class StockistTestDownloader:
         初始化下载器
         
         Args:
-            db_path: SQLite 数据库路径
+            db_path: 保留参数（兼容旧调用；实际连接走 db_adapter PostgreSQL）
             base_folder: Stockist&Test Report 文件夹的基础路径
         """
+        _require_postgres_backend()
         self.db_path = db_path
         self.base_folder = base_folder
         # 可选：强制索引命中优先（不回退全盘扫描），用于高并发场景降低磁盘压力
@@ -78,6 +79,19 @@ class StockistTestDownloader:
                 except (UnicodeEncodeError, UnicodeDecodeError, Exception):
                     pass
                 self.index_query = None
+
+    def _open_conn(self):
+        _require_postgres_backend()
+        return get_db_connection()
+
+    def _tr_report_table(self) -> str:
+        return '"TR_Report"'
+
+    def _sql_placeholders(self, count: int) -> str:
+        return ','.join(['%s'] * count)
+
+    def _single_placeholder(self) -> str:
+        return '%s'
     
     def get_order_info(self, order_no: int) -> Optional[Dict]:
         """
@@ -89,41 +103,27 @@ class StockistTestDownloader:
         Returns:
             包含 stockist_cert, rm_dn_no, jobsite_type 的字典，如果订单不存在返回 None
         """
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
+        conn = self._open_conn()
         cursor = conn.cursor()
         
         try:
-            # 查询订单的 stockist_cert, rm_dn_no, jobsite_type 和 del_date
-            # 注意：TR_Report 表的字段名需要根据实际表结构调整
-            # 先尝试小写字段名，如果失败再尝试其他格式
-            query = """
+            ph = self._single_placeholder()
+            job_col = '"Job_No" AS job_no'
+            query = f"""
                 SELECT DISTINCT
                     stockist_cert,
                     rm_dn_no,
                     jobsite_type,
                     del_date,
-                    job_no
-                FROM TR_Report
-                WHERE order_no = ?
+                    {job_col}
+                FROM {self._tr_report_table()}
+                WHERE order_no = {ph}
                 LIMIT 1
             """
-            try:
-                cursor.execute(query, (order_no,))
-                row = cursor.fetchone()
-            except sqlite3.OperationalError as e:
-                # 如果字段名不对，尝试其他可能的字段名
-                print(f"[警告] 查询失败，尝试其他字段名: {e}")
-                # 尝试查看表结构
-                cursor.execute("PRAGMA table_info(TR_Report)")
-                columns = cursor.fetchall()
-                print(f"[调试] TR_Report 表字段: {[col[1] for col in columns]}")
-                # 重新尝试查询
-                cursor.execute(query, (order_no,))
-                row = cursor.fetchone()
+            cursor.execute(query, (order_no,))
+            row = cursor.fetchone()
             
             if row:
-                # sqlite3.Row 对象不支持 get() 方法，直接使用键访问
                 try:
                     stockist_cert = row['stockist_cert'] if row['stockist_cert'] else ''
                 except (KeyError, IndexError):
@@ -204,12 +204,12 @@ class StockistTestDownloader:
         for i in range(0, len(order_nos), BATCH_SIZE):
             batch = order_nos[i:i + BATCH_SIZE]
             
-            conn = sqlite3.connect(self.db_path)
-            conn.row_factory = sqlite3.Row
+            conn = self._open_conn()
             cursor = conn.cursor()
             
             try:
-                placeholders = ','.join('?' * len(batch))
+                placeholders = self._sql_placeholders(len(batch))
+                job_col = '"Job_No" AS job_no'
                 query = f"""
                     SELECT DISTINCT
                         order_no,
@@ -217,8 +217,8 @@ class StockistTestDownloader:
                         rm_dn_no,
                         jobsite_type,
                         del_date,
-                        job_no
-                    FROM TR_Report
+                        {job_col}
+                    FROM {self._tr_report_table()}
                     WHERE order_no IN ({placeholders})
                 """
                 cursor.execute(query, batch)
@@ -309,18 +309,17 @@ class StockistTestDownloader:
         for i in range(0, len(order_nos), BATCH_SIZE):
             batch = order_nos[i:i + BATCH_SIZE]
             
-            conn = sqlite3.connect(self.db_path)
-            conn.row_factory = sqlite3.Row
+            conn = self._open_conn()
             cursor = conn.cursor()
             
             try:
-                placeholders = ','.join('?' * len(batch))
+                placeholders = self._sql_placeholders(len(batch))
                 query = f"""
                     SELECT DISTINCT
                         order_no,
                         stockist_cert,
                         rm_dn_no
-                    FROM TR_Report
+                    FROM {self._tr_report_table()}
                     WHERE order_no IN ({placeholders})
                 """
                 cursor.execute(query, batch)
@@ -400,18 +399,17 @@ class StockistTestDownloader:
         for i in range(0, len(order_nos), BATCH_SIZE):
             batch = order_nos[i:i + BATCH_SIZE]
             
-            conn = sqlite3.connect(self.db_path)
-            conn.row_factory = sqlite3.Row
+            conn = self._open_conn()
             cursor = conn.cursor()
             
             try:
-                placeholders = ','.join('?' * len(batch))
+                placeholders = self._sql_placeholders(len(batch))
                 query = f"""
                     SELECT DISTINCT
                         order_no,
                         rm_dn_no,
                         stockist_cert
-                    FROM TR_Report
+                    FROM {self._tr_report_table()}
                     WHERE order_no IN ({placeholders})
                         AND rm_dn_no IS NOT NULL 
                         AND rm_dn_no != '' 
@@ -466,34 +464,25 @@ class StockistTestDownloader:
         Returns:
             (stockist_cert_list, rm_dn_no_list) 元组
         """
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
+        conn = self._open_conn()
         cursor = conn.cursor()
         
         try:
-            query = """
+            ph = self._single_placeholder()
+            query = f"""
                 SELECT DISTINCT
                     stockist_cert,
                     rm_dn_no
-                FROM TR_Report
-                WHERE order_no = ?
+                FROM {self._tr_report_table()}
+                WHERE order_no = {ph}
             """
-            try:
-                cursor.execute(query, (order_no,))
-                rows = cursor.fetchall()
-            except sqlite3.OperationalError as e:
-                print(f"[警告] 查询失败: {e}")
-                # 尝试查看表结构
-                cursor.execute("PRAGMA table_info(TR_Report)")
-                columns = cursor.fetchall()
-                print(f"[调试] TR_Report 表字段: {[col[1] for col in columns]}")
-                raise
+            cursor.execute(query, (order_no,))
+            rows = cursor.fetchall()
             
             stockist_certs = []
             rm_dn_nos = []
             
             for row in rows:
-                # sqlite3.Row 对象不支持 get() 方法，直接使用键访问
                 stockist_cert = None
                 try:
                     stockist_cert = row['stockist_cert']
@@ -540,24 +529,20 @@ class StockistTestDownloader:
         Returns:
             {rm_dn_no: stockist_cert} 字典
         """
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
+        conn = self._open_conn()
         cursor = conn.cursor()
         
         try:
-            query = """
+            ph = self._single_placeholder()
+            query = f"""
                 SELECT DISTINCT
                     rm_dn_no,
                     stockist_cert
-                FROM TR_Report
-                WHERE order_no = ? AND rm_dn_no IS NOT NULL AND rm_dn_no != '' AND stockist_cert IS NOT NULL AND stockist_cert != ''
+                FROM {self._tr_report_table()}
+                WHERE order_no = {ph} AND rm_dn_no IS NOT NULL AND rm_dn_no != '' AND stockist_cert IS NOT NULL AND stockist_cert != ''
             """
-            try:
-                cursor.execute(query, (order_no,))
-                rows = cursor.fetchall()
-            except sqlite3.OperationalError as e:
-                print(f"[警告] 查询失败: {e}")
-                return {}
+            cursor.execute(query, (order_no,))
+            rows = cursor.fetchall()
             
             mapping = {}
             for row in rows:
@@ -865,6 +850,35 @@ class StockistTestDownloader:
                         return rm_dn_to_stockist_map[rm_dn_no]
         
         return None
+    
+    def zip_stockist_folder_name_from_files(self, stockist_cert: str, file_paths: List[str]) -> str:
+        """
+        ZIP 内 Stockist No 文件夹名：根据其中 Test Report 所在目录类型追加后缀（互斥）。
+        IAT Formal / Private Formal → _F；IAT Prelim / Private Prelim → _P。
+        仅 Stockist Cert 或其它路径、无上述 Test Report 时不追加。
+        若异常数据下同时存在 Formal 与 Prelim，优先使用 _F。
+        """
+        if not stockist_cert:
+            return stockist_cert
+        abs_iat_f = os.path.abspath(self.iat_formal_folder)
+        abs_priv_f = os.path.abspath(self.private_formal_folder)
+        abs_iat_p = os.path.abspath(self.iat_prelim_folder)
+        abs_priv_p = os.path.abspath(self.private_prelim_folder)
+        has_formal_test = False
+        has_prelim_test = False
+        for fp in file_paths or []:
+            if not fp:
+                continue
+            ap = os.path.abspath(fp)
+            if ap.startswith(abs_iat_f) or ap.startswith(abs_priv_f):
+                has_formal_test = True
+            elif ap.startswith(abs_iat_p) or ap.startswith(abs_priv_p):
+                has_prelim_test = True
+        if has_formal_test:
+            return f"{stockist_cert}_F"
+        if has_prelim_test:
+            return f"{stockist_cert}_P"
+        return stockist_cert
     
     def check_jobsite_type(self, jobsite_type) -> Tuple[bool, bool]:
         """
@@ -1357,6 +1371,7 @@ class StockistTestDownloader:
                 for stockist_cert, files in files_by_stockist_cert.items():
                     if not files:
                         continue
+                    zip_stockist_folder = self.zip_stockist_folder_name_from_files(stockist_cert, files)
                     
                     for file_path in files:
                         abs_file_path = os.path.abspath(file_path)
@@ -1407,13 +1422,13 @@ class StockistTestDownloader:
                                         # 去掉第一层（stockist_cert 文件夹）
                                         rel_path = '/'.join(path_parts[1:])
                                     
-                                    zip_path = f"{stockist_cert}/{source_folder}/{rel_path}"
+                                    zip_path = f"{zip_stockist_folder}/{source_folder}/{rel_path}"
                                 else:
-                                    zip_path = f"{stockist_cert}/{source_folder}/{file_name}"
+                                    zip_path = f"{zip_stockist_folder}/{source_folder}/{file_name}"
                             else:
                                 # 其他文件夹（IAT Prelim、Private Formal、Private Prelim、Stockist Cert）：
                                 # 直接放在 stockist_cert 文件夹下，只放文件名
-                                zip_path = f"{stockist_cert}/{file_name}"
+                                zip_path = f"{zip_stockist_folder}/{file_name}"
                             
                             zipf.write(file_path, zip_path)
                             files_added_count += 1
@@ -1421,10 +1436,10 @@ class StockistTestDownloader:
                         except ValueError:
                             # 如果 relpath 失败（不同驱动器），使用文件名
                             if preserve_folder_structure:
-                                zip_path = f"{stockist_cert}/{source_folder}/{file_name}"
+                                zip_path = f"{zip_stockist_folder}/{source_folder}/{file_name}"
                             else:
                                 # 其他文件夹直接放在 stockist_cert 文件夹下
-                                zip_path = f"{stockist_cert}/{file_name}"
+                                zip_path = f"{zip_stockist_folder}/{file_name}"
                             zipf.write(file_path, zip_path)
                             files_added_count += 1
                             print(f"[ZIP创建] 已添加文件: {file_name} -> {zip_path}")
@@ -1460,44 +1475,25 @@ class StockistTestDownloader:
         Returns:
             Order_No 列表
         """
-        # 使用数据库适配器以支持 PostgreSQL
-        if DB_ADAPTER_AVAILABLE:
-            conn = get_db_connection()
-        else:
-            conn = sqlite3.connect(self.db_path)
-            conn.row_factory = sqlite3.Row
-        
+        conn = get_db_connection()
         cursor = conn.cursor()
         
         try:
-            # 处理 PostgreSQL 类型转换问题
-            # 如果 dd_no 字段是 INTEGER，需要将参数转换为整数，或者将字段转换为文本
-            if DB_ADAPTER_AVAILABLE and is_postgres():
-                # PostgreSQL: 尝试将 dd_no 转换为整数进行比较
-                try:
-                    dd_no_int = int(dd_no)
-                    query = """
-                        SELECT DISTINCT bbs_no
-                        FROM bbs_dd
-                        WHERE dd_no = %s
-                    """
-                    cursor.execute(query, (dd_no_int,))
-                except (ValueError, TypeError):
-                    # 如果转换失败，使用文本比较（将字段转换为文本）
-                    query = """
-                        SELECT DISTINCT bbs_no
-                        FROM bbs_dd
-                        WHERE CAST(dd_no AS TEXT) = %s
-                    """
-                    cursor.execute(query, (str(dd_no),))
-            else:
-                # SQLite: 直接使用字符串比较
+            try:
+                dd_no_int = int(dd_no)
                 query = """
                     SELECT DISTINCT bbs_no
                     FROM bbs_dd
-                    WHERE dd_no = ?
+                    WHERE dd_no = %s
                 """
-                cursor.execute(query, (dd_no,))
+                cursor.execute(query, (dd_no_int,))
+            except (ValueError, TypeError):
+                query = """
+                    SELECT DISTINCT bbs_no
+                    FROM bbs_dd
+                    WHERE CAST(dd_no AS TEXT) = %s
+                """
+                cursor.execute(query, (str(dd_no),))
             
             rows = cursor.fetchall()
             
@@ -1752,6 +1748,52 @@ class StockistTestDownloader:
             else:
                 # 如果文件不匹配任何 stockist_cert，不做任何处理（不添加到 ZIP）
                 pass
+
+        # 过滤缺失的 stockist_cert：若缺少 Stockist 或 Test，则不打包该 stockist 文件夹
+        abs_stockist_folder = os.path.abspath(self.stockist_folder)
+        abs_private_formal_folder = os.path.abspath(self.private_formal_folder)
+        abs_private_prelim_folder = os.path.abspath(self.private_prelim_folder)
+        abs_iat_formal_folder = os.path.abspath(self.iat_formal_folder)
+        abs_iat_prelim_folder = os.path.abspath(self.iat_prelim_folder)
+
+        for stockist_cert in list(files_by_stockist_cert.keys()):
+            cert_files = files_by_stockist_cert.get(stockist_cert, [])
+            has_stockist_report = False
+            has_test_report = False
+
+            for file_path in cert_files:
+                abs_file_path = os.path.abspath(file_path)
+                if abs_file_path.startswith(abs_stockist_folder):
+                    has_stockist_report = True
+                if (
+                    abs_file_path.startswith(abs_private_formal_folder) or
+                    abs_file_path.startswith(abs_private_prelim_folder) or
+                    abs_file_path.startswith(abs_iat_formal_folder) or
+                    abs_file_path.startswith(abs_iat_prelim_folder)
+                ):
+                    has_test_report = True
+
+            missing_type = None
+            if not cert_files:
+                missing_type = "No matched PDF"
+            elif not has_stockist_report and not has_test_report:
+                missing_type = "No Stockist/Test classified file"
+            elif not has_stockist_report:
+                missing_type = "Missing Stockist report"
+            elif not has_test_report:
+                missing_type = "Missing Test report"
+
+            if missing_type:
+                try:
+                    print(f"[下载] DD_No {dd_no}: Stockist {stockist_cert} 缺失({missing_type})，跳过打包该文件夹")
+                except (UnicodeEncodeError, UnicodeDecodeError, Exception):
+                    pass
+                files_by_stockist_cert.pop(stockist_cert, None)
+
+        packaged_files_set = set()
+        for files in files_by_stockist_cert.values():
+            for file_path in files:
+                packaged_files_set.add(file_path)
         
         # 4. 创建 ZIP 文件（和 download_by_order 保持完全一致的结构）
         temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
@@ -1766,6 +1808,7 @@ class StockistTestDownloader:
                     if not files:
                         print(f"[ZIP创建] 跳过空的 stockist_cert: {stockist_cert}")
                         continue
+                    zip_stockist_folder = self.zip_stockist_folder_name_from_files(stockist_cert, files)
                     
                     print(f"[ZIP创建] 处理 stockist_cert: {stockist_cert}, {len(files)} 个文件")
                     for file_path in files:
@@ -1817,29 +1860,29 @@ class StockistTestDownloader:
                                         # 去掉第一层（stockist_cert 文件夹）
                                         rel_path = '/'.join(path_parts[1:])
                                     
-                                    zip_path = f"{stockist_cert}/{source_folder}/{rel_path}"
+                                    zip_path = f"{zip_stockist_folder}/{source_folder}/{rel_path}"
                                 else:
-                                    zip_path = f"{stockist_cert}/{source_folder}/{file_name}"
+                                    zip_path = f"{zip_stockist_folder}/{source_folder}/{file_name}"
                             else:
                                 # 其他文件夹（IAT Prelim、Private Formal、Private Prelim、Stockist Cert）：
                                 # 直接放在 stockist_cert 文件夹下，只放文件名
-                                zip_path = f"{stockist_cert}/{file_name}"
+                                zip_path = f"{zip_stockist_folder}/{file_name}"
                             
                             zipf.write(file_path, zip_path)
                         except ValueError:
                             # 如果 relpath 失败（不同驱动器），使用文件名
                             if preserve_folder_structure:
-                                zip_path = f"{stockist_cert}/{source_folder}/{file_name}"
+                                zip_path = f"{zip_stockist_folder}/{source_folder}/{file_name}"
                             else:
                                 # 其他文件夹直接放在 stockist_cert 文件夹下
-                                zip_path = f"{stockist_cert}/{file_name}"
+                                zip_path = f"{zip_stockist_folder}/{file_name}"
                             zipf.write(file_path, zip_path)
             
             try:
-                print(f"[下载] 成功创建 ZIP 文件: {temp_zip_path}, 包含 {len(all_files)} 个文件")
+                print(f"[下载] 成功创建 ZIP 文件: {temp_zip_path}, 包含 {len(packaged_files_set)} 个文件")
             except (UnicodeEncodeError, UnicodeDecodeError, Exception):
                 pass
-            return temp_zip_path, len(all_files)
+            return temp_zip_path, len(packaged_files_set)
             
         except Exception as e:
             # 如果创建 ZIP 失败，清理临时文件
@@ -2048,6 +2091,7 @@ class StockistTestDownloader:
                 for (order_no, stockist_cert), files in files_by_order_and_cert.items():
                     if not files or not stockist_cert:
                         continue
+                    zip_stockist_folder = self.zip_stockist_folder_name_from_files(stockist_cert, files)
                     
                     for file_path in files:
                         abs_file_path = os.path.abspath(file_path)
@@ -2098,22 +2142,22 @@ class StockistTestDownloader:
                                         # 去掉第一层（stockist_cert 文件夹）
                                         rel_path = '/'.join(path_parts[1:])
                                     
-                                    zip_path = f"{order_no}/{stockist_cert}/{source_folder}/{rel_path}"
+                                    zip_path = f"{order_no}/{zip_stockist_folder}/{source_folder}/{rel_path}"
                                 else:
-                                    zip_path = f"{order_no}/{stockist_cert}/{source_folder}/{file_name}"
+                                    zip_path = f"{order_no}/{zip_stockist_folder}/{source_folder}/{file_name}"
                             else:
                                 # 其他文件夹（IAT Prelim、Private Formal、Private Prelim、Stockist Cert）：
                                 # 直接放在 Order_No/stockist_cert 文件夹下，只放文件名
-                                zip_path = f"{order_no}/{stockist_cert}/{file_name}"
+                                zip_path = f"{order_no}/{zip_stockist_folder}/{file_name}"
                             
                             zipf.write(file_path, zip_path)
                         except ValueError:
                             # 如果 relpath 失败（不同驱动器），使用文件名
                             if preserve_folder_structure:
-                                zip_path = f"{order_no}/{stockist_cert}/{source_folder}/{file_name}"
+                                zip_path = f"{order_no}/{zip_stockist_folder}/{source_folder}/{file_name}"
                             else:
                                 # 其他文件夹直接放在 Order_No/stockist_cert 文件夹下
-                                zip_path = f"{order_no}/{stockist_cert}/{file_name}"
+                                zip_path = f"{order_no}/{zip_stockist_folder}/{file_name}"
                             zipf.write(file_path, zip_path)
             
             try:
@@ -2141,32 +2185,17 @@ class StockistTestDownloader:
         Returns:
             DD_No 值，如果不存在返回 None
         """
-        # 使用数据库适配器以支持 PostgreSQL
-        if DB_ADAPTER_AVAILABLE:
-            conn = get_db_connection()
-        else:
-            conn = sqlite3.connect(self.db_path)
-            conn.row_factory = sqlite3.Row
-        
+        conn = get_db_connection()
         cursor = conn.cursor()
         
         try:
-            if DB_ADAPTER_AVAILABLE and is_postgres():
-                query = """
-                    SELECT DISTINCT dd_no
-                    FROM bbs_dd
-                    WHERE bbs_no = %s
-                    LIMIT 1
-                """
-                cursor.execute(query, (order_no,))
-            else:
-                query = """
-                    SELECT DISTINCT dd_no
-                    FROM bbs_dd
-                    WHERE bbs_no = ?
-                    LIMIT 1
-                """
-                cursor.execute(query, (order_no,))
+            query = """
+                SELECT DISTINCT dd_no
+                FROM bbs_dd
+                WHERE bbs_no = %s
+                LIMIT 1
+            """
+            cursor.execute(query, (order_no,))
             
             row = cursor.fetchone()
             
@@ -2207,32 +2236,17 @@ class StockistTestDownloader:
         for i in range(0, len(order_nos), BATCH_SIZE):
             batch = order_nos[i:i + BATCH_SIZE]
             
-            # 使用数据库适配器以支持 PostgreSQL
-            if DB_ADAPTER_AVAILABLE:
-                conn = get_db_connection()
-            else:
-                conn = sqlite3.connect(self.db_path)
-                conn.row_factory = sqlite3.Row
-            
+            conn = get_db_connection()
             cursor = conn.cursor()
             
             try:
-                if DB_ADAPTER_AVAILABLE and is_postgres():
-                    placeholders = ','.join(['%s'] * len(batch))
-                    query = f"""
-                        SELECT DISTINCT bbs_no, dd_no
-                        FROM bbs_dd
-                        WHERE bbs_no IN ({placeholders})
-                    """
-                    cursor.execute(query, batch)
-                else:
-                    placeholders = ','.join('?' * len(batch))
-                    query = f"""
-                        SELECT DISTINCT bbs_no, dd_no
-                        FROM bbs_dd
-                        WHERE bbs_no IN ({placeholders})
-                    """
-                    cursor.execute(query, batch)
+                placeholders = ','.join(['%s'] * len(batch))
+                query = f"""
+                    SELECT DISTINCT bbs_no, dd_no
+                    FROM bbs_dd
+                    WHERE bbs_no IN ({placeholders})
+                """
+                cursor.execute(query, batch)
                 
                 rows = cursor.fetchall()
                 
@@ -2513,12 +2527,62 @@ class StockistTestDownloader:
                         print(f"[下载] 文件 {file_name} 未匹配到任何 stockist_cert，跳过该文件")
                     except (UnicodeEncodeError, UnicodeDecodeError, Exception):
                         pass
+
+            # 过滤缺失的 stockist_cert：若缺少 Stockist 或 Test，则不打包该 stockist 文件夹
+            abs_stockist_folder = os.path.abspath(self.stockist_folder)
+            abs_private_formal_folder = os.path.abspath(self.private_formal_folder)
+            abs_private_prelim_folder = os.path.abspath(self.private_prelim_folder)
+            abs_iat_formal_folder = os.path.abspath(self.iat_formal_folder)
+            abs_iat_prelim_folder = os.path.abspath(self.iat_prelim_folder)
+
+            for stockist_cert in list(files_by_stockist_cert.keys()):
+                cert_files = files_by_stockist_cert.get(stockist_cert, [])
+                has_stockist_report = False
+                has_test_report = False
+
+                for file_path in cert_files:
+                    abs_file_path = os.path.abspath(file_path)
+                    if abs_file_path.startswith(abs_stockist_folder):
+                        has_stockist_report = True
+                    if (
+                        abs_file_path.startswith(abs_private_formal_folder) or
+                        abs_file_path.startswith(abs_private_prelim_folder) or
+                        abs_file_path.startswith(abs_iat_formal_folder) or
+                        abs_file_path.startswith(abs_iat_prelim_folder)
+                    ):
+                        has_test_report = True
+
+                missing_type = None
+                if not cert_files:
+                    missing_type = "No matched PDF"
+                elif not has_stockist_report and not has_test_report:
+                    missing_type = "No Stockist/Test classified file"
+                elif not has_stockist_report:
+                    missing_type = "Missing Stockist report"
+                elif not has_test_report:
+                    missing_type = "Missing Test report"
+
+                if missing_type:
+                    try:
+                        print(f"[下载] DD_No {dd_no}: Stockist {stockist_cert} 缺失({missing_type})，跳过打包该文件夹")
+                    except (UnicodeEncodeError, UnicodeDecodeError, Exception):
+                        pass
+                    files_by_stockist_cert.pop(stockist_cert, None)
             
             # 保存该 DD_No 的文件组织结构
             files_by_dd_no_and_cert[dd_no] = files_by_stockist_cert
         
-        if not files_by_dd_no_and_cert:
+        has_packable_files = any(
+            files for files_by_cert in files_by_dd_no_and_cert.values() for files in files_by_cert.values()
+        )
+        if not files_by_dd_no_and_cert or not has_packable_files:
             raise ValueError(f"所有 DD_No {unique_dd_nos} 都没有找到相关 PDF 文件")
+
+        packaged_files_set = set()
+        for files_by_cert in files_by_dd_no_and_cert.values():
+            for files in files_by_cert.values():
+                for file_path in files:
+                    packaged_files_set.add(file_path)
         
         # 统计各DD_No的文件数
         dd_no_file_counts = {}
@@ -2528,7 +2592,7 @@ class StockistTestDownloader:
         
         try:
             try:
-                print(f"[下载] 批量下载总共找到 {len(all_files_set)} 个唯一文件（已去重）")
+                print(f"[下载] 批量下载总共找到 {len(packaged_files_set)} 个唯一文件（已去重）")
                 print(f"[下载] 各DD_No文件统计: {dd_no_file_counts}")
             except (UnicodeEncodeError, UnicodeDecodeError, Exception):
                 pass
@@ -2547,6 +2611,7 @@ class StockistTestDownloader:
                     for stockist_cert, files in files_by_stockist_cert.items():
                         if not files or not stockist_cert:
                             continue
+                        zip_stockist_folder = self.zip_stockist_folder_name_from_files(stockist_cert, files)
                         
                         for file_path in files:
                             abs_file_path = os.path.abspath(file_path)
@@ -2597,29 +2662,29 @@ class StockistTestDownloader:
                                             # 去掉第一层（stockist_cert 文件夹）
                                             rel_path = '/'.join(path_parts[1:])
                                         
-                                        zip_path = f"{dd_no}/{stockist_cert}/{source_folder}/{rel_path}"
+                                        zip_path = f"{dd_no}/{zip_stockist_folder}/{source_folder}/{rel_path}"
                                     else:
-                                        zip_path = f"{dd_no}/{stockist_cert}/{source_folder}/{file_name}"
+                                        zip_path = f"{dd_no}/{zip_stockist_folder}/{source_folder}/{file_name}"
                                 else:
                                     # 其他文件夹（IAT Prelim、Private Formal、Private Prelim、Stockist Cert）：
                                     # 直接放在 DD_No/stockist_cert 文件夹下，只放文件名
-                                    zip_path = f"{dd_no}/{stockist_cert}/{file_name}"
+                                    zip_path = f"{dd_no}/{zip_stockist_folder}/{file_name}"
                                 
                                 zipf.write(file_path, zip_path)
                             except ValueError:
                                 # 如果 relpath 失败（不同驱动器），使用文件名
                                 if preserve_folder_structure:
-                                    zip_path = f"{dd_no}/{stockist_cert}/{source_folder}/{file_name}"
+                                    zip_path = f"{dd_no}/{zip_stockist_folder}/{source_folder}/{file_name}"
                                 else:
                                     # 其他文件夹直接放在 DD_No/stockist_cert 文件夹下
-                                    zip_path = f"{dd_no}/{stockist_cert}/{file_name}"
+                                    zip_path = f"{dd_no}/{zip_stockist_folder}/{file_name}"
                                 zipf.write(file_path, zip_path)
             
             try:
-                print(f"[下载] 成功创建 ZIP，包含 {len(all_files_set)} 个文件")
+                print(f"[下载] 成功创建 ZIP，包含 {len(packaged_files_set)} 个文件")
             except (UnicodeEncodeError, UnicodeDecodeError, Exception):
                 pass
-            return temp_zip_path, len(all_files_set)
+            return temp_zip_path, len(packaged_files_set)
             
         except Exception as e:
             # 如果创建 ZIP 失败，清理临时文件
@@ -2849,12 +2914,52 @@ class StockistTestDownloader:
                                             except (UnicodeEncodeError, UnicodeDecodeError, Exception):
                                                 pass
                     elif is_private:
-                        # Private 类型
-                        private_formal_files = self.find_files_by_keywords(self.private_formal_folder, all_keywords, search_subfolders=True)
+                        # Private 类型：与 download_by_order 一致 —— 按 cert 统计 Formal 命中，仅对 missing 的 cert 补 Private Prelim
+                        private_formal_files = self.find_files_by_keywords(
+                            self.private_formal_folder, all_keywords, search_subfolders=True
+                        )
+                        formal_files_by_cert = {}
+                        for file_path in private_formal_files:
+                            file_name = os.path.basename(file_path)
+                            matched_cert = self.match_file_to_stockist_cert(
+                                file_name, file_path, stockist_certs, rm_dn_nos, order_rm_dn_map
+                            )
+                            if matched_cert:
+                                if matched_cert not in formal_files_by_cert:
+                                    formal_files_by_cert[matched_cert] = []
+                                formal_files_by_cert[matched_cert].append(file_path)
+                        missing_certs = [cert for cert in stockist_certs if cert and cert not in formal_files_by_cert]
+                        
                         if private_formal_files:
                             additional_files.extend(private_formal_files)
+                            
+                            if missing_certs:
+                                missing_keywords = []
+                                for cert in missing_certs:
+                                    missing_keywords.append(cert)
+                                    for rm_dn_no, mapped_cert in order_rm_dn_map.items():
+                                        if mapped_cert == cert:
+                                            missing_keywords.append(rm_dn_no)
+                                
+                                if missing_keywords:
+                                    private_prelim_files = self.find_files_by_keywords(
+                                        self.private_prelim_folder, missing_keywords, search_subfolders=True
+                                    )
+                                    if private_prelim_files:
+                                        valid_prelim_files = []
+                                        for file_path in private_prelim_files:
+                                            file_name = os.path.basename(file_path)
+                                            matched_cert = self.match_file_to_stockist_cert(
+                                                file_name, file_path, missing_certs, rm_dn_nos, order_rm_dn_map
+                                            )
+                                            if matched_cert and matched_cert in missing_certs:
+                                                valid_prelim_files.append(file_path)
+                                        if valid_prelim_files:
+                                            additional_files.extend(valid_prelim_files)
                         else:
-                            private_prelim_files = self.find_files_by_keywords(self.private_prelim_folder, all_keywords, search_subfolders=True)
+                            private_prelim_files = self.find_files_by_keywords(
+                                self.private_prelim_folder, all_keywords, search_subfolders=True
+                            )
                             if private_prelim_files:
                                 additional_files.extend(private_prelim_files)
                     
@@ -2997,7 +3102,7 @@ class StockistTestDownloader:
                         if file_path not in files_by_job_and_cert[job_no][matched_stockist_cert]:
                             files_by_job_and_cert[job_no][matched_stockist_cert].append(file_path)
 
-            # 记录缺失项：该日期下，每个 order 的每个 stockist_cert 如果没有任何文件则记为缺失
+            # 记录缺失项：基于最终落桶结果细分缺失类型（全缺 / 仅缺 Stockist / 仅缺 Test）
             for order_no in order_nos_for_date:
                 order_info = orders_info_batch.get(order_no)
                 if not order_info:
@@ -3017,15 +3122,50 @@ class StockistTestDownloader:
                     continue
 
                 job_bucket = files_by_job_and_cert.get(order_job_no, {})
+                abs_stockist_folder = os.path.abspath(self.stockist_folder)
+                abs_private_formal_folder = os.path.abspath(self.private_formal_folder)
+                abs_private_prelim_folder = os.path.abspath(self.private_prelim_folder)
+                abs_iat_formal_folder = os.path.abspath(self.iat_formal_folder)
+                abs_iat_prelim_folder = os.path.abspath(self.iat_prelim_folder)
                 for cert in normalized_certs:
                     cert_files = job_bucket.get(cert, [])
+                    has_stockist_report = False
+                    has_test_report = False
+
+                    for file_path in cert_files:
+                        abs_file_path = os.path.abspath(file_path)
+                        if abs_file_path.startswith(abs_stockist_folder):
+                            has_stockist_report = True
+                        if (
+                            abs_file_path.startswith(abs_private_formal_folder) or
+                            abs_file_path.startswith(abs_private_prelim_folder) or
+                            abs_file_path.startswith(abs_iat_formal_folder) or
+                            abs_file_path.startswith(abs_iat_prelim_folder)
+                        ):
+                            has_test_report = True
+
                     if not cert_files:
+                        missing_type = "No matched PDF"
+                    elif not has_stockist_report and not has_test_report:
+                        missing_type = "No Stockist/Test classified file"
+                    elif not has_stockist_report:
+                        missing_type = "Missing Stockist report"
+                    elif not has_test_report:
+                        missing_type = "Missing Test report"
+                    else:
+                        missing_type = None
+
+                    if missing_type:
                         missing_entries.append({
                             'date': date_str,
                             'order_no': order_no,
                             'job_no': order_job_no,
-                            'stockist_cert': cert
+                            'stockist_cert': cert,
+                            'missing_type': missing_type
                         })
+                        # 缺失则不打包该 Stockist 文件夹
+                        if cert in job_bucket:
+                            job_bucket.pop(cert, None)
             
             # 保存该日期的文件组织结构
             files_by_date_job_and_cert[date_str] = files_by_job_and_cert
@@ -3033,17 +3173,21 @@ class StockistTestDownloader:
         if not files_by_date_job_and_cert:
             raise ValueError(f"所有日期 {unique_dates} 都没有找到相关 PDF 文件")
         
-        # 统计各日期的文件数
+        # 统计各日期的文件数（基于最终会被打包的结构）
+        packaged_files_set = set()
         date_file_counts = {}
         for date_str, files_by_job in files_by_date_job_and_cert.items():
             total_count = 0
             for files_by_cert in files_by_job.values():
-                total_count += sum(len(files) for files in files_by_cert.values())
+                for files in files_by_cert.values():
+                    total_count += len(files)
+                    for file_path in files:
+                        packaged_files_set.add(file_path)
             date_file_counts[date_str] = total_count
         
         try:
             try:
-                print(f"[下载] 批量下载总共找到 {len(all_files_set)} 个唯一文件（已去重）")
+                print(f"[下载] 批量下载总共找到 {len(packaged_files_set)} 个唯一文件（已去重）")
                 print(f"[下载] 各日期文件统计: {date_file_counts}")
             except (UnicodeEncodeError, UnicodeDecodeError, Exception):
                 pass
@@ -3066,6 +3210,7 @@ class StockistTestDownloader:
                         for stockist_cert, files in files_by_stockist_cert.items():
                             if not files or not stockist_cert:
                                 continue
+                            zip_stockist_folder = self.zip_stockist_folder_name_from_files(stockist_cert, files)
                             
                             for file_path in files:
                                 abs_file_path = os.path.abspath(file_path)
@@ -3116,14 +3261,25 @@ class StockistTestDownloader:
                                                 # 去掉第一层（stockist_cert 文件夹）
                                                 rel_path = '/'.join(path_parts[1:])
                                             
-                                            zip_path = f"{date_str}/{job_no}/{stockist_cert}/{source_folder}/{rel_path}"
+                                            zip_path = f"{date_str}/{job_no}/{zip_stockist_folder}/{source_folder}/{rel_path}"
                                         else:
-                                            zip_path = f"{date_str}/{job_no}/{stockist_cert}/{source_folder}/{file_name}"
+                                            zip_path = f"{date_str}/{job_no}/{zip_stockist_folder}/{source_folder}/{file_name}"
                                     else:
                                         # 其他文件夹（IAT Prelim、Private Formal、Private Prelim、Stockist Cert）：
                                         # 直接放在 日期/Job_No/stockist_cert 文件夹下，只放文件名
-                                        zip_path = f"{date_str}/{job_no}/{stockist_cert}/{file_name}"
+                                        zip_path = f"{date_str}/{job_no}/{zip_stockist_folder}/{file_name}"
                                     
+                                    if zip_path in written_zip_paths:
+                                        continue
+                                    zipf.write(file_path, zip_path)
+                                    written_zip_paths.add(zip_path)
+                                except ValueError:
+                                    # 如果 relpath 失败（不同驱动器），使用文件名
+                                    if preserve_folder_structure:
+                                        zip_path = f"{date_str}/{job_no}/{zip_stockist_folder}/{source_folder}/{file_name}"
+                                    else:
+                                        # 其他文件夹直接放在 日期/Job_No/stockist_cert 文件夹下
+                                        zip_path = f"{date_str}/{job_no}/{zip_stockist_folder}/{file_name}"
                                     if zip_path in written_zip_paths:
                                         continue
                                     zipf.write(file_path, zip_path)
@@ -3142,32 +3298,21 @@ class StockistTestDownloader:
 
                     report_lines = [
                         "Stockist & Test Report Missing Items",
-                        "Generated by grouped-by-date download",
+                        "MissingType: No matched PDF | Missing Stockist report | Missing Test report",
                         ""
                     ]
                     for item in unique_missing:
                         report_lines.append(
-                            f"Date={item['date']} | Order={item['order_no']} | Job No={item['job_no']} | Stockist No={item['stockist_cert']} | Missing=No matched PDF"
+                            f"Date={item['date']} | Order={item['order_no']} | Job No={item['job_no']} | Stockist No={item['stockist_cert']} | Missing={item.get('missing_type', 'Unknown')}"
                         )
 
                     zipf.writestr("MISSING_FILES_REPORT.txt", "\n".join(report_lines))
-                                except ValueError:
-                                    # 如果 relpath 失败（不同驱动器），使用文件名
-                                    if preserve_folder_structure:
-                                        zip_path = f"{date_str}/{job_no}/{stockist_cert}/{source_folder}/{file_name}"
-                                    else:
-                                        # 其他文件夹直接放在 日期/Job_No/stockist_cert 文件夹下
-                                        zip_path = f"{date_str}/{job_no}/{stockist_cert}/{file_name}"
-                                    if zip_path in written_zip_paths:
-                                        continue
-                                    zipf.write(file_path, zip_path)
-                                    written_zip_paths.add(zip_path)
             
             try:
-                print(f"[下载] 成功创建 ZIP，包含 {len(all_files_set)} 个文件")
+                print(f"[下载] 成功创建 ZIP，包含 {len(packaged_files_set)} 个文件")
             except (UnicodeEncodeError, UnicodeDecodeError, Exception):
                 pass
-            return temp_zip_path, len(all_files_set)
+            return temp_zip_path, len(packaged_files_set)
             
         except Exception as e:
             # 如果创建 ZIP 失败，清理临时文件

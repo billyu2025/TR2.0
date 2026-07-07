@@ -52,18 +52,6 @@
             <main class="content">
                 <div class="page-header">
                     <h1>TR記錄管理</h1>
-                    <div class="system-update-notice">
-                        <div class="notice-title">
-                            <span class="notice-icon">⚠</span>
-                            <span>系統更新時段</span>
-                        </div>
-                        <div class="notice-slots">
-                            <span class="notice-slot">13:05 - 13:15</span>
-                            <span class="notice-separator">，</span>
-                            <span class="notice-slot">16:20 - 16:30</span>
-                        </div>
-                        <div class="notice-text">更新期間功能可能短暫受影響，請於更新完成後再操作。</div>
-                    </div>
                     <button 
                         class="update-data-btn" 
                         @click="startUpdateAllTables($event)"
@@ -90,6 +78,13 @@
                         @click="activeSubTab = 'stocklist-test'"
                     >
                         STOCKIST & TEST REPORT
+                    </button>
+                    <button 
+                        class="tab-btn" 
+                        :class="{ 'tab-btn--active': activeSubTab === 'cert-compliance' }"
+                        @click="activeSubTab = 'cert-compliance'"
+                    >
+                        CERT OF COMPLIANCE
                     </button>
                 </div>
 
@@ -170,7 +165,7 @@
 
                 <!-- TR记录表格 -->
                 <div class="table-container">
-                    <table class="tr-table">
+                    <table class="tr-table tr-records-table">
                         <thead>
                             <tr>
                                 <th class="checkbox-column">
@@ -231,13 +226,16 @@
                                         <span v-if="record.status === 'generated'" class="status-badge generated">
                                             ✅ 已生成
                                         </span>
+                                        <span v-else-if="record.status === 'failed'" class="status-badge failed">
+                                            ❌ 生成失敗
+                                        </span>
                                         <span v-else class="status-badge pending">
                                             ⏳ 未生成
                                         </span>
                                     </td>
                                     <td class="action-cell" @click.stop>
                                         <button 
-                                            v-if="record.status === 'pending'"
+                                            v-if="record.status === 'pending' || record.status === 'failed'"
                                             class="generate-btn" 
                                             @click="generatePDF(record)"
                                         >
@@ -269,6 +267,167 @@
                 </div>
 
                 <!-- 分頁 - 搜索和非搜索狀態都顯示 -->
+                <div class="pagination" v-if="totalPages > 0">
+                    <button @click="prevPage" :disabled="currentPage === 1">上一頁</button>
+                    <span>第 {{ currentPage }} 頁，共 {{ totalPages }} 頁</span>
+                    <button @click="nextPage" :disabled="currentPage === totalPages">下一頁</button>
+                </div>
+                </div>
+
+                <!-- CERT OF COMPLIANCE Tab -->
+                <div v-if="activeSubTab === 'cert-compliance'">
+                <div class="search-section">
+                    <div class="search-box">
+                        <input 
+                            type="text" 
+                            v-model="searchQuery.shippingNo" 
+                            placeholder="按 DD_NO 搜尋"
+                            @keyup.enter="performSearch"
+                        >
+                    </div>
+                    <div class="search-box">
+                        <input 
+                            type="text" 
+                            v-model="searchQuery.jobNo" 
+                            placeholder="按 Job No 搜尋"
+                            @keyup.enter="performSearch"
+                        >
+                    </div>
+                    <div class="date-filter">
+                        <label>開始日期</label>
+                        <input type="date" v-model="searchQuery.startDate" :min="minDate" :max="maxDate">
+                    </div>
+                    <div class="date-filter">
+                        <label>結束日期</label>
+                        <input type="date" v-model="searchQuery.endDate" :min="minDate" :max="maxDate">
+                    </div>
+                    <button class="search-btn" @click="performSearch">搜尋</button>
+                    <button class="reset-btn" @click="resetSearch">重置</button>
+                </div>
+
+                <div class="batch-actions" v-if="currentSelectedRecords.length > 0">
+                    <div class="batch-info">
+                        <span>已選擇 {{ currentSelectedRecords.length }} 條記錄</span>
+                    </div>
+                    <div class="batch-buttons">
+                        <button 
+                            class="batch-download-btn" 
+                            @click="certBatchDownload"
+                            :disabled="!hasSelectedGeneratedRecords"
+                        >
+                            📥 批量下載PDF ({{ selectedGeneratedCount }})
+                        </button>
+                        <button 
+                            class="batch-generate-btn" 
+                            @click="certBatchGenerate"
+                            :disabled="!hasSelectedPendingRecords"
+                        >
+                            ⚙️ 批量生成PDF ({{ selectedPendingCount }})
+                        </button>
+                        <button 
+                            class="batch-regenerate-btn" 
+                            @click="certBatchRegenerate"
+                            :disabled="!hasSelectedGeneratedRecords"
+                        >
+                            🔄 批量重新生成PDF ({{ selectedGeneratedCount }})
+                        </button>
+                        <button class="clear-selection-btn" @click="clearSelection">✕ 清除選擇</button>
+                    </div>
+                </div>
+
+                <div class="table-container">
+                    <table class="tr-table cert-compliance-table">
+                        <thead>
+                            <tr>
+                                <th class="checkbox-column">
+                                    <input type="checkbox" :checked="isAllSelected" @change="toggleSelectAll" class="select-all-checkbox">
+                                </th>
+                                <th>DD_NO</th>
+                                <th>Job No</th>
+                                <th>Jobsite Name</th>
+                                <th>Del Address</th>
+                                <th>Client Name</th>
+                                <th>Del Date</th>
+                                <th>狀態</th>
+                                <th>操作</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr v-if="loading">
+                                <td colspan="9" class="loading-row">
+                                    <div class="table-loading">
+                                        <div class="loading-spinner-small"></div>
+                                        <span>正在載入數據...</span>
+                                    </div>
+                                </td>
+                            </tr>
+                            <template v-else>
+                                <tr 
+                                    v-for="record in filteredRecords" 
+                                    :key="record.id"
+                                    @click="certHandleRowClick(record, $event)"
+                                    :class="{ 'row-clickable': record.status === 'generated', 'row-hover': true }"
+                                    style="cursor: pointer;"
+                                >
+                                    <td class="checkbox-column" @click.stop>
+                                        <input 
+                                            type="checkbox" 
+                                            :value="record.id" 
+                                            v-model="currentSelectedRecordsModel" 
+                                            class="record-checkbox"
+                                            @click.stop
+                                        >
+                                    </td>
+                                    <td>{{ record.shippingNo }}</td>
+                                    <td>{{ record.jobNo }}</td>
+                                    <td>{{ record.jobsiteName }}</td>
+                                    <td class="del-address-cell">{{ record.delAddress }}</td>
+                                    <td>{{ record.client }}</td>
+                                    <td>{{ record.delDate }}</td>
+                                    <td class="status-cell">
+                                        <span v-if="record.status === 'generated'" class="status-badge generated">
+                                            ✅ 已生成
+                                        </span>
+                                        <span v-else-if="record.status === 'failed'" class="status-badge failed">
+                                            ❌ 生成失敗
+                                        </span>
+                                        <span v-else class="status-badge pending">
+                                            ⏳ 未生成
+                                        </span>
+                                    </td>
+                                    <td class="action-cell" @click.stop>
+                                        <button 
+                                            v-if="record.status === 'pending' || record.status === 'failed'"
+                                            class="generate-btn" 
+                                            @click="certGeneratePDF(record)"
+                                        >
+                                            📄 生成
+                                        </button>
+                                        <button 
+                                            v-if="record.status === 'generated'" 
+                                            class="download-btn" 
+                                            @click="certDownloadPDF(record)"
+                                        >
+                                            📥 下載
+                                        </button>
+                                        <button 
+                                            v-if="record.status === 'generated' && (userInfo.role === 'admin' || userInfo.role === 'manager')" 
+                                            class="generate-btn" 
+                                            @click.stop="certRegeneratePDF(record)"
+                                            :title="'重新生成 DD_NO ' + record.shippingNo + ' 的PDF'"
+                                        >
+                                            🔄 生成
+                                        </button>
+                                    </td>
+                                </tr>
+                                <tr v-if="filteredRecords.length === 0">
+                                    <td colspan="9" class="no-data">暫無數據</td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                </div>
+
                 <div class="pagination" v-if="totalPages > 0">
                     <button @click="prevPage" :disabled="currentPage === 1">上一頁</button>
                     <span>第 {{ currentPage }} 頁，共 {{ totalPages }} 頁</span>
@@ -484,14 +643,19 @@
             </div>
         </div>
 
-        <!-- 更新数据模态框 -->
-        <div v-if="showUpdateModal" class="modal-overlay update-modal-overlay" @keyup.enter="closeUpdateModal">
+        <!-- 更新数据模态框：進行中時鎖定滾動、禁止關閉與重新整理（見 tr-records.js） -->
+        <div
+            v-if="showUpdateModal"
+            class="modal-overlay update-modal-overlay"
+            :class="{ 'update-modal-overlay--locked': updateDataLoading }"
+        >
             <div class="update-modal-content" @click.stop>
                 <!-- 更新中状态 -->
                 <div v-if="updateDataStatus === 'running'" class="update-status">
                     <div class="loading-spinner"></div>
                     <h2>正在更新數據...</h2>
-                    <p>請稍候，此過程可能需要幾分鐘時間</p>
+                    <p>請稍候，此過程可能需要二十分鐘左右時間</p>
+                    <p class="update-lock-hint">更新進行中：頁面已鎖定，請勿關閉分頁或重新整理；完成或失敗後可按 Enter 關閉提示。</p>
                     <div class="loading-dots">
                         <span></span>
                         <span></span>
@@ -520,7 +684,7 @@
         </div>
     </div>
 
-    <script src="scripts/tr-records.js?v=20260224a"></script>
+    <script src="scripts/tr-records.js?v=20260605d"></script>
 </body>
 </html>
 

@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import create_engine, text
 import pyodbc
 import warnings
-from db_adapter import DB_PATH, POSTGRES_DSN, is_postgres
+from db_adapter import DB_PATH, POSTGRES_DSN, is_postgres, sqlalchemy_postgres_dsn, coerce_dataframe_date_columns
 warnings.filterwarnings('ignore')
 
 # 配置日志
@@ -104,7 +104,7 @@ class TRReportGenerator3Years:
             if is_postgres():
                 if not POSTGRES_DSN:
                     raise RuntimeError("POSTGRES_DSN 未配置")
-                self.target_engine = create_engine(POSTGRES_DSN, echo=False)
+                self.target_engine = create_engine(sqlalchemy_postgres_dsn(), echo=False)
                 with self.target_engine.connect() as conn:
                     conn.execute(text("SELECT 1"))
                 self.logger.info("✅ PostgreSQL目标数据库连接成功")
@@ -201,6 +201,9 @@ class TRReportGenerator3Years:
                 if not self.target_engine:
                     self.create_target_connection()
 
+                if is_postgres():
+                    df = coerce_dataframe_date_columns(df)
+
                 with self.target_engine.begin() as target_conn:
                     if self._target_table_exists():
                         target_conn.execute(text(f"DELETE FROM {self.target_table_ref}"))
@@ -208,8 +211,15 @@ class TRReportGenerator3Years:
                     else:
                         self.logger.info("TR_Report 表不存在，将按 DataFrame 结构创建")
 
-                self.logger.info(f"写入数据到 {'PostgreSQL' if is_postgres() else 'SQLite'}...")
-                df.to_sql('TR_Report', self.target_engine, if_exists='append', index=False, method='multi', chunksize=1000)
+                    self.logger.info(f"写入数据到 {'PostgreSQL' if is_postgres() else 'SQLite'}...")
+                    df.to_sql(
+                        'TR_Report',
+                        target_conn,
+                        if_exists='append',
+                        index=False,
+                        method='multi',
+                        chunksize=1000,
+                    )
 
                 verify_count = pd.read_sql(f"SELECT COUNT(*) as cnt FROM {self.target_table_ref}", self.target_engine).iloc[0]['cnt']
                 self.logger.info(f"✅ TR_Report 表创建成功: {verify_count:,} 条记录")

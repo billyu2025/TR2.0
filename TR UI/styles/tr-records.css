@@ -157,88 +157,6 @@
     margin-bottom: 28px;
 }
 
-.system-update-notice {
-    margin: 0 0 0 auto;
-    padding: var(--spacing-3) var(--spacing-4);
-    border-radius: var(--radius-lg);
-    border: 1px solid #f8d78d;
-    background: linear-gradient(135deg, #fffaf0 0%, #fff2d7 100%);
-    color: #7a5a00;
-    min-width: 300px;
-    max-width: 420px;
-    box-shadow: 0 8px 20px rgba(243, 156, 18, 0.14);
-    transition: transform var(--transition-base), box-shadow var(--transition-base);
-}
-
-.system-update-notice:hover {
-    transform: translateY(-1px);
-    box-shadow: 0 10px 22px rgba(243, 156, 18, 0.2);
-}
-
-.notice-title {
-    display: flex;
-    align-items: center;
-    gap: var(--spacing-2);
-    font-size: var(--font-size-sm);
-    font-weight: var(--font-weight-bold);
-    letter-spacing: 0.3px;
-    color: #6d4f00;
-}
-
-.notice-icon {
-    width: 20px;
-    height: 20px;
-    border-radius: 50%;
-    background: #f39c12;
-    color: #fff;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 12px;
-    line-height: 1;
-    flex-shrink: 0;
-}
-
-.notice-slots {
-    margin-top: var(--spacing-2);
-    display: flex;
-    flex-wrap: wrap;
-    gap: var(--spacing-2);
-}
-
-.notice-slot {
-    display: inline-flex;
-    align-items: center;
-    padding: 2px 10px;
-    font-size: var(--font-size-xs);
-    font-weight: var(--font-weight-semibold);
-    color: #7a4a00;
-    background: rgba(255, 255, 255, 0.8);
-    border: 1px solid #f4d08a;
-    border-radius: var(--radius-full);
-}
-
-/* Fallback spacing in case flex gap is not applied */
-.notice-slot + .notice-slot {
-    margin-left: 8px;
-}
-
-.notice-separator {
-    display: inline-flex;
-    align-items: center;
-    color: #8a6413;
-    font-weight: var(--font-weight-semibold);
-    margin: 0 2px;
-}
-
-.notice-text {
-    margin-top: var(--spacing-2);
-    font-size: var(--font-size-xs);
-    line-height: 1.5;
-    color: #8a6413;
-    font-weight: var(--font-weight-medium);
-}
-
 .page-header h1 {
     font-size: var(--font-size-3xl);
     color: var(--color-primary);
@@ -252,7 +170,7 @@
 
 /* 更新数据按钮 - 优化样式 */
 .update-data-btn {
-    margin-left: 0;
+    margin-left: auto;
     background: linear-gradient(135deg, var(--color-warning) 0%, #e67e22 100%);
     color: white;
     border: none;
@@ -1014,6 +932,44 @@
     line-height: 1.5;
 }
 
+.tr-table td.del-address-cell {
+    max-width: 320px;
+    white-space: normal;
+    word-break: break-word;
+    line-height: 1.5;
+}
+
+/* CERT OF COMPLIANCE 标签页中 Job No 列（第3列）缩小宽度 */
+.cert-compliance-table th:nth-child(3),
+.cert-compliance-table td:nth-child(3) {
+    width: 80px;
+    max-width: 80px;
+}
+
+.cert-compliance-table td:nth-child(3) {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* CERT OF COMPLIANCE：Jobsite Name 略压缩，Del Date 略加宽 */
+.cert-compliance-table th:nth-child(4),
+.cert-compliance-table td:nth-child(4) {
+    max-width: 200px;
+}
+
+.cert-compliance-table td:nth-child(4) {
+    word-break: break-word;
+    line-height: 1.5;
+}
+
+.cert-compliance-table th:nth-child(7),
+.cert-compliance-table td:nth-child(7) {
+    min-width: 110px;
+    width: 110px;
+    white-space: nowrap;
+}
+
 /* Stocklist&Test Report 标签页中 Job_No 列（第3列）缩小宽度 */
 .stocklist-test-table th:nth-child(3),
 .stocklist-test-table td:nth-child(3) {
@@ -1042,11 +998,32 @@
     text-overflow: ellipsis;
 }
 
-/* Del Date 列保持在同一行展示完整日期 */
-.tr-table th:nth-child(8),
-.tr-table td:nth-child(8) {
+/* Del Date 列保持在同一行展示完整日期（仅 TR 记录管理） */
+.tr-records-table th:nth-child(8),
+.tr-records-table td:nth-child(8) {
     min-width: 130px;
     width: 130px;
+    white-space: nowrap;
+}
+
+/* 状态列 — TR 第9列 / CERT 第8列，尺寸一致 */
+.tr-records-table th:nth-child(9),
+.tr-records-table td:nth-child(9),
+.cert-compliance-table th:nth-child(8),
+.cert-compliance-table td:nth-child(8) {
+    width: 105px;
+    min-width: 105px;
+    max-width: 105px;
+    white-space: nowrap;
+}
+
+/* 操作列 — TR 第10列 / CERT 第9列，尺寸一致 */
+.tr-records-table th:nth-child(10),
+.tr-records-table td:nth-child(10),
+.cert-compliance-table th:nth-child(9),
+.cert-compliance-table td:nth-child(9) {
+    width: 200px;
+    min-width: 200px;
     white-space: nowrap;
 }
 
@@ -1193,6 +1170,12 @@
 .status-badge.pending:hover {
     transform: translateY(-1px);
     box-shadow: 0 2px 8px rgba(243, 156, 18, 0.2);
+}
+
+.status-badge.failed {
+    background: linear-gradient(135deg, #f8d7da 0%, #f5c6cb 100%);
+    color: #721c24;
+    border: 1px solid #f5c6cb;
 }
 
 /* 禁用状态的下载按钮 */
@@ -1852,13 +1835,6 @@
         align-items: flex-start;
     }
 
-    .system-update-notice {
-        margin: 0;
-        min-width: 100%;
-        max-width: 100%;
-        order: 3;
-    }
-
     /* 搜索区域 */
     .search-section {
         flex-direction: column;
@@ -1968,6 +1944,34 @@
     justify-content: center;
     z-index: 10000;
     backdrop-filter: blur(4px);
+}
+
+/* 更新進行中：遮罩全屏固定，避免誤觸背後滾動 */
+.update-modal-overlay--locked {
+    overscroll-behavior: none;
+    touch-action: none;
+}
+
+html.tr-update-html-lock,
+body.tr-update-body-lock {
+    overflow: hidden !important;
+}
+
+body.tr-update-body-lock {
+    position: fixed;
+    width: 100%;
+    left: 0;
+    right: 0;
+}
+
+.update-lock-hint {
+    font-size: 14px !important;
+    color: #c0392b !important;
+    margin: 8px 0 0 !important;
+    line-height: 1.5 !important;
+    max-width: 28em;
+    margin-left: auto !important;
+    margin-right: auto !important;
 }
 
 .update-modal-content {

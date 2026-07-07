@@ -291,7 +291,7 @@ class PDFTaskManager:
             self.update_progress(task_id, 20, 'Creating PDF generator...')
             logger.debug(f"Creating PDF generator for order {order_no}")
             
-            # Create PDF generator (using SQL Server connection)
+            # Create PDF generator (PostgreSQL TR_Report)
             generator = OrderTraceabilityPDFGenerator()
             
             self.update_progress(task_id, 30, 'Generating PDF...')

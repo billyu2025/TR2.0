@@ -21,6 +21,39 @@ DB_BACKEND = os.getenv("DB_BACKEND", "postgres").strip().lower()
 DB_PATH = os.getenv("DB_PATH", _default_db_path)
 POSTGRES_DSN = os.getenv("POSTGRES_DSN", "postgresql://postgres:postgres@127.0.0.1:5432/tr_db").strip()
 
+
+def sqlalchemy_postgres_dsn(dsn: str | None = None) -> str:
+    """SQLAlchemy 需 postgresql+psycopg://；psycopg(v3) 直连仍可用 postgresql://。"""
+    raw = (dsn or POSTGRES_DSN).strip()
+    if not raw:
+        return raw
+    if "+" in raw.split("://", 1)[0]:
+        return raw
+    if raw.startswith("postgresql://"):
+        return "postgresql+psycopg://" + raw[len("postgresql://") :]
+    if raw.startswith("postgres://"):
+        return "postgresql+psycopg://" + raw[len("postgres://") :]
+    return raw
+
+
+def coerce_dataframe_date_columns(df, columns=None):
+    """将 DataFrame 日期列转为 date，避免 PostgreSQL DATE 列插入 varchar 失败。"""
+    import pandas as pd
+
+    if columns is None:
+        columns = [
+            c
+            for c in df.columns
+            if c.lower().endswith("_date")
+            or c.lower() in ("del_date", "delivery_date", "dd_delivery_date")
+        ]
+    out = df.copy()
+    for col in columns:
+        if col in out.columns:
+            out[col] = pd.to_datetime(out[col], errors="coerce").dt.date
+    return out
+
+
 if DB_PATH and not os.path.isabs(DB_PATH):
     DB_PATH = os.path.abspath(os.path.join(_project_root, DB_PATH))
 
@@ -175,6 +208,7 @@ def _get_postgres_pool():
 
 
 def get_connection():
+    """Return a DB connection (PostgreSQL pool or SQLite)."""
     if is_postgres():
         use_pool = os.getenv("POSTGRES_USE_POOL", "1").strip().lower() not in ("0", "false")
         if use_pool:
@@ -188,6 +222,10 @@ def get_connection():
             return _PooledPostgresConnection(conn, pool)
         return _create_postgres_connection()
     return _create_sqlite_connection()
+
+
+# Backward-compatible alias used by several backend modules.
+get_db_connection = get_connection
 
 
 def sql_placeholder() -> str:

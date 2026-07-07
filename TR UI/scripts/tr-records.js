@@ -144,6 +144,16 @@ async function apiFetch(path, options = {}) {
     return result;
 }
 
+/** CERT Tab 在后端未重启时常见 404「资源不存在」 */
+function formatListLoadError(error, activeSubTab) {
+    const msg = (error && error.message) ? String(error.message) : '';
+    if (activeSubTab === 'cert-compliance' &&
+        (msg.includes('资源不存在') || msg.includes('404') || /not found/i.test(msg))) {
+        return 'CERT OF COMPLIANCE 接口未加载：请以管理员身份重启 Windows 服务「TR-Backend」，然后刷新本页。';
+    }
+    return msg;
+}
+
 async function buildHttpError(response, fallbackPrefix = '请求失败') {
     let errorMessage = `${fallbackPrefix}（HTTP ${response.status}）`;
     try {
@@ -170,7 +180,7 @@ createApp({
     data() {
         return {
             loading: false,
-            activeSubTab: 'records', // 当前激活的子Tab：'records' 或 'stocklist-test'
+            activeSubTab: 'records', // records | stocklist-test | cert-compliance
             userInfo: {
                 username: '',
                 name: '',
@@ -198,6 +208,7 @@ createApp({
                 orderNo: '',
                 jobNo: '',
                 dnNo: '',
+                shippingNo: '',
                 startDate: '',
                 endDate: ''
             },
@@ -207,8 +218,9 @@ createApp({
             pageSize: 100,
             totalPagesComputed: 1,
             selectedRecords: {
-                records: [],      // TR记录管理Tab的选择
-                stocklistTest: [] // Stocklist&Test Report Tab的选择
+                records: [],
+                stocklistTest: [],
+                certCompliance: []
             },
             isSearching: false,
             _searchDebounce: null,
@@ -220,7 +232,8 @@ createApp({
             updateDataStatus: 'running', // 'running', 'completed', 'failed'
             updateDataMessage: '',
             updateCheckInterval: null,
-            downloadProgressVisible: false
+            downloadProgressVisible: false,
+            _updateLockScrollY: 0
         };
     },
     computed: {
@@ -239,20 +252,21 @@ createApp({
         },
         // 获取当前Tab的selectedRecords数组（只读）
         currentSelectedRecords() {
-            return this.activeSubTab === 'records' 
-                ? this.selectedRecords.records 
-                : this.selectedRecords.stocklistTest;
+            if (this.activeSubTab === 'records') return this.selectedRecords.records;
+            if (this.activeSubTab === 'cert-compliance') return this.selectedRecords.certCompliance;
+            return this.selectedRecords.stocklistTest;
         },
-        // 用于v-model绑定的计算属性（带getter和setter）
         currentSelectedRecordsModel: {
             get() {
-                return this.activeSubTab === 'records' 
-                    ? this.selectedRecords.records 
-                    : this.selectedRecords.stocklistTest;
+                if (this.activeSubTab === 'records') return this.selectedRecords.records;
+                if (this.activeSubTab === 'cert-compliance') return this.selectedRecords.certCompliance;
+                return this.selectedRecords.stocklistTest;
             },
             set(value) {
                 if (this.activeSubTab === 'records') {
                     this.selectedRecords.records = value;
+                } else if (this.activeSubTab === 'cert-compliance') {
+                    this.selectedRecords.certCompliance = value;
                 } else {
                     this.selectedRecords.stocklistTest = value;
                 }
@@ -292,10 +306,13 @@ createApp({
                 // 重置搜索状态和分页
                 this.currentPage = 1;
                 this.isSearching = false;
-                this.searchQuery = { orderNo: '', jobNo: '', dnNo: '', startDate: '', endDate: '' };
+                this.searchQuery = { orderNo: '', jobNo: '', dnNo: '', shippingNo: '', startDate: '', endDate: '' };
                 // 重新加载数据
                 this.loadOrdersFromAPI(1);
             }
+        },
+        updateDataLoading(val) {
+            this._applyUpdateViewportLock(!!val);
         }
     },
     async mounted() {
@@ -346,7 +363,23 @@ createApp({
         };
         document.addEventListener('keydown', enterKeyHandler);
         this._enterKeyHandler = enterKeyHandler;
-        
+
+        this._beforeUnloadDuringUpdate = (e) => {
+            if (this.updateDataLoading) {
+                e.preventDefault();
+                e.returnValue = '';
+            }
+        };
+        window.addEventListener('beforeunload', this._beforeUnloadDuringUpdate);
+
+        this._escapeBlockDuringUpdate = (e) => {
+            if (e.key === 'Escape' && this.showUpdateModal && this.updateDataLoading) {
+                e.preventDefault();
+                e.stopPropagation();
+            }
+        };
+        document.addEventListener('keydown', this._escapeBlockDuringUpdate, true);
+
         try {
             await this.initializeUser();
             this.loadUserSettings();
@@ -416,36 +449,39 @@ createApp({
                 const orderNoTrim = (this.searchQuery.orderNo || '').trim();
                 const jobNoTrim = (this.searchQuery.jobNo || '').trim();
                 const dnNoTrim = (this.searchQuery.dnNo || '').trim();
+                const shippingNoTrim = (this.searchQuery.shippingNo || '').trim();
                 const hasDate = !!(this.searchQuery.startDate || this.searchQuery.endDate);
-                // Stocklist&Test Report 标签页支持 Order No、Job No、DD_No 和日期搜索
-                // TR记录管理标签页支持 Order No、Job No 和日期搜索
-                const hasCondition = orderNoTrim || jobNoTrim || dnNoTrim || hasDate;
+                const hasCondition = orderNoTrim || jobNoTrim || dnNoTrim || shippingNoTrim || hasDate;
 
                 this.isSearching = hasCondition;
 
-                // 日期搜索或Job No搜索时，每页记录上限设置为200；其他情况为100
-                const perPageParam = (hasDate || jobNoTrim) ? 200 : 100;
+                const perPageParam = (hasDate || jobNoTrim || shippingNoTrim) ? 200 : 100;
 
                 const params = new URLSearchParams({
                     page: '1',
                     per_page: String(perPageParam)
                 });
-                // 根据当前Tab决定使用哪个数据源
+
+                let listUrl = '/api/orders/list';
                 if (this.activeSubTab === 'stocklist-test') {
                     params.set('tab', 'stocklist-test');
+                } else if (this.activeSubTab === 'cert-compliance') {
+                    listUrl = '/api/cert-of-compliance/list';
                 } else {
                     params.set('tab', 'records');
                 }
                 if (orderNoTrim) params.set('order_no', orderNoTrim);
                 if (jobNoTrim) params.set('job_no', jobNoTrim);
                 if (dnNoTrim) params.set('dn_no', dnNoTrim);
+                if (shippingNoTrim) params.set('shipping_no', shippingNoTrim);
                 if (this.searchQuery.startDate) params.set('start_date', this.searchQuery.startDate);
                 if (this.searchQuery.endDate) params.set('end_date', this.searchQuery.endDate);
 
-                const result = await apiFetch(`/api/orders/list?${params.toString()}`);
+                const result = await apiFetch(`${listUrl}?${params.toString()}`);
                 
-                // 根据当前Tab使用不同的字段映射
-                if (this.activeSubTab === 'stocklist-test') {
+                if (this.activeSubTab === 'cert-compliance') {
+                    this.records = result.data.map(row => this.mapCertComplianceRow(row));
+                } else if (this.activeSubTab === 'stocklist-test') {
                     // Stocklist&Test Report 标签页：从 bbs_dd 表获取数据
                     this.records = result.data.map(order => ({
                         id: order.Order_No,
@@ -496,7 +532,7 @@ createApp({
                 this.currentPage = 1;
             } catch (error) {
                 console.error('搜索失败:', error);
-                alert(error.message || '搜索失败，请稍后重试');
+                alert(formatListLoadError(error, this.activeSubTab) || '搜索失败，请稍后重试');
             } finally {
                 this.loading = false;
             }
@@ -512,28 +548,33 @@ createApp({
                 const hasDate = !!(this.searchQuery.startDate || this.searchQuery.endDate);
 
                 // 日期搜索或Job No搜索时，每页记录上限设置为200；其他情况为100
-                const perPageParam = (hasDate || jobNoTrim) ? 200 : 100;
+                const shippingNoTrim = (this.searchQuery.shippingNo || '').trim();
+                const perPageParam = (hasDate || jobNoTrim || shippingNoTrim) ? 200 : 100;
 
                 const params = new URLSearchParams({
                     page: String(page),
                     per_page: String(perPageParam)
                 });
-                // 根据当前Tab决定使用哪个数据源
+                let listUrl = '/api/orders/list';
                 if (this.activeSubTab === 'stocklist-test') {
                     params.set('tab', 'stocklist-test');
+                } else if (this.activeSubTab === 'cert-compliance') {
+                    listUrl = '/api/cert-of-compliance/list';
                 } else {
                     params.set('tab', 'records');
                 }
                 if (orderNoTrim) params.set('order_no', orderNoTrim);
                 if (jobNoTrim) params.set('job_no', jobNoTrim);
                 if (dnNoTrim) params.set('dn_no', dnNoTrim);
+                if (shippingNoTrim) params.set('shipping_no', shippingNoTrim);
                 if (this.searchQuery.startDate) params.set('start_date', this.searchQuery.startDate);
                 if (this.searchQuery.endDate) params.set('end_date', this.searchQuery.endDate);
 
-                const result = await apiFetch(`/api/orders/list?${params.toString()}`);
+                const result = await apiFetch(`${listUrl}?${params.toString()}`);
                 
-                // 根据当前Tab使用不同的字段映射
-                if (this.activeSubTab === 'stocklist-test') {
+                if (this.activeSubTab === 'cert-compliance') {
+                    this.records = result.data.map(row => this.mapCertComplianceRow(row));
+                } else if (this.activeSubTab === 'stocklist-test') {
                     // Stocklist&Test Report 标签页：从 bbs_dd 表获取数据
                     this.records = result.data.map(order => ({
                         id: order.Order_No,
@@ -574,14 +615,14 @@ createApp({
                 this.currentPage = page;
             } catch (error) {
                 console.error('加载搜索页失败:', error);
-                alert(error.message || '加载失败，请稍后重试');
+                alert(formatListLoadError(error, this.activeSubTab) || '加载失败，请稍后重试');
             } finally {
                 this.loading = false;
             }
         },
 
         async resetSearch() {
-            this.searchQuery = { orderNo: '', jobNo: '', dnNo: '', startDate: '', endDate: '' };
+            this.searchQuery = { orderNo: '', jobNo: '', dnNo: '', shippingNo: '', startDate: '', endDate: '' };
             this.isSearching = false;
             this.pageSize = this.defaultPageSize;
             await this.loadOrdersFromAPI();
@@ -772,6 +813,483 @@ createApp({
             }
         },
 
+        mapCertComplianceRow(row) {
+            const raw = (row.pdf_status || '').toLowerCase() || 'pending';
+            const status = raw === 'generated' ? 'generated' : (raw === 'failed' ? 'failed' : 'pending');
+            return {
+                id: row.shipping_no,
+                shippingNo: String(row.shipping_no || ''),
+                jobNo: row.jobsite_no != null ? String(row.jobsite_no) : '',
+                jobsiteName: row.jobsite_name || '',
+                delAddress: row.del_address || '',
+                client: row.client_name || '',
+                delDate: formatDateToYYYYMMDD(row.del_date),
+                status,
+                pdfPath: row.pdf_path || null,
+                generatedAt: row.generated_at || null
+            };
+        },
+
+        certRecordSummary(record) {
+            const name = record.jobsiteName || record.jobNo || '';
+            return `DD_NO ${record.shippingNo}${name ? ` (${name})` : ''}`;
+        },
+
+        async certPollTaskUntilDone(taskId, record, options = {}) {
+            const { signal, onProgress, isRegenerate = false } = options;
+            const maxAttempts = 120;
+            const pollInterval = 2000;
+            for (let attempts = 0; attempts < maxAttempts; attempts++) {
+                if (signal && signal.aborted) {
+                    throw new DOMException('Aborted', 'AbortError');
+                }
+                await new Promise(r => setTimeout(r, pollInterval));
+                const statusResult = await apiFetch(`/api/cert-of-compliance/task-status/${taskId}`, { signal });
+                if (!statusResult.success) continue;
+                const taskStatus = statusResult.status;
+                const progress = statusResult.progress || 0;
+                if (taskStatus === 'completed') {
+                    record.status = 'generated';
+                    record.pdfPath = statusResult.pdf_path || null;
+                    return { ok: true };
+                }
+                if (taskStatus === 'failed') {
+                    record.status = 'pending';
+                    return { ok: false, error: statusResult.error_message || (isRegenerate ? 'PDF重新生成失败' : 'PDF生成失败') };
+                }
+                if (taskStatus === 'processing') {
+                    record.status = 'generating';
+                    if (onProgress) {
+                        const text = statusResult.message || `${isRegenerate ? '正在重新生成' : '正在生成'}PDF... (${progress}%)`;
+                        onProgress('processing', text);
+                    }
+                } else if (taskStatus === 'pending' && onProgress) {
+                    onProgress('processing', '任务等待中...');
+                }
+            }
+            record.status = 'pending';
+            return { ok: false, error: isRegenerate ? '重新生成超时' : '生成超时' };
+        },
+
+        async certRegeneratePDF(record) {
+            if (this.userInfo.role !== 'admin' && this.userInfo.role !== 'manager') {
+                alert('只有管理員和管理帳號可以重新生成 PDF');
+                return;
+            }
+            if (!confirm(`确定要重新生成 DD_NO ${record.shippingNo} 的PDF吗？\n\n注意：这将覆盖现有的PDF文件。`)) {
+                return;
+            }
+            try {
+                record.status = 'generating';
+                const result = await apiFetch('/api/cert-of-compliance/generate', {
+                    method: 'POST',
+                    body: JSON.stringify({ shipping_no: parseInt(record.shippingNo, 10) })
+                });
+                if (!result.success || !result.task_id) {
+                    record.status = 'generated';
+                    alert(result.error || 'PDF重新生成失败');
+                    return;
+                }
+                const poll = await this.certPollTaskUntilDone(result.task_id, record, { isRegenerate: true });
+                if (poll.ok) {
+                    alert('PDF重新生成成功！');
+                    if (this.isSearching) await this.executeSearch();
+                    else await this.loadOrdersFromAPI(this.currentPage);
+                } else {
+                    record.status = 'generated';
+                    alert(poll.error || 'PDF重新生成失败');
+                }
+            } catch (error) {
+                record.status = 'generated';
+                alert(error.message || '重新生成PDF失败，请重试！');
+            }
+        },
+
+        async certGeneratePDF(record) {
+            if (this.userInfo.role !== 'admin' && this.userInfo.role !== 'manager') {
+                alert('只有管理員和管理帳號可以生成 PDF');
+                return;
+            }
+            if (!confirm(`确定要生成 DD_NO ${record.shippingNo} 的PDF吗？`)) {
+                return;
+            }
+            try {
+                record.status = 'generating';
+                const progressMsg = document.createElement('div');
+                progressMsg.id = 'single-pdf-progress';
+                progressMsg.style.cssText = 'position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.3); z-index: 10000; min-width: 300px; text-align: center;';
+                progressMsg.innerHTML = `
+                    <h4>正在生成PDF...</h4>
+                    <p>DD_NO: ${record.shippingNo}</p>
+                    <div style="margin: 10px 0;">
+                        <div style="width: 100%; height: 20px; background: #f0f0f0; border-radius: 10px; overflow: hidden;">
+                            <div id="single-progress-bar" style="width: 0%; height: 100%; background: #4CAF50; transition: width 0.3s;"></div>
+                        </div>
+                    </div>
+                    <p id="single-progress-text" style="margin: 10px 0; color: #666;">提交任务中...</p>
+                `;
+                document.body.appendChild(progressMsg);
+                const updateProgress = (progress, text) => {
+                    const bar = document.getElementById('single-progress-bar');
+                    const textEl = document.getElementById('single-progress-text');
+                    if (bar) bar.style.width = progress + '%';
+                    if (textEl) textEl.textContent = text;
+                };
+
+                const result = await apiFetch('/api/cert-of-compliance/generate', {
+                    method: 'POST',
+                    body: JSON.stringify({ shipping_no: parseInt(record.shippingNo, 10) })
+                });
+                if (!result.success || !result.task_id) {
+                    document.body.removeChild(progressMsg);
+                    throw new Error(result.error || '创建PDF生成任务失败');
+                }
+                const taskId = result.task_id;
+                updateProgress(10, '任务已提交，等待处理...');
+
+                const poll = await this.certPollTaskUntilDone(taskId, record, {
+                    onProgress: (_state, text) => updateProgress(50, text)
+                });
+                document.body.removeChild(progressMsg);
+                if (poll.ok) {
+                    alert('PDF生成成功！');
+                    if (this.isSearching) await this.executeSearch();
+                    else await this.loadOrdersFromAPI(this.currentPage);
+                } else {
+                    record.status = 'pending';
+                    alert(poll.error || 'PDF生成失败');
+                }
+            } catch (error) {
+                const progressMsg = document.getElementById('single-pdf-progress');
+                if (progressMsg) document.body.removeChild(progressMsg);
+                record.status = 'pending';
+                alert(error.message || '生成PDF時發生錯誤，請重試！');
+            }
+        },
+
+        certHandleRowClick(record, event) {
+            if (event.target.tagName === 'BUTTON' ||
+                event.target.tagName === 'INPUT' ||
+                event.target.closest('button') ||
+                event.target.closest('input')) {
+                return;
+            }
+            if (record.status === 'generated') {
+                this.certDownloadPDF(record);
+            } else {
+                alert(`DD_NO ${record.shippingNo} 的PDF尚未生成，请先点击"📄 生成"按钮生成PDF。`);
+            }
+        },
+
+        async certDownloadPDF(record) {
+            if (record.status !== 'generated') {
+                alert('该记录的PDF尚未生成，请先生成PDF！');
+                return;
+            }
+            try {
+                const authInfo = getAuthInfo();
+                const headers = {};
+                if (authInfo.token) headers['Authorization'] = `Bearer ${authInfo.token}`;
+                const response = await fetch(
+                    buildApiUrl(`/api/cert-of-compliance/download/${record.shippingNo}`),
+                    { headers }
+                );
+                if (!response.ok) {
+                    let errorMsg = `下载失败：HTTP ${response.status}`;
+                    try {
+                        const data = await response.json();
+                        if (data && data.error) errorMsg = `下载失败：${data.error}`;
+                    } catch (_) {}
+                    alert(errorMsg);
+                    return;
+                }
+                const blob = await response.blob();
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `Cert_${record.shippingNo}.pdf`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                window.URL.revokeObjectURL(url);
+            } catch (error) {
+                console.error('下载失败:', error);
+                alert(error.message || '下載時發生錯誤，請重試！');
+            }
+        },
+
+        async certBatchDownload() {
+            if (!this.hasSelectedGeneratedRecords) {
+                alert('请选择至少一条已生成的记录！');
+                return;
+            }
+            const selectedGeneratedRecords = this.currentSelectedRecords
+                .map(id => this.records.find(r => r.id === id))
+                .filter(record => record && record.status === 'generated');
+            if (selectedGeneratedRecords.length === 0) {
+                alert('没有可下载的记录！请确保选择的记录状态为"已生成"。');
+                return;
+            }
+            const confirmMessage = `确定要下载 ${selectedGeneratedRecords.length} 个PDF文件吗？\n\n选中的记录：\n${selectedGeneratedRecords.slice(0, 5).map(r => `- ${this.certRecordSummary(r)}`).join('\n')}${selectedGeneratedRecords.length > 5 ? `\n... 还有 ${selectedGeneratedRecords.length - 5} 个` : ''}`;
+            if (!confirm(confirmMessage)) return;
+
+            this.isCancelling = false;
+            this.currentAbortController = new AbortController();
+            try {
+                this.showDownloadProgress(1);
+                this.updateDownloadProgress(1, 1, '正在打包...');
+                const shippingNos = selectedGeneratedRecords.map(r => parseInt(r.shippingNo, 10));
+                const authInfo = getAuthInfo();
+                const headers = { 'Content-Type': 'application/json' };
+                if (authInfo.token) headers['Authorization'] = `Bearer ${authInfo.token}`;
+                const response = await fetch(buildApiUrl('/api/cert-of-compliance/batch-download'), {
+                    method: 'POST',
+                    headers,
+                    body: JSON.stringify({ shipping_nos: shippingNos }),
+                    signal: this.currentAbortController.signal
+                });
+                if (!response.ok) {
+                    let errorMsg = `批量下载失败：HTTP ${response.status}`;
+                    try {
+                        const data = await response.json();
+                        if (data && data.error) errorMsg = `批量下载失败：${data.error}`;
+                    } catch (_) {}
+                    this.hideDownloadProgress();
+                    alert(errorMsg);
+                    return;
+                }
+                const blob = await response.blob();
+                if (blob.size === 0) {
+                    this.hideDownloadProgress();
+                    alert('批量下载失败：服务器返回了空文件');
+                    return;
+                }
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `Cert_Compliance_${new Date().getTime()}.zip`;
+                a.style.display = 'none';
+                document.body.appendChild(a);
+                a.click();
+                await new Promise(resolve => setTimeout(resolve, 200));
+                document.body.removeChild(a);
+                setTimeout(() => window.URL.revokeObjectURL(url), 2000);
+                this.hideDownloadProgress();
+                alert(`批量下载完成！共下载 ${selectedGeneratedRecords.length} 个PDF文件（已打包为ZIP）。`);
+                this.clearSelection();
+            } catch (error) {
+                if (error.name === 'AbortError' || this.isCancelling) {
+                    this.hideDownloadProgress();
+                    return;
+                }
+                this.hideDownloadProgress();
+                alert(error.message || '批量下载失败，请重试！');
+            } finally {
+                this.isCancelling = false;
+                this.currentAbortController = null;
+            }
+        },
+
+        async certBatchGenerate() {
+            if (!this.hasSelectedPendingRecords) {
+                alert('请选择至少一条未生成的记录！');
+                return;
+            }
+            if (this.userInfo.role !== 'admin' && this.userInfo.role !== 'manager') {
+                alert('只有管理員和管理帳號可以生成 PDF');
+                return;
+            }
+            const selectedPendingRecords = this.currentSelectedRecords
+                .map(id => this.records.find(r => r.id === id))
+                .filter(record => record && record.status !== 'generated');
+            if (selectedPendingRecords.length === 0) {
+                alert('没有可生成的记录！');
+                return;
+            }
+            const confirmMessage = `确定要批量生成 ${selectedPendingRecords.length} 个合规证的PDF吗？\n\n选中的记录：\n${selectedPendingRecords.slice(0, 5).map(r => `- ${this.certRecordSummary(r)}`).join('\n')}${selectedPendingRecords.length > 5 ? `\n... 还有 ${selectedPendingRecords.length - 5} 个` : ''}`;
+            if (!confirm(confirmMessage)) return;
+
+            this.isCancelling = false;
+            this.currentAbortController = new AbortController();
+            try {
+                this.showGenerateProgress(selectedPendingRecords.length);
+                let successCount = 0;
+                let failCount = 0;
+                const failedIds = [];
+
+                for (let i = 0; i < selectedPendingRecords.length; i++) {
+                    if (this.isCancelling) {
+                        this.hideGenerateProgress();
+                        alert(`生成已取消。\n已生成: ${successCount} 个\n失败: ${failCount} 个`);
+                        if (this.isSearching) await this.executeSearch();
+                        else await this.loadOrdersFromAPI(this.currentPage);
+                        return;
+                    }
+                    const record = selectedPendingRecords[i];
+                    record.status = 'generating';
+                    this.updateGenerateProgress(i, selectedPendingRecords.length, record.shippingNo, 'processing');
+                    try {
+                        const resp = await apiFetch('/api/cert-of-compliance/generate', {
+                            method: 'POST',
+                            body: JSON.stringify({ shipping_no: parseInt(record.shippingNo, 10) }),
+                            signal: this.currentAbortController.signal
+                        });
+                        if (!resp.success || !resp.task_id) {
+                            throw new Error(resp.error || '创建PDF生成任务失败');
+                        }
+                        this.updateGenerateProgress(i, selectedPendingRecords.length, record.shippingNo, 'processing', '任务已提交，等待处理...');
+                        const poll = await this.certPollTaskUntilDone(resp.task_id, record, {
+                            signal: this.currentAbortController.signal,
+                            onProgress: (state, text) => {
+                                this.updateGenerateProgress(i, selectedPendingRecords.length, record.shippingNo, state, text);
+                            }
+                        });
+                        if (poll.ok) {
+                            successCount++;
+                            this.updateGenerateProgress(i + 1, selectedPendingRecords.length, record.shippingNo, 'completed', 'PDF生成完成');
+                        } else {
+                            failCount++;
+                            failedIds.push(record.shippingNo);
+                            this.updateGenerateProgress(i + 1, selectedPendingRecords.length, record.shippingNo, 'failed', poll.error);
+                        }
+                    } catch (e) {
+                        if (e.name === 'AbortError' || this.isCancelling) {
+                            this.hideGenerateProgress();
+                            alert(`生成已取消。\n已生成: ${successCount} 个`);
+                            if (this.isSearching) await this.executeSearch();
+                            else await this.loadOrdersFromAPI(this.currentPage);
+                            return;
+                        }
+                        failCount++;
+                        failedIds.push(record.shippingNo);
+                        record.status = 'pending';
+                        this.updateGenerateProgress(i + 1, selectedPendingRecords.length, record.shippingNo, 'failed');
+                    }
+                    if (i < selectedPendingRecords.length - 1) await this.delay(200);
+                }
+                this.updateGenerateProgress(selectedPendingRecords.length, selectedPendingRecords.length, 'ALL', 'completed');
+                await this.delay(300);
+                this.hideGenerateProgress();
+                if (this.isSearching) await this.executeSearch();
+                else await this.loadOrdersFromAPI(this.currentPage);
+                if (failCount === 0) {
+                    alert(`批量生成完成！成功生成 ${successCount} 個PDF。`);
+                } else {
+                    alert(`批量生成結束！\n成功: ${successCount} 個\n失敗: ${failCount} 個\n失敗的 DD_NO: ${failedIds.join(', ')}`);
+                }
+                this.clearSelection();
+            } catch (error) {
+                if (error.name === 'AbortError' || this.isCancelling) {
+                    this.hideGenerateProgress();
+                    return;
+                }
+                this.hideGenerateProgress();
+                alert('批量生成失败，请重试！');
+            } finally {
+                this.isCancelling = false;
+                this.currentAbortController = null;
+            }
+        },
+
+        async certBatchRegenerate() {
+            if (!this.hasSelectedGeneratedRecords) {
+                alert('请选择至少一条已生成的记录！');
+                return;
+            }
+            if (this.userInfo.role !== 'admin' && this.userInfo.role !== 'manager') {
+                alert('只有管理員和管理帳號可以重新生成 PDF');
+                return;
+            }
+            const selectedGeneratedRecords = this.currentSelectedRecords
+                .map(id => this.records.find(r => r.id === id))
+                .filter(record => record && (record.status === 'generated' || record.status === 'pending'));
+            if (selectedGeneratedRecords.length === 0) {
+                alert('没有可重新生成的记录！请选择状态为"已生成"的记录。');
+                return;
+            }
+            const confirmMessage = `确定要批量重新生成 ${selectedGeneratedRecords.length} 个合规证的PDF吗？\n\n注意：这将覆盖现有的PDF文件。\n\n选中的记录：\n${selectedGeneratedRecords.slice(0, 5).map(r => `- ${this.certRecordSummary(r)}`).join('\n')}${selectedGeneratedRecords.length > 5 ? `\n... 还有 ${selectedGeneratedRecords.length - 5} 个` : ''}`;
+            if (!confirm(confirmMessage)) return;
+
+            this.isCancelling = false;
+            this.currentAbortController = new AbortController();
+            try {
+                this.showGenerateProgress(selectedGeneratedRecords.length, true);
+                let successCount = 0;
+                let failCount = 0;
+                const failedIds = [];
+
+                for (let i = 0; i < selectedGeneratedRecords.length; i++) {
+                    if (this.isCancelling) {
+                        this.hideGenerateProgress();
+                        alert(`重新生成已取消。\n已重新生成: ${successCount} 个\n失败: ${failCount} 个`);
+                        if (this.isSearching) await this.executeSearch();
+                        else await this.loadOrdersFromAPI(this.currentPage);
+                        return;
+                    }
+                    const record = selectedGeneratedRecords[i];
+                    record.status = 'generating';
+                    this.updateGenerateProgress(i, selectedGeneratedRecords.length, record.shippingNo, 'processing', '', true);
+                    try {
+                        const resp = await apiFetch('/api/cert-of-compliance/generate', {
+                            method: 'POST',
+                            body: JSON.stringify({ shipping_no: parseInt(record.shippingNo, 10) }),
+                            signal: this.currentAbortController.signal
+                        });
+                        if (!resp.success || !resp.task_id) {
+                            throw new Error(resp.error || '创建PDF生成任务失败');
+                        }
+                        this.updateGenerateProgress(i, selectedGeneratedRecords.length, record.shippingNo, 'processing', '任务已提交，等待处理...', true);
+                        const poll = await this.certPollTaskUntilDone(resp.task_id, record, {
+                            signal: this.currentAbortController.signal,
+                            isRegenerate: true,
+                            onProgress: (state, text) => {
+                                this.updateGenerateProgress(i, selectedGeneratedRecords.length, record.shippingNo, state, text, true);
+                            }
+                        });
+                        if (poll.ok) {
+                            successCount++;
+                            this.updateGenerateProgress(i + 1, selectedGeneratedRecords.length, record.shippingNo, 'completed', 'PDF重新生成完成', true);
+                        } else {
+                            failCount++;
+                            failedIds.push(record.shippingNo);
+                            record.status = 'generated';
+                            this.updateGenerateProgress(i + 1, selectedGeneratedRecords.length, record.shippingNo, 'failed', poll.error, true);
+                        }
+                    } catch (error) {
+                        if (error.name === 'AbortError' || this.isCancelling) {
+                            throw error;
+                        }
+                        failCount++;
+                        failedIds.push(record.shippingNo);
+                        record.status = 'generated';
+                        this.updateGenerateProgress(i + 1, selectedGeneratedRecords.length, record.shippingNo, 'failed', error.message || '重新生成失败', true);
+                    }
+                    if (i < selectedGeneratedRecords.length - 1) await this.delay(200);
+                }
+                this.updateGenerateProgress(selectedGeneratedRecords.length, selectedGeneratedRecords.length, 'ALL', 'completed', '', true);
+                await this.delay(300);
+                this.hideGenerateProgress();
+                if (this.isSearching) await this.executeSearch();
+                else await this.loadOrdersFromAPI(this.currentPage);
+                if (failCount === 0) {
+                    alert(`批量重新生成完成！成功 ${successCount} 個PDF。`);
+                } else {
+                    alert(`批量重新生成結束！\n成功: ${successCount} 個\n失敗: ${failCount} 個\n失敗的 DD_NO: ${failedIds.join(', ')}`);
+                }
+                this.clearSelection();
+            } catch (error) {
+                if (error.name === 'AbortError' || this.isCancelling) {
+                    this.hideGenerateProgress();
+                    return;
+                }
+                this.hideGenerateProgress();
+                alert('批量重新生成失败，请重试！');
+            } finally {
+                this.isCancelling = false;
+                this.currentAbortController = null;
+            }
+        },
+
         handleRowClick(record, event) {
             // 如果点击的是按钮、复选框或其他交互元素，不处理
             if (event.target.tagName === 'BUTTON' || 
@@ -838,8 +1356,8 @@ createApp({
                 if (this.isSearching) {
                     const hasDate = !!(this.searchQuery.startDate || this.searchQuery.endDate);
                     const jobNoTrim = (this.searchQuery.jobNo || '').trim();
-                    // 日期搜索或Job No搜索时，每页记录上限设置为200；其他情况为100
-                    if (hasDate || jobNoTrim) {
+                    const shippingNoTrim = (this.searchQuery.shippingNo || '').trim();
+                    if (hasDate || jobNoTrim || shippingNoTrim) {
                         perPageValue = 200;
                     } else {
                         perPageValue = 100;
@@ -850,32 +1368,24 @@ createApp({
                     page: String(page),
                     per_page: String(perPageValue)
                 });
-                // 根据当前Tab决定使用哪个数据源
+                let listUrl = '/api/orders/list';
                 if (this.activeSubTab === 'stocklist-test') {
                     params.set('tab', 'stocklist-test');
+                } else if (this.activeSubTab === 'cert-compliance') {
+                    listUrl = '/api/cert-of-compliance/list';
                 } else {
                     params.set('tab', 'records');
                 }
-                // 只有在搜索状态下才添加搜索参数
                 if (this.isSearching) {
-                    if (this.searchQuery.startDate) {
-                        params.append('start_date', this.searchQuery.startDate);
-                    }
-                    if (this.searchQuery.endDate) {
-                        params.append('end_date', this.searchQuery.endDate);
-                    }
-                    if (this.searchQuery.orderNo) {
-                        params.append('order_no', this.searchQuery.orderNo);
-                    }
-                    if (this.searchQuery.jobNo) {
-                        params.append('job_no', this.searchQuery.jobNo);
-                    }
-                    if (this.searchQuery.dnNo) {
-                        params.append('dn_no', this.searchQuery.dnNo);
-                    }
+                    if (this.searchQuery.startDate) params.append('start_date', this.searchQuery.startDate);
+                    if (this.searchQuery.endDate) params.append('end_date', this.searchQuery.endDate);
+                    if (this.searchQuery.orderNo) params.append('order_no', this.searchQuery.orderNo);
+                    if (this.searchQuery.jobNo) params.append('job_no', this.searchQuery.jobNo);
+                    if (this.searchQuery.dnNo) params.append('dn_no', this.searchQuery.dnNo);
+                    if (this.searchQuery.shippingNo) params.append('shipping_no', this.searchQuery.shippingNo);
                 }
                 
-                const result = await apiFetch(`/api/orders/list?${params.toString()}`);
+                const result = await apiFetch(`${listUrl}?${params.toString()}`);
                 
                 // 检查返回结果
                 if (!result || !result.pagination) {
@@ -883,9 +1393,11 @@ createApp({
                     throw new Error('API 返回结果格式错误：缺少分页信息');
                 }
                 
-                // 优化数据处理：使用更高效的方式
-                const dataMapping = this.activeSubTab === 'stocklist-test' 
-                    ? (order) => ({
+                let dataMapping;
+                if (this.activeSubTab === 'cert-compliance') {
+                    dataMapping = (row) => this.mapCertComplianceRow(row);
+                } else if (this.activeSubTab === 'stocklist-test') {
+                    dataMapping = (order) => ({
                         id: order.Order_No,
                         orderNo: String(order.Order_No || ''),
                         orderDescription: order.Order_Description || '',
@@ -896,8 +1408,9 @@ createApp({
                         status: (order.pdf_status || 'pending').toLowerCase(),
                         pdfPath: order.pdf_path || null,
                         generatedAt: order.generated_at || null
-                    })
-                    : (order) => ({
+                    });
+                } else {
+                    dataMapping = (order) => ({
                         id: order.Order_No,
                         orderNo: String(order.Order_No || ''),
                         orderDescription: order.Order_Description || '',
@@ -912,6 +1425,7 @@ createApp({
                         pdfPath: order.pdf_path || null,
                         generatedAt: order.generated_at || null
                     });
+                }
                 
                 // 批量处理数据，提升性能
                 this.records = result.data.map(dataMapping);
@@ -955,7 +1469,7 @@ createApp({
             } catch (error) {
                 console.error('[分页] 加载订单失败:', error);
                 this.filteredRecords = [];
-                alert(error.message || '加载订单失败，请稍后重试');
+                alert(formatListLoadError(error, this.activeSubTab) || '加载订单失败，请稍后重试');
             } finally {
                 // 确保加载状态被清除
                 this.loading = false;
@@ -1059,7 +1573,7 @@ createApp({
             }
 
             // 确认操作
-            if (!confirm('確定要更新所有數據嗎？此過程可能需要幾分鐘時間。')) {
+            if (!confirm('確定要更新所有數據嗎？此過程可能需要二十分鐘左右時間。')) {
                 return;
             }
 
@@ -1096,11 +1610,11 @@ createApp({
             }
 
             let checkCount = 0;
-            const maxChecks = 120; // 最多检查120次（10分钟，每5秒一次）
+            // 阶段A+阶段B 可能很长：每 5 秒一次，最多约 2 小时
+            const maxChecks = 1440;
 
-            this.updateCheckInterval = setInterval(async () => {
+            const pollOnce = async () => {
                 checkCount++;
-                
                 try {
                     const response = await apiFetch('/api/system/check-update-status', {
                         method: 'GET'
@@ -1108,51 +1622,62 @@ createApp({
 
                     if (response.success) {
                         const status = response.status;
+                        const phase = response.phase;
                         const message = response.message || '';
+                        const done =
+                            status === 'completed' || phase === 'completed';
+                        const failed =
+                            status === 'failed' || phase === 'failed';
 
-                        if (status === 'completed') {
-                            // 更新完成
+                        if (done) {
                             clearInterval(this.updateCheckInterval);
                             this.updateCheckInterval = null;
                             this.updateDataStatus = 'completed';
                             this.updateDataMessage = message || '數據更新已完成！';
                             this.updateDataLoading = false;
-                        } else if (status === 'failed') {
-                            // 更新失败
+                            return true;
+                        }
+                        if (failed) {
                             clearInterval(this.updateCheckInterval);
                             this.updateCheckInterval = null;
                             this.updateDataStatus = 'failed';
                             this.updateDataMessage = message || '數據更新失敗，請查看日誌';
                             this.updateDataLoading = false;
-                        } else if (status === 'running') {
-                            // 仍在运行
+                            return true;
+                        }
+                        if (status === 'running' || phase === 'sync' || phase === 'batch') {
                             this.updateDataMessage = message || '正在更新數據，請稍候...';
-                        } else {
-                            // 未知状态
-                            if (checkCount >= maxChecks) {
-                                clearInterval(this.updateCheckInterval);
-                                this.updateCheckInterval = null;
-                                this.updateDataStatus = 'failed';
-                                this.updateDataMessage = '更新狀態檢查超時，請查看日誌確認狀態';
-                                this.updateDataLoading = false;
-                            }
+                        } else if (checkCount >= maxChecks) {
+                            clearInterval(this.updateCheckInterval);
+                            this.updateCheckInterval = null;
+                            this.updateDataStatus = 'failed';
+                            this.updateDataMessage = '更新狀態檢查超時，請查看日誌確認狀態';
+                            this.updateDataLoading = false;
+                            return true;
                         }
                     }
                 } catch (error) {
                     console.error('檢查更新狀態失敗:', error);
-                    // 继续检查，不要因为一次检查失败就停止
                     if (checkCount >= maxChecks) {
                         clearInterval(this.updateCheckInterval);
                         this.updateCheckInterval = null;
                         this.updateDataStatus = 'failed';
                         this.updateDataMessage = '無法檢查更新狀態，請手動查看日誌';
                         this.updateDataLoading = false;
+                        return true;
                     }
                 }
-            }, 5000); // 每5秒检查一次
+                return false;
+            };
+
+            pollOnce();
+            this.updateCheckInterval = setInterval(pollOnce, 5000);
         },
 
         closeUpdateModal() {
+            if (this.updateDataLoading) {
+                return;
+            }
             // 清除定时器
             if (this.updateCheckInterval) {
                 clearInterval(this.updateCheckInterval);
@@ -1162,6 +1687,22 @@ createApp({
             this.updateDataLoading = false;
             this.updateDataStatus = 'running';
             this.updateDataMessage = '';
+        },
+
+        _applyUpdateViewportLock(locked) {
+            const bcls = 'tr-update-body-lock';
+            const hcls = 'tr-update-html-lock';
+            if (locked) {
+                this._updateLockScrollY = window.scrollY || 0;
+                document.documentElement.classList.add(hcls);
+                document.body.classList.add(bcls);
+                document.body.style.top = `-${this._updateLockScrollY}px`;
+            } else {
+                document.documentElement.classList.remove(hcls);
+                document.body.classList.remove(bcls);
+                document.body.style.top = '';
+                window.scrollTo(0, this._updateLockScrollY || 0);
+            }
         },
 
         
@@ -1208,35 +1749,15 @@ createApp({
         },
 
         toggleSelectAll() {
-            const currentSelected = this.activeSubTab === 'records' 
-                ? this.selectedRecords.records 
-                : this.selectedRecords.stocklistTest;
-            
             if (this.isAllSelected) {
-                // 清空当前Tab的选择
-                if (this.activeSubTab === 'records') {
-                    this.selectedRecords.records = [];
-                } else {
-                    this.selectedRecords.stocklistTest = [];
-                }
+                this.currentSelectedRecordsModel = [];
             } else {
-                // 全选当前Tab的记录
-                const allIds = this.filteredRecords.map(record => record.id);
-                if (this.activeSubTab === 'records') {
-                    this.selectedRecords.records = allIds;
-                } else {
-                    this.selectedRecords.stocklistTest = allIds;
-                }
+                this.currentSelectedRecordsModel = this.filteredRecords.map(record => record.id);
             }
         },
 
         clearSelection() {
-            // 只清空当前Tab的选择
-            if (this.activeSubTab === 'records') {
-                this.selectedRecords.records = [];
-            } else {
-                this.selectedRecords.stocklistTest = [];
-            }
+            this.currentSelectedRecordsModel = [];
         },
 
         async downloadByOrder() {
@@ -2917,7 +3438,14 @@ createApp({
         if (this._enterKeyHandler) {
             document.removeEventListener('keydown', this._enterKeyHandler);
         }
-        
+        if (this._beforeUnloadDuringUpdate) {
+            window.removeEventListener('beforeunload', this._beforeUnloadDuringUpdate);
+        }
+        if (this._escapeBlockDuringUpdate) {
+            document.removeEventListener('keydown', this._escapeBlockDuringUpdate, true);
+        }
+        this._applyUpdateViewportLock(false);
+
         // 清理 sticky 相关的事件监听器
         if (this._stickyCleanup) {
             this._stickyCleanup();

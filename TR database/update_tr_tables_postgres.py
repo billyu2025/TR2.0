@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 TR Database Tables Auto Update Script (PostgreSQL)
-Function: Update bbs_dd, TR_Report and TR_Report_Deduplication tables
+Function: Update bbs_dd, cert_of_compliance, TR_Report and TR_Report_Deduplication tables
 Author: TR Report System
 Date: 2026-03-12
 """
@@ -85,7 +85,9 @@ def get_table_count(table_name):
         # Handle PostgreSQL case-sensitive table names
         if is_postgres():
             # PostgreSQL: use quoted table name for case-sensitive names
-            quoted_table = f'"{table_name}"' if table_name in ['TR_Report', 'TR_Report_Deduplication', 'bbs_dd', 'file_index_cache'] else table_name
+            quoted_table = f'"{table_name}"' if table_name in [
+                'TR_Report', 'TR_Report_Deduplication', 'bbs_dd', 'file_index_cache'
+            ] else table_name
             cursor.execute(f'SELECT COUNT(*) as cnt FROM {quoted_table}')
         else:
             cursor.execute(f'SELECT COUNT(*) as cnt FROM {table_name}')
@@ -388,7 +390,7 @@ def main():
     error_message = ""
     
     # Step 1: Update bbs_dd table
-    logger.info("[Step 1/4] Updating bbs_dd table...")
+    logger.info("[Step 1/5] Updating bbs_dd table...")
     if run_script('generate_bbs_dd_3years.py', 'bbs_dd table update'):
         count = get_table_count('bbs_dd')
         if count is not None:
@@ -404,9 +406,28 @@ def main():
         logger.error("[ERROR] bbs_dd table update failed!")
     
     logger.info("")
+
+    # Step 2: Update cert_of_compliance table
+    logger.info("[Step 2/5] Updating cert_of_compliance table...")
+    if run_script('generate_cert_of_compliance_3years.py', 'cert_of_compliance table update'):
+        count = get_table_count('cert_of_compliance')
+        if count is not None:
+            update_results['cert_of_compliance'] = {'status': 'Updated', 'count': count}
+            logger.info(f"[SUCCESS] cert_of_compliance table update completed ({count:,} records)")
+        else:
+            update_results['cert_of_compliance'] = {'status': 'Updated', 'count': None}
+            logger.info("[SUCCESS] cert_of_compliance table update completed")
+    else:
+        update_results['cert_of_compliance'] = {'status': 'Failed', 'count': None}
+        update_success = False
+        if not error_message:
+            error_message = "cert_of_compliance table update failed"
+        logger.error("[ERROR] cert_of_compliance table update failed!")
+
+    logger.info("")
     
-    # Step 2: Update TR_Report table
-    logger.info("[Step 2/4] Updating TR_Report table...")
+    # Step 3: Update TR_Report table
+    logger.info("[Step 3/5] Updating TR_Report table...")
     if run_script('generate_tr_report_3years.py', 'TR_Report table update'):
         count = get_table_count('TR_Report')
         if count is not None:
@@ -424,8 +445,8 @@ def main():
     
     logger.info("")
     
-    # Step 3: Update TR_Report_Deduplication table
-    logger.info("[Step 3/4] Updating TR_Report_Deduplication table...")
+    # Step 4: Update TR_Report_Deduplication table
+    logger.info("[Step 4/5] Updating TR_Report_Deduplication table...")
     if run_script('update_tr_report_deduplication.py', 'TR_Report_Deduplication table update'):
         count = get_table_count('TR_Report_Deduplication')
         if count is not None:
@@ -443,8 +464,8 @@ def main():
     
     logger.info("")
     
-    # Step 4: Update file_index_cache table
-    logger.info("[Step 4/4] Updating file_index_cache table...")
+    # Step 5: Update file_index_cache table
+    logger.info("[Step 5/5] Updating file_index_cache table...")
     file_index_result = update_file_index()
     if file_index_result.get('status') == 'success':
         stats = file_index_result.get('stats', {})
@@ -473,7 +494,10 @@ def main():
     
     # Send notification email
     if update_success:
-        message = "bbs_dd, TR_Report, TR_Report_Deduplication and file_index_cache tables updated successfully"
+        message = (
+            "bbs_dd, cert_of_compliance, TR_Report, TR_Report_Deduplication "
+            "and file_index_cache tables updated successfully"
+        )
     else:
         message = error_message
     

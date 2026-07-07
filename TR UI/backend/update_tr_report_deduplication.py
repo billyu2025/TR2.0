@@ -14,7 +14,7 @@ import sys
 from datetime import datetime
 from sqlalchemy import create_engine, text
 
-from db_adapter import DB_PATH, POSTGRES_DSN, is_postgres
+from db_adapter import DB_PATH, POSTGRES_DSN, is_postgres, sqlalchemy_postgres_dsn
 
 # 配置日志
 def setup_logging():
@@ -50,7 +50,7 @@ class TRReportDeduplicationUpdater:
             if is_postgres():
                 if not POSTGRES_DSN:
                     raise RuntimeError("POSTGRES_DSN 未配置")
-                self.engine = create_engine(POSTGRES_DSN)
+                self.engine = create_engine(sqlalchemy_postgres_dsn())
                 self.logger.info("✅ PostgreSQL 数据库连接成功")
             else:
                 db_dir = os.path.dirname(DB_PATH)

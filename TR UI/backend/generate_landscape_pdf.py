@@ -49,6 +49,15 @@ try:
 except ImportError:
     SQLALCHEMY_AVAILABLE = False
 
+from db_adapter import is_postgres, sqlalchemy_postgres_dsn
+
+
+def _require_postgres_backend() -> None:
+    if not is_postgres():
+        raise RuntimeError(
+            "TR PDF generation requires DB_BACKEND=postgres; SQLite/SQL Server direct reads are no longer supported."
+        )
+
 try:
     # Try pypdf first (new version)
     from pypdf import PdfReader, PdfWriter, Transformation
@@ -68,7 +77,35 @@ except ImportError:
 
 
 class OrderTraceabilityPDFGenerator:
-    def __init__(self, db_path: str = None, db_config: dict = None):
+    _TR_REPORT_QUERY = text("""
+        SELECT
+            "Job_No",
+            jobsite,
+            order_no,
+            order_describution,
+            client,
+            del_date,
+            ref_no,
+            bbs_po_no,
+            jobsite_type,
+            diameter,
+            wt_ton,
+            product,
+            grade,
+            pattern,
+            mill_cert,
+            test_cert1,
+            test_cert2,
+            supplier,
+            stockist_cert,
+            po_no,
+            rm_dn_no
+        FROM "TR_Report"
+        WHERE order_no = :order_no
+        ORDER BY "Job_No", order_no, diameter, pattern
+    """)
+
+    def __init__(self, db_path: str = None, db_config: dict = None, postgres_dsn: str | None = None):
         if not WEASYPRINT_AVAILABLE:
             error_msg = (
                 "\n" + "=" * 70 + "\n"
@@ -88,32 +125,19 @@ class OrderTraceabilityPDFGenerator:
             raise ImportError("Jinja2 is not installed. Please run: pip install Jinja2")
 
         if not SQLALCHEMY_AVAILABLE:
-            raise ImportError("SQLAlchemy is not installed. Please run: pip install sqlalchemy pyodbc")
+            raise ImportError(
+                "SQLAlchemy is not installed. Please run: pip install sqlalchemy psycopg[binary]"
+            )
 
-        # Database configuration: prefer passed config, otherwise use default SQL Server config
+        _require_postgres_backend()
         if db_config:
-            self.db_config = db_config
-        else:
-            # Default SQL Server configuration
-            self.db_config = {
-                'server': os.getenv('SQL_SERVER', '192.168.80.242'),
-                'database': os.getenv('SQL_DATABASE', 'TVSC'),
-                'username': os.getenv('SQL_USERNAME', 'reportuser'),
-                'password': os.getenv('SQL_PASSWORD', 'HKSHA123'),
-                'driver': 'SQL Server'
-            }
-        
-        # Create SQL Server connection string
-        connection_string = (
-            f"mssql+pyodbc://{self.db_config['username']}:{self.db_config['password']}"
-            f"@{self.db_config['server']}/{self.db_config['database']}"
-            f"?driver={self.db_config['driver']}"
-        )
-        self.engine = create_engine(connection_string, echo=False)
-        
-        # Keep db_path for compatibility (if needed in the future)
+            _safe_log(
+                'warning',
+                'OrderTraceabilityPDFGenerator db_config (SQL Server) is ignored; using PostgreSQL TR_Report.',
+            )
+        self.engine = create_engine(sqlalchemy_postgres_dsn(postgres_dsn), echo=False)
         self.db_path = db_path
-        
+
         templates_dir = os.path.join(os.path.dirname(__file__), "templates")
         self.jinja_env = Environment(loader=FileSystemLoader(templates_dir))
 
@@ -127,6 +151,69 @@ class OrderTraceabilityPDFGenerator:
 
         self.jinja_env.filters["format"] = format_float
         self._to_text = lambda v: "" if v is None else str(v)
+
+    @staticmethod
+    def _cell(row, *keys):
+        """Read a value from a DataFrame/Series row with TR_Report or legacy aliases."""
+        for key in keys:
+            if key in row.index and not pd.isna(row.get(key)):
+                val = row.get(key)
+                if val is not None and str(val).strip() != "":
+                    return val
+        return None
+
+    @classmethod
+    def _map_tr_report_header(cls, row) -> pd.Series:
+        """Map TR_Report columns to PDF template order_info field names."""
+        del_date = cls._cell(row, 'del_date', 'Del_Date')
+        if hasattr(del_date, 'strftime'):
+            del_date = del_date.strftime('%Y-%m-%d')
+        elif del_date is not None:
+            del_date = str(del_date).strip()[:10]
+
+        return pd.Series({
+            'Job_No': cls._cell(row, 'Job_No', 'job_no'),
+            'Jobsite': cls._cell(row, 'jobsite', 'Jobsite'),
+            'Order_No': cls._cell(row, 'order_no', 'Order_No'),
+            'Order_Description': cls._cell(row, 'order_describution', 'order_description', 'Order_Description'),
+            'Client': cls._cell(row, 'client', 'Client'),
+            'Del_Date': del_date,
+            'Ref_No': cls._cell(row, 'ref_no', 'Ref_No'),
+            'PO_No(2)': cls._cell(row, 'bbs_po_no', 'PO_No(2)'),
+            'Jobsite_Type': cls._cell(row, 'jobsite_type', 'Jobsite_Type'),
+        })
+
+    @classmethod
+    def _map_tr_report_materials(cls, df: pd.DataFrame) -> pd.DataFrame:
+        """Map TR_Report material columns to names expected by grouping/rendering code."""
+        return pd.DataFrame({
+            'Dia': df['diameter'],
+            'Wt(ton)': df['wt_ton'],
+            'Product': df['product'],
+            'Grade': df['grade'],
+            'Pattern': df['pattern'],
+            'Mill Cert': df['mill_cert'],
+            'Test_Cert1': df['test_cert1'],
+            'Test_Cert2': df['test_cert2'],
+            'Supplier': df['supplier'],
+            'Stockist Cert': df['stockist_cert'],
+            'PO_No(1)': df['po_no'],
+            'rm_dn_no': df['rm_dn_no'],
+        })
+
+    @staticmethod
+    def _resolve_use_test_cert1(jobsite_type) -> bool:
+        """PRIVATE jobsites use Test Cert 1; IAT and others use Test Cert 2."""
+        if jobsite_type is None or (isinstance(jobsite_type, float) and pd.isna(jobsite_type)):
+            return False
+        if isinstance(jobsite_type, str):
+            if jobsite_type.upper().strip() == 'PRIVATE':
+                return True
+            return False
+        try:
+            return int(jobsite_type) in [1, 4, 5, 6, 8, 11]
+        except (ValueError, TypeError):
+            return False
 
     def _is_blank(self, value) -> bool:
         if value is None:
@@ -163,102 +250,28 @@ class OrderTraceabilityPDFGenerator:
         return empty_count
 
     def get_order_data(self, order_no: int):
-        # Use SQL Server connection
+        """Load order header and material lines from PostgreSQL TR_Report."""
         conn = self.engine.connect()
         try:
-            # Query order basic information (order level)
-            # SQL Server uses TOP instead of LIMIT
-            order_query = """
-            SELECT DISTINCT TOP 1
-                tbh.jobsite_no AS Job_No, 
-                tbh.jobsite_name AS Jobsite, 
-                tbh.bbs_no AS Order_No, 
-                tbh.order_desc AS Order_Description,
-                tbh.main_contractor AS Client,
-                tbh.delivery_date AS Del_Date,
-                tbh.bbs_ref_no AS Ref_No,
-                tbh.bbs_po_no AS [PO_No(2)],
-                tbh.jobsite_type AS Jobsite_Type
-            FROM tr_line_size tls
-            JOIN tr_bbs_header tbh
-                ON tbh.bbs_no = tls.bbs_no
-            LEFT JOIN tr_line_detail tld
-                ON tls.bbs_no = tld.bbs_no
-                AND tls.diameter = tld.diameter
-            JOIN pedidos_produccion pp
-                ON pp.ID_PEDIDO_PRODUCCION = tls.bbs_no
-            JOIN obras js
-                ON js.ID_OBRA = tls.jobsite_no
-            WHERE tls.bbs_no = :order_no
-            """
-
-            order_info = pd.read_sql(text(order_query), conn, params={'order_no': order_no})
-            if order_info.empty:
+            df = pd.read_sql(
+                self._TR_REPORT_QUERY,
+                conn,
+                params={'order_no': int(order_no)},
+            )
+            if df.empty:
                 return None, None, False
 
-            # Get Jobsite_Type and decide whether to use Test_Cert1 or Test_Cert2
-            # Jobsite_Type may be string "IAT" or "PRIVATE", or a number
-            # Rule: PRIVATE → Test_Cert1, IAT → Test_Cert2
-            jobsite_type = order_info.iloc[0]["Jobsite_Type"]
-            use_test_cert1 = False
-            if pd.notna(jobsite_type):
-                # Try to process as string first
-                if isinstance(jobsite_type, str):
-                    jobsite_type_upper = jobsite_type.upper().strip()
-                    if jobsite_type_upper == "PRIVATE":
-                        use_test_cert1 = True
-                    # If "IAT" or other value, use Test_Cert2 (use_test_cert1 = False)
-                else:
-                    # If number, check if in specified list
-                    try:
-                        jobsite_type_int = int(jobsite_type)
-                        if jobsite_type_int in [1, 4, 5, 6, 8, 11]:
-                            use_test_cert1 = True
-                    except (ValueError, TypeError):
-                        pass
-
-            # Query material detailed information (material level)
-            # Decide whether to use Test_Cert1 or Test_Cert2 based on Jobsite_Type
-            # Now query both test_cert1 and test_cert2, select which one to use based on logic
-            materials_query = """
-            SELECT 
-                tbh.jobsite_no AS Job_No,
-                tls.diameter AS Dia,
-                tls.wt_ton AS "Wt(ton)",
-                tld.product AS Product,
-                tld.grade AS Grade,
-                tld.pattern AS Pattern,
-                tld.mill_cert AS "Mill Cert",
-                tld.test_cert1 AS "Test_Cert1",
-                tld.test_cert2 AS "Test_Cert2",
-                tld.supplier AS Supplier,
-                tld.stockist_cert AS "Stockist Cert",
-                tld.po_no AS "PO_No(1)",
-                tld.rm_dn_no AS rm_dn_no
-            FROM tr_line_size tls
-            JOIN tr_bbs_header tbh
-                ON tbh.bbs_no = tls.bbs_no
-            LEFT JOIN tr_line_detail tld
-                ON tls.bbs_no = tld.bbs_no
-                AND tls.diameter = tld.diameter
-            JOIN pedidos_produccion pp
-                ON pp.ID_PEDIDO_PRODUCCION = tls.bbs_no
-            JOIN obras js
-                ON js.ID_OBRA = tls.jobsite_no
-            WHERE tls.bbs_no = :order_no
-            ORDER BY pp.id_obra, pp.ID_PEDIDO_PRODUCCION, tls.diameter, tld.pattern
-            """
-
-            materials_data = pd.read_sql(text(materials_query), conn, params={'order_no': order_no})
-            
-            return order_info.iloc[0], materials_data, use_test_cert1
+            order_info = self._map_tr_report_header(df.iloc[0])
+            use_test_cert1 = self._resolve_use_test_cert1(order_info.get('Jobsite_Type'))
+            materials_data = self._map_tr_report_materials(df)
+            return order_info, materials_data, use_test_cert1
         finally:
             conn.close()
     
     def generate_pdf(self, order_no: int, output_path: str | None = None):
         order_info, materials_data, use_test_cert1 = self.get_order_data(order_no)
         if order_info is None:
-            _safe_log('warning', f"Order {order_no} not found in database!")
+            _safe_log('warning', f"Order {order_no} not found in PostgreSQL TR_Report")
             return False, None
 
         empty_key_rows = self._count_empty_key_rows(materials_data)
@@ -1181,8 +1194,7 @@ ET
 
 def generate_landscape_pdf():
     print("=== Order Traceability PDF Generator (WeasyPrint) ===")
-    db_path = r"C:\YYH\TR REPORT\TR database\data_3years.db"
-    generator = OrderTraceabilityPDFGenerator(db_path)
+    generator = OrderTraceabilityPDFGenerator()
     
     sample_order = 126831
     print(f"Generating landscape PDF for Order: {sample_order}")

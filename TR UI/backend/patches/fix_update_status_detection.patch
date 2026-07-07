@@ -1,0 +1,67 @@
+--- a/TR UI/backend/tr_full_update_pipeline.py
++++ b/TR UI/backend/tr_full_update_pipeline.py
+@@ -203,8 +203,16 @@
+     if "script execution completed" in low:
+         return True
+     if "update completed successfully" in low:
+         return True
++    if "all data update successful" in low:
++        return True
++    if "tr database tables update completed" in low:
++        return True
+     if "file index auto update process ended" in low:
+         return True
++    if "file index auto update ended" in low:
++        return True
++    if "auto update ended" in low:
++        return True
+     if "automatic update process ended" in low:
+         return True
+     return False
+@@ -265,6 +273,9 @@
+             if _batch_log_indicates_success(content):
+                 return "completed", "阶段B：批处理已完成"
+             return "failed", "阶段B：批处理可能失败"
++        # 日志已停止更新较久且含成功标记时，仍视为完成（兼容结束文案变更）
++        if time_diff >= recent_secs and _batch_log_indicates_success(content):
++            return "completed", "阶段B：批处理已完成（日志含成功标记）"
+         return "unknown", "阶段B：无法从日志判定状态"
+     except OSError:
+         return "unknown", "阶段B：无法读取日志文件"
+@@ -337,8 +348,17 @@
+             if status == "running":
+                 pass
+             elif status == "unknown":
+-                if time.time() - lm < 300:
++                idle_sec = time.time() - lm
++                if idle_sec < 300:
+                     last_msg = "阶段B：批处理可能进行中"
++                else:
++                    content = _read_auto_update_log_text(latest_log)
++                    if _batch_log_indicates_success(content):
++                        return (
++                            "completed",
++                            "阶段B：批处理已完成（日志已停止更新且含成功标记）",
++                            latest_log,
++                        )
+         elif log_files:
+             latest_log = max(log_files, key=os.path.getmtime)
+             lm = os.path.getmtime(latest_log)
+@@ -373,8 +393,17 @@
+             if status == "running":
+                 pass
+             elif status == "unknown":
+-                if time.time() - lm < 300:
++                idle_sec = time.time() - lm
++                if idle_sec < 300:
+                     last_msg = "阶段B：批处理可能进行中"
++                else:
++                    content = _read_auto_update_log_text(latest_log)
++                    if _batch_log_indicates_success(content):
++                        return (
++                            "completed",
++                            "阶段B：批处理已完成（日志已停止更新且含成功标记）",
++                            latest_log,
++                        )
+         time.sleep(poll_interval)
+     return "failed", f"阶段B：等待日志超时（{max_wait_sec}s），最后状态：{last_msg}", latest_log

@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Certificate of Compliance</title>
+    <link rel="stylesheet" href="cert_compliance.css">
+</head>
+<body>
+    <div class="cert-page">
+        <header class="cert-header">
+            <table class="header-table">
+                <tr>
+                    <td class="header-left">
+                        {% if logo_exists %}
+                        <img src="{{ logo_path }}" alt="VSC Logo" class="logo">
+                        {% endif %}
+                        <div class="company-name">VSC Construction Steel Solutions Limited</div>
+                        <div class="company-address">17 Tsing Keung Street, Tsing Yi South, Tsing Yi, New Territories, Hong Kong</div>
+                        <div class="company-contact">Tel: 2165 5788&nbsp;&nbsp;&nbsp;&nbsp;Fax: 2165 5789</div>
+                    </td>
+                    <td class="header-right">
+                        <div><span class="meta-label">Date:</span> {{ cert.date_dispatched }}</div>
+                        <div><span class="meta-label">Ref. no.:</span> {{ cert.ref_no }}</div>
+                        <div><span class="meta-label">Jobsite no.:</span> {{ cert.jobsite_no }}</div>
+                    </td>
+                </tr>
+            </table>
+        </header>
+
+        <table class="project-table">
+            <tr>
+                <td class="field-label">Client:</td>
+                <td class="field-value">{{ cert.client_name }}</td>
+            </tr>
+            <tr>
+                <td class="field-label">Main Contractor:</td>
+                <td class="field-value">{{ cert.main_contractor }}</td>
+            </tr>
+            <tr>
+                <td class="field-label">Project:</td>
+                <td class="field-value">{{ cert.jobsite_name }}</td>
+            </tr>
+            {% for line in cert.project_lines %}
+            <tr>
+                <td class="field-label"></td>
+                <td class="field-value">{{ line }}</td>
+            </tr>
+            {% endfor %}
+            {% if cert.archsd_contract_no %}
+            <tr>
+                <td class="field-label">ArchSD Contract No.:</td>
+                <td class="field-value archsd-value">{{ cert.archsd_contract_no }}</td>
+            </tr>
+            {% endif %}
+            {% if cert.asd_marker %}
+            <tr>
+                <td class="field-label"></td>
+                <td class="field-value">{{ cert.asd_marker }}</td>
+            </tr>
+            {% endif %}
+            {% if cert.work_order_no %}
+            <tr>
+                <td class="field-label">W/O:</td>
+                <td class="field-value">{{ cert.work_order_no }}</td>
+            </tr>
+            {% endif %}
+        </table>
+
+        <h1 class="cert-title">Certificate of Compliance</h1>
+
+        <p class="cert-body">
+            We, VSC Construction Steel Solutions Limited, hereby confirm that all Steel Reinforcing Bar
+            products supplied as below delivery to the above-mentioned project are produced by our approved
+            prefabrication yard listed on the &lsquo;List of Approved Steel Reinforcing Bar Prefabrication
+            Yards for Public Works&rsquo; in accordance with the Development Bureau Technical Circular
+            (Works) No. 1/2016 and located at 17 Tsing Keung Street, Tsing Yi South, Tsing Yi,
+            New Territories, Hong Kong. All Steel Reinforcing Bar products are in compliance with the
+            quality assurance scheme of the approved prefabrication yard, and the products are in compliance
+            with the Construction Standard CS2:2012 including amendments thereto and replacement thereof and
+            other relevant prevailing technical memorandums, practice notes, codes of practice and
+            specifications related to testing of reinforcement issued by the Government for this contract.
+        </p>
+
+        <section class="delivery-block">
+            <table class="delivery-table">
+                <tr>
+                    <td class="delivery-col">
+                        <div class="delivery-label">Delivery Docket no.:</div>
+                        <div class="delivery-value">{{ cert.ref_no }}</div>
+                    </td>
+                    <td class="delivery-col">
+                        <div class="delivery-label">Order no.:</div>
+                        {% if cert.order_nos %}
+                        {% for order_no in cert.order_nos %}
+                        <div class="delivery-value">{{ order_no }}</div>
+                        {% endfor %}
+                        {% else %}
+                        <div class="delivery-value">&nbsp;</div>
+                        {% endif %}
+                    </td>
+                    <td class="delivery-col">
+                        <div class="delivery-label">Date dispatched:</div>
+                        <div class="delivery-value">{{ cert.date_dispatched }}</div>
+                    </td>
+                </tr>
+            </table>
+        </section>
+
+        <section class="signature-section">
+            <div class="signature-intro">Signed for and on behalf of</div>
+            {% if signature_exists %}
+            <div class="signature-visual">
+                <img src="{{ signature_path }}" alt="Signature" class="signature-img">
+            </div>
+            {% endif %}
+            <div class="signature-line"></div>
+            <div class="signature-role">Authorized Signatory</div>
+            <div class="signature-name">Sigrid Tung</div>
+            <div class="signature-title">Team Leader of Orders Management</div>
+        </section>
+    </div>
+</body>
+</html>

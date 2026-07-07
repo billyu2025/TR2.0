@@ -12,7 +12,16 @@ TR UI/.env
 
 # 日志文件
 TR database/logs/
-TR UI/backend/logs
+TR UI/backend/logs/
+TR UI/nginx-1.28.0/logs/
 
 # 生成的PDF文件
 TR UI/backend/Generated_PDFs/
+TR UI/backend/Generated_Cert_PDFs/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+#COC
+COC file/

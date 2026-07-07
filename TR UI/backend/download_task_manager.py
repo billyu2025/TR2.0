@@ -138,19 +138,135 @@ class DownloadTaskManager:
         }
         warning_filename = warning_filename_map.get(task_type, 'missing_summary.txt')
 
-        lines = [
-            "TR Stockist & Test Report Missing Summary",
-            f"Task Type: {task_type}",
-            f"Generated At: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            "",
-            warning_message
-        ]
-        warning_content = "\n".join(lines)
+        # Stockist & Test 各下载任务统一缺失文本（与按日期一致）
+        warning_content = warning_message
+
+        only_missing_report = task_type in {'date', 'order', 'order_stockist_flat', 'dd_no'}
 
         with zipfile.ZipFile(zip_path, 'a', zipfile.ZIP_STORED) as zipf:
+            existing_names = set(zipf.namelist())
+            if "MISSING_FILES_REPORT.txt" not in existing_names:
+                zipf.writestr("MISSING_FILES_REPORT.txt", warning_content.encode('utf-8-sig'))
+
+            if only_missing_report:
+                return "MISSING_FILES_REPORT.txt"
+
             zipf.writestr(warning_filename, warning_content.encode('utf-8-sig'))
 
         return warning_filename
+
+    def _format_missing_report_content(self, missing_entries: List[Dict]) -> str:
+        """Format missing entries in the same report style as grouped-by-date."""
+        if not missing_entries:
+            return ""
+
+        unique_entries = []
+        seen = set()
+        for item in missing_entries:
+            key = (
+                str(item.get('date') or ""),
+                str(item.get('order_no') or ""),
+                str(item.get('job_no') or ""),
+                str(item.get('stockist_cert') or ""),
+                str(item.get('missing_type') or "")
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_entries.append(item)
+
+        unique_entries.sort(key=lambda x: (
+            str(x.get('date') or ""),
+            str(x.get('order_no') or ""),
+            str(x.get('job_no') or ""),
+            str(x.get('stockist_cert') or "")
+        ))
+
+        lines = [
+            "Stockist & Test Report Missing Items",
+            "MissingType: No matched PDF | Missing Stockist report | Missing Test report",
+            ""
+        ]
+        for item in unique_entries:
+            lines.append(
+                f"Date={item.get('date') or ''} | Order={item.get('order_no')} | Job No={item.get('job_no') or 'Unknown'} | "
+                f"Stockist No={item.get('stockist_cert')} | Missing={item.get('missing_type') or 'Unknown'}"
+            )
+        return "\n".join(lines)
+
+    def _build_missing_entries_from_presence(
+        self,
+        cert_presence: Dict,
+        orders_info: Dict[int, Dict],
+        order_to_date: Optional[Dict[int, str]] = None
+    ) -> List[Dict]:
+        """Convert cert presence map to standardized missing entries."""
+        missing_entries = []
+        for (order_no, cert), presence in cert_presence.items():
+            if not cert:
+                continue
+
+            has_any_file = bool(presence.get('has_any_file'))
+            has_stockist_cert = bool(presence.get('has_stockist_cert'))
+            has_test_report = bool(presence.get('has_test_report'))
+
+            if not has_any_file:
+                missing_type = "No matched PDF"
+            elif not has_stockist_cert and not has_test_report:
+                missing_type = "No Stockist/Test classified file"
+            elif not has_stockist_cert:
+                missing_type = "Missing Stockist report"
+            elif not has_test_report:
+                missing_type = "Missing Test report"
+            else:
+                missing_type = None
+
+            if not missing_type:
+                continue
+
+            order_info = orders_info.get(order_no) or {}
+            job_no = order_info.get('job_no') or 'Unknown'
+            if not job_no or job_no == 'None':
+                job_no = 'Unknown'
+            date_val = ""
+            if order_to_date:
+                date_val = str(order_to_date.get(order_no) or "").strip()
+
+            missing_entries.append({
+                'date': date_val,
+                'order_no': order_no,
+                'job_no': job_no,
+                'stockist_cert': cert,
+                'missing_type': missing_type
+            })
+        return missing_entries
+
+    def _extract_grouped_date_warning_from_zip(self, zip_path: str) -> Optional[str]:
+        """
+        Read grouped-by-date missing report from ZIP and convert it to warning summary text.
+        This keeps API warning_message aligned with actual packaged missing result.
+        """
+        if not zip_path or not os.path.exists(zip_path):
+            return None
+
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zipf:
+                if "MISSING_FILES_REPORT.txt" not in zipf.namelist():
+                    return None
+                raw = zipf.read("MISSING_FILES_REPORT.txt")
+        except Exception:
+            return None
+
+        try:
+            content = raw.decode('utf-8-sig', errors='replace')
+        except Exception:
+            return None
+
+        lines = [line.strip() for line in content.splitlines() if line.strip()]
+        item_lines = [line for line in lines if line.startswith("Date=")]
+        if not item_lines:
+            return None
+        return content
 
     def _format_missing_summary_by_order(
         self,
@@ -416,12 +532,14 @@ class DownloadTaskManager:
             except Exception:
                 continue
 
-        warning_message = self._format_missing_summary_by_order(
+        derived_order_to_date = self._build_order_to_date_map(downloader, order_nos)
+        order_to_date_map = order_to_group if (group_title == "Date" and order_to_group) else derived_order_to_date
+        missing_entries = self._build_missing_entries_from_presence(
             cert_presence,
-            order_to_group=order_to_group,
-            group_title=group_title,
-            unmatched_group_label=unmatched_group_label
+            orders_info,
+            order_to_date=order_to_date_map
         )
+        warning_message = self._format_missing_report_content(missing_entries)
         return warning_message or None
 
     def _build_order_to_date_map(self, downloader, order_nos: list) -> Dict[int, str]:
@@ -1029,17 +1147,46 @@ class DownloadTaskManager:
                 pass
             raise ValueError(error_msg)
 
-        # 生成缺失提示（不中断下载），按 Order 分组
-        warning_message = self._format_missing_summary_by_order(cert_presence)
+        # 生成缺失提示（不中断下载），与 grouped-by-date 使用一致格式
+        order_to_date = self._build_order_to_date_map(downloader, order_nos)
+        missing_entries = self._build_missing_entries_from_presence(
+            cert_presence,
+            orders_info,
+            order_to_date=order_to_date
+        )
+        warning_message = self._format_missing_report_content(missing_entries)
+
+        # 过滤缺失的 stockist_cert：只要该 (order, cert) 存在缺失，就不打包该 cert 文件夹
+        excluded_order_cert_keys = set()
+        for item in missing_entries:
+            try:
+                excluded_order_cert_keys.add((int(item.get('order_no')), str(item.get('stockist_cert') or '').strip()))
+            except (TypeError, ValueError):
+                continue
+        if excluded_order_cert_keys:
+            filtered_files_by_order_and_cert = {}
+            for key, files in files_by_order_and_cert.items():
+                order_no, stockist_cert = key
+                normalized_key = (int(order_no), str(stockist_cert or '').strip())
+                if normalized_key in excluded_order_cert_keys:
+                    continue
+                filtered_files_by_order_and_cert[key] = files
+            files_by_order_and_cert = filtered_files_by_order_and_cert
+
+            # 重新统计将被打包的文件数（避免统计包含被过滤的文件）
+            all_files_set = set()
+            for files in files_by_order_and_cert.values():
+                for file_path in files:
+                    all_files_set.add(file_path)
         
         # 更新进度：90% - 文件收集完成，开始打包
         self.update_progress(task_id, 90, total_orders, total_orders)
         
         # 创建ZIP文件
         if flat_by_stockist:
-            zip_path = self._create_zip_from_files_flat_by_stockist(files_by_order_and_cert)
+            zip_path = self._create_zip_from_files_flat_by_stockist(files_by_order_and_cert, downloader)
         else:
-            zip_path = self._create_zip_from_files(files_by_order_and_cert, order_nos)
+            zip_path = self._create_zip_from_files(files_by_order_and_cert, order_nos, downloader)
         file_count = len(all_files_set)
         
         # 更新进度：100% - 完成
@@ -1048,7 +1195,7 @@ class DownloadTaskManager:
         # 直接返回ZIP文件路径（不移动到缓存）
         return zip_path, file_count, (warning_message or None)
 
-    def _create_zip_from_files_flat_by_stockist(self, files_by_order_and_cert: Dict) -> str:
+    def _create_zip_from_files_flat_by_stockist(self, files_by_order_and_cert: Dict, downloader) -> str:
         """
         Create ZIP file flattened by Stockist No.
 
@@ -1056,6 +1203,9 @@ class DownloadTaskManager:
         - Stockist_No_1/file1.pdf
         - Stockist_No_1/file2.pdf
         - Stockist_No_2/file3.pdf
+
+        Folder names use the same _F / _P suffix rules as order-based download
+        (via zip_stockist_folder_name_from_files, per order+stockist group).
         """
         import tempfile
         import zipfile
@@ -1065,19 +1215,20 @@ class DownloadTaskManager:
         temp_zip.close()
 
         try:
-            # Aggregate and deduplicate by (stockist_cert, file_path)
-            files_by_cert = {}
+            # Aggregate and deduplicate by (zip folder name, file_path)
+            files_by_zip_folder = {}
             for (_, stockist_cert), files in files_by_order_and_cert.items():
                 if not stockist_cert or not files:
                     continue
-                cert_files = files_by_cert.setdefault(stockist_cert, set())
+                zip_folder = downloader.zip_stockist_folder_name_from_files(stockist_cert, files)
+                folder_files = files_by_zip_folder.setdefault(zip_folder, set())
                 for file_path in files:
                     if file_path and os.path.exists(file_path):
-                        cert_files.add(file_path)
+                        folder_files.add(file_path)
 
             with zipfile.ZipFile(temp_zip_path, 'w', zipfile.ZIP_STORED) as zipf:
                 written_paths = set()
-                for stockist_cert, file_paths in files_by_cert.items():
+                for zip_folder, file_paths in files_by_zip_folder.items():
                     used_names = set()
                     for file_path in sorted(file_paths):
                         file_name = os.path.basename(file_path)
@@ -1093,7 +1244,7 @@ class DownloadTaskManager:
                             counter += 1
                         used_names.add(candidate_name.lower())
 
-                        zip_path = f"{stockist_cert}/{candidate_name}"
+                        zip_path = f"{zip_folder}/{candidate_name}"
                         zip_path_key = zip_path.lower()
                         if zip_path_key in written_paths:
                             continue
@@ -1110,7 +1261,7 @@ class DownloadTaskManager:
                     pass
             raise e
     
-    def _create_zip_from_files(self, files_by_order_and_cert: Dict, order_nos: list) -> str:
+    def _create_zip_from_files(self, files_by_order_and_cert: Dict, order_nos: list, downloader) -> str:
         """Create ZIP file from file dictionary (consistent with original logic)"""
         import tempfile
         import zipfile
@@ -1134,6 +1285,7 @@ class DownloadTaskManager:
                 for (order_no, stockist_cert), files in files_by_order_and_cert.items():
                     if not files or not stockist_cert:
                         continue
+                    zip_stockist_folder = downloader.zip_stockist_folder_name_from_files(stockist_cert, files)
                     
                     for file_path in files:
                         abs_file_path = os.path.abspath(file_path)
@@ -1187,22 +1339,22 @@ class DownloadTaskManager:
                                         # 去掉第一层（stockist_cert 文件夹）
                                         rel_path = '/'.join(path_parts[1:])
                                     
-                                    zip_path = f"{order_no}/{stockist_cert}/{source_folder}/{rel_path}"
+                                    zip_path = f"{order_no}/{zip_stockist_folder}/{source_folder}/{rel_path}"
                                 else:
-                                    zip_path = f"{order_no}/{stockist_cert}/{source_folder}/{file_name}"
+                                    zip_path = f"{order_no}/{zip_stockist_folder}/{source_folder}/{file_name}"
                             else:
                                 # 其他文件夹（IAT Prelim、Private Formal、Private Prelim、Stockist Cert）：
                                 # 直接放在 Order_No/stockist_cert 文件夹下，只放文件名
-                                zip_path = f"{order_no}/{stockist_cert}/{file_name}"
+                                zip_path = f"{order_no}/{zip_stockist_folder}/{file_name}"
                             
                             zipf.write(file_path, zip_path)
                         except ValueError:
                             # 如果 relpath 失败（不同驱动器），使用文件名
                             if preserve_folder_structure:
-                                zip_path = f"{order_no}/{stockist_cert}/{source_folder}/{file_name}"
+                                zip_path = f"{order_no}/{zip_stockist_folder}/{source_folder}/{file_name}"
                             else:
                                 # 其他文件夹直接放在 Order_No/stockist_cert 文件夹下
-                                zip_path = f"{order_no}/{stockist_cert}/{file_name}"
+                                zip_path = f"{order_no}/{zip_stockist_folder}/{file_name}"
                             zipf.write(file_path, zip_path)
             
             return temp_zip_path
@@ -1257,14 +1409,17 @@ class DownloadTaskManager:
         
         # 调用下载方法
         zip_path, file_count = downloader.download_by_order_nos_grouped_by_date(order_nos)
-        order_to_date = self._build_order_to_date_map(downloader, order_nos)
-        warning_message = self._collect_warning_for_selected_orders(
-            downloader,
-            order_nos,
-            order_to_group=order_to_date,
-            group_title="Date",
-            unmatched_group_label="Unmatched Date"
-        )
+        warning_message = self._extract_grouped_date_warning_from_zip(zip_path)
+        if not warning_message:
+            # 兼容：如果ZIP里没有缺失报告，则回退到旧的告警计算
+            order_to_date = self._build_order_to_date_map(downloader, order_nos)
+            warning_message = self._collect_warning_for_selected_orders(
+                downloader,
+                order_nos,
+                order_to_group=order_to_date,
+                group_title="Date",
+                unmatched_group_label="Unmatched Date"
+            )
         
         # 更新进度：90% - 文件收集完成，开始打包
         self.update_progress(task_id, 90, total_orders, total_orders)

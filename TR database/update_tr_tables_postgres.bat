@@ -1,7 +1,7 @@
 @echo off
 REM ============================================
 REM TR Database Tables Auto Update Script (PostgreSQL)
-REM Function: Update bbs_dd, TR_Report and TR_Report_Deduplication tables
+REM Function: Update bbs_dd, cert_of_compliance, TR_Report and TR_Report_Deduplication tables
 REM This script calls update_tr_tables_postgres.py which handles email sending internally
 REM ============================================
 
@@ -40,22 +40,10 @@ echo [INFO] Python Script: %PYTHON_SCRIPT%
 echo [INFO] Database Backend: PostgreSQL
 echo.
 
-REM Check Python
-where python >nul 2>&1
-if errorlevel 1 (
-    echo [ERROR] Python not found in PATH
-    echo Please ensure Python is installed and added to PATH
-    echo.
-    exit /b 1
-)
+REM Use the same Python as TR-Backend service (3.10); fallback to PATH python
+set "PYTHON_EXE=C:\Users\tradmin\AppData\Local\Programs\Python\Python310\python.exe"
+if not exist "%PYTHON_EXE%" set "PYTHON_EXE=python"
 
-REM Record Python path
-for /f "delims=" %%i in ('where python 2^>nul') do (
-    echo [INFO] Python found at: %%i
-)
-
-echo [INFO] Python version:
-python --version
 echo.
 
 echo ============================================
@@ -72,7 +60,7 @@ echo ============================================
 echo.
 
 REM Execute Python script (Python script will handle email sending internally)
-call python "%PYTHON_SCRIPT%"
+call "%PYTHON_EXE%" "%PYTHON_SCRIPT%"
 set "EXIT_CODE=%errorlevel%"
 
 echo.

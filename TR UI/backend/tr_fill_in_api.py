@@ -37,6 +37,23 @@ from dotenv import load_dotenv
 # 加载环境变量
 load_dotenv()
 
+from tr_full_update_pipeline import (
+    append_log,
+    auto_update_log_phase_b_status,
+    execute_sync_tr_data,
+    glob_auto_update_all_outputs,
+    log_scheduled_task_query_summary,
+    phase_b_wait_message_is_stale_no_log,
+    resolve_batch_file,
+    resolve_tr_update_log_dir,
+    run_batch_subprocess,
+    scheduled_task_launch_failure_suspect,
+    schtasks_query_task_details,
+    snapshot_auto_update_log_mtimes,
+    try_run_scheduled_task,
+    wait_for_auto_update_logs,
+)
+
 # 導入統一日誌系統
 from logger_config import init_logger, get_logger, get_access_logger
 
@@ -47,7 +64,16 @@ except ImportError as e:
     PDFTaskManager = None
     try:
         logger.warning(f"Failed to import PDFTaskManager: {e}")
-    except:
+    except Exception:
+        pass
+
+try:
+    from cert_pdf_task_manager import CertPDFTaskManager
+except ImportError as e:
+    CertPDFTaskManager = None
+    try:
+        logger.warning(f"Failed to import CertPDFTaskManager: {e}")
+    except Exception:
         pass
 
 try:
@@ -137,6 +163,35 @@ logger = init_logger(debug_mode=DEBUG_MODE)
 access_logger = get_access_logger()
 
 
+def _audit_log_download(action: str, order_nos, *, zip_size=None, file_count=None, zip_name=None, extra=None):
+    """Write download audit trail to backend/logs/access.log for later tracing."""
+    try:
+        user = getattr(g, 'current_user', None) or {}
+        username = user.get('username') or 'unknown'
+        user_id = user.get('id')
+        client_ip = request.remote_addr if request else '-'
+        orders = [str(o) for o in (order_nos or [])]
+        parts = [
+            f"DOWNLOAD_AUDIT action={action}",
+            f"user={username}",
+            f"uid={user_id}",
+            f"ip={client_ip}",
+            f"count={len(orders)}",
+            f"orders={','.join(orders)}",
+        ]
+        if file_count is not None:
+            parts.append(f"files={file_count}")
+        if zip_size is not None:
+            parts.append(f"zip_size={zip_size}")
+        if zip_name:
+            parts.append(f"zip_name={zip_name}")
+        if extra:
+            parts.append(str(extra))
+        access_logger.info(' '.join(parts))
+    except Exception:
+        pass
+
+
 def _safe_error_message(exc: BaseException | None) -> str:
     """
     生产环境不向客户端返回异常细节、路径或数据库错误原文。
@@ -145,6 +200,534 @@ def _safe_error_message(exc: BaseException | None) -> str:
     if exc is not None and DEBUG_MODE:
         return str(exc)
     return '操作失败，请稍后重试或联系管理员'
+
+
+# --- 全量更新：阶段 A（EXEC sync_tr_data）+ 阶段 B（计划任务 / bat），异步单飞 ---
+_full_update_lock = threading.Lock()
+_full_update_state = {
+    "run_id": None,
+    "phase": "idle",
+    "message": "",
+    "phase_a_log": None,
+    "phase_b_log": None,
+    "started_at": None,
+    "finished_at": None,
+}
+
+
+def _full_update_state_json_path() -> str:
+    return os.path.join(resolve_tr_update_log_dir(), "full_update_job_state.json")
+
+
+def _persist_full_update_state() -> None:
+    """多进程下通过共享文件同步更新作业状态，避免 GET 落到别的 worker 时一直显示进行中。"""
+    try:
+        pt = time.time()
+        with _full_update_lock:
+            _full_update_state["_persisted_at"] = pt
+            payload = dict(_full_update_state)
+        payload["_persisted_at"] = pt
+        path = _full_update_state_json_path()
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception as exc:
+        try:
+            logger.warning("写入 full_update 状态文件失败: %s", exc)
+        except Exception:
+            pass
+
+
+def _load_full_update_state_disk() -> dict | None:
+    path = _full_update_state_json_path()
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _effective_full_update_state() -> dict:
+    """
+    优先使用本进程内存状态（非 idle）；否则读磁盘（另一 worker 在执行或已结束）。
+    若内存仍为 sync/batch 但磁盘上同一 run_id 已是 completed/failed（手工改 JSON、
+    或写盘与内存不同步），则以磁盘为准并回写内存，避免永久 409。
+    """
+    with _full_update_lock:
+        mem = dict(_full_update_state)
+    disk = _load_full_update_state_disk()
+    if (
+        disk
+        and isinstance(disk, dict)
+        and mem.get("phase") in ("sync", "batch")
+        and disk.get("phase") in ("completed", "failed")
+        and mem.get("run_id") is not None
+        and disk.get("run_id") == mem.get("run_id")
+    ):
+        with _full_update_lock:
+            for k, v in dict(disk).items():
+                _full_update_state[k] = v
+        mem = dict(_full_update_state)
+    if mem.get("phase") != "idle":
+        return mem
+    if not disk or not isinstance(disk, dict):
+        return mem
+    disk = dict(disk)
+    # 保留 _persisted_at：供 try_reconcile 判断「进入 batch 之后」日志是否更新（勿 pop 丢掉）
+    persisted_at = disk.get("_persisted_at")
+    dphase = disk.get("phase")
+    if dphase not in ("sync", "batch", "completed", "failed"):
+        return mem
+    if dphase in ("sync", "batch"):
+        if persisted_at is not None:
+            try:
+                max_age = float(os.getenv("FULL_UPDATE_DISK_STALE_SEC", str(4 * 3600)))
+                if time.time() - float(persisted_at) > max_age:
+                    return mem
+            except (TypeError, ValueError):
+                pass
+        return disk
+    fin = disk.get("finished_at")
+    if fin:
+        try:
+            fdt = datetime.fromisoformat(fin)
+            max_age = float(os.getenv("FULL_UPDATE_TERMINAL_DISK_MAX_AGE_SEC", str(86400 * 7)))
+            if (datetime.now() - fdt).total_seconds() > max_age:
+                return mem
+        except ValueError:
+            pass
+    return disk
+
+
+def _persist_full_update_payload(payload: dict) -> None:
+    """将完整作业状态写入 full_update_job_state.json（刷新 _persisted_at）。"""
+    out = {k: v for k, v in payload.items() if k != "_persisted_at"}
+    out["_persisted_at"] = time.time()
+    path = _full_update_state_json_path()
+    try:
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(out, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception as exc:
+        try:
+            logger.warning("写入 full_update 核对状态失败: %s", exc)
+        except Exception:
+            pass
+
+
+def try_reconcile_full_update_from_logs(eff: dict) -> dict | None:
+    """
+    若磁盘上 phase=batch 但后台线程已丢（例如进程重启），而 auto_update_all 输出（.log/.txt）在写入 batch
+    状态之后已被更新，则根据日志补记为 completed / failed。
+    """
+    if eff.get("phase") != "batch":
+        return None
+    pa = eff.get("_persisted_at")
+    pt: float | None = None
+    if pa is not None:
+        try:
+            pt = float(pa)
+        except (TypeError, ValueError):
+            pt = None
+    if pt is None:
+        started = eff.get("started_at")
+        if not started:
+            return None
+        try:
+            pt = datetime.fromisoformat(started).timestamp()
+        except ValueError:
+            return None
+
+    log_dir = resolve_tr_update_log_dir()
+    log_files = glob_auto_update_all_outputs(log_dir)
+    if not log_files:
+        return None
+    latest = max(log_files, key=os.path.getmtime)
+    try:
+        lm = os.path.getmtime(latest)
+    except OSError:
+        return None
+
+    # 以写入 batch 时的 _persisted_at 为基准；略放宽避免同秒写入被判成「未更新」
+    # 勿过大，否则易把「上一轮」日志当成本轮（仅用秒级 mtime 时）
+    mtime_slop = float(os.getenv("FULL_UPDATE_RECONCILE_MTIME_SLOP_SEC", "0.05"))
+    if lm < pt - mtime_slop:
+        return None
+
+    st, msg = auto_update_log_phase_b_status(latest)
+    fin = datetime.now().isoformat()
+    if st == "completed":
+        merged = {
+            **eff,
+            "phase": "completed",
+            "message": msg or "全量更新已完成（与日志核对后补记）",
+            "phase_b_log": latest,
+            "finished_at": fin,
+        }
+        _persist_full_update_payload(merged)
+        return merged
+    if st == "failed":
+        merged = {
+            **eff,
+            "phase": "failed",
+            "message": msg or "阶段B失败（与日志核对后补记）",
+            "phase_b_log": latest,
+            "finished_at": fin,
+        }
+        _persist_full_update_payload(merged)
+        return merged
+    return None
+
+
+def _merge_reconciled_full_update_into_memory(merged: dict) -> None:
+    with _full_update_lock:
+        if _full_update_state.get("run_id") != merged.get("run_id") and _full_update_state.get(
+            "phase"
+        ) not in (None, "idle"):
+            return
+        for k, v in merged.items():
+            if k == "_persisted_at":
+                continue
+            _full_update_state[k] = v
+
+
+def _startup_reconcile_full_update_if_needed() -> None:
+    try:
+        disk = _load_full_update_state_disk()
+        if not disk:
+            return
+        rec = try_reconcile_full_update_from_logs(disk)
+        if rec is not None:
+            _merge_reconciled_full_update_into_memory(rec)
+    except Exception as exc:
+        try:
+            logger.warning("启动时核对 full_update 状态失败: %s", exc)
+        except Exception:
+            pass
+
+
+def _full_update_sync_state(run_id: str, **kwargs) -> bool:
+    """若当前 run_id 仍为活动作业则更新状态。返回是否已写入。"""
+    with _full_update_lock:
+        cur = _full_update_state.get("run_id")
+        if cur != run_id:
+            try:
+                logger.warning(
+                    "full_update 状态未写入：run_id 不匹配 mem=%r 请求=%r 更新键=%s",
+                    cur,
+                    run_id,
+                    list(kwargs.keys()),
+                )
+            except Exception:
+                pass
+            return False
+        for key, val in kwargs.items():
+            _full_update_state[key] = val
+    _persist_full_update_state()
+    return True
+
+
+def _full_update_started_at_snapshot() -> str | None:
+    with _full_update_lock:
+        return _full_update_state.get("started_at")
+
+
+def _try_promote_phase_b_completed_from_logs(
+    run_id: str,
+    log_dir: str,
+    *,
+    job_started_at: str | None,
+    log_fn,
+    suffix: str = "（bat 已成功结束，按日志全文补记为完成）",
+) -> bool:
+    """
+    wait_for 可能因快照/mtime/关键词未命中仍返回非 completed；若 bat 进程已 exit 0，
+    再扫 auto_update_all 输出，在「不早于作业开始过多」的文件上若全文判定为完成则写入 completed。
+    """
+    try:
+        t0 = datetime.fromisoformat(job_started_at or "").timestamp()
+    except (ValueError, TypeError):
+        t0 = None
+    paths = glob_auto_update_all_outputs(log_dir)
+    if not paths:
+        return False
+    slack = float(os.getenv("FULL_UPDATE_PROMOTE_LOG_START_SLACK_SEC", "180"))
+    candidates = paths
+    if t0 is not None:
+        candidates = [p for p in paths if os.path.getmtime(p) >= t0 - slack]
+    if not candidates:
+        return False
+    best = max(candidates, key=os.path.getmtime)
+    try:
+        bmt = os.path.getmtime(best)
+    except OSError:
+        return False
+    if t0 is not None and bmt < t0 - slack:
+        return False
+    st, msg = auto_update_log_phase_b_status(best, recent_secs=0.0)
+    if st != "completed":
+        return False
+    fin = datetime.now().isoformat()
+    ok = _full_update_sync_state(
+        run_id,
+        phase="completed",
+        message=(msg or "全量更新已完成") + suffix,
+        phase_b_log=best,
+        finished_at=fin,
+    )
+    if ok and log_fn:
+        log_fn(f"阶段B：已根据日志补记为 completed file={best}")
+    return ok
+
+
+def _full_update_worker(run_id: str, batch_file: str, scheduled_task_name: str) -> None:
+    log_dir = resolve_tr_update_log_dir()
+    max_b = int(os.getenv("FULL_UPDATE_PHASE_B_MAX_WAIT_SEC", "7200"))
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    phase_a_log = os.path.join(log_dir, f"sync_tr_data_{ts}.log")
+
+    def blog(msg: str) -> None:
+        try:
+            logger.info("[full-update %s] %s", run_id, msg)
+        except Exception:
+            pass
+
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+    except OSError as exc:
+        _full_update_sync_state(
+            run_id,
+            phase="failed",
+            message=f"无法创建日志目录: {_safe_error_message(exc)}",
+            finished_at=datetime.now().isoformat(),
+        )
+        return
+
+    append_log(phase_a_log, f"run_id={run_id} 阶段A开始")
+    _full_update_sync_state(
+        run_id,
+        phase_a_log=phase_a_log,
+        message="阶段A：正在执行数据库同步存储过程...",
+    )
+
+    try:
+        execute_sync_tr_data(phase_a_log)
+    except Exception as exc:
+        blog(f"阶段A异常: {exc}")
+        traceback.print_exc()
+        _full_update_sync_state(
+            run_id,
+            phase="failed",
+            message=f"阶段A失败: {_safe_error_message(exc)}",
+            finished_at=datetime.now().isoformat(),
+        )
+        return
+
+    _full_update_sync_state(
+        run_id,
+        phase="batch",
+        message="阶段B：正在启动批处理/计划任务...",
+    )
+
+    snap_before_phase_b = snapshot_auto_update_log_mtimes(log_dir)
+    if try_run_scheduled_task(scheduled_task_name, log_fn=blog):
+        log_scheduled_task_query_summary(scheduled_task_name, log_fn=blog)
+        time.sleep(float(os.getenv("PHASE_B_SCHTASKS_QUERY_DELAY_SEC", "2.5")))
+        q = schtasks_query_task_details(scheduled_task_name)
+        lr = q.get("last_result")
+        st_line = q.get("status")
+        if lr is not None:
+            blog(
+                "schtasks 解析: Last Result=%s (0x%08x) Status=%r"
+                % (lr, lr & 0xFFFFFFFF, st_line)
+            )
+        else:
+            blog("schtasks 解析: Last Result=None Status=%r" % (st_line,))
+
+        sched_stale = float(
+            os.getenv("PHASE_B_STALE_LOG_ABORT_SCHEDULED_SEC", "1200")
+        )
+        short_stale = float(os.getenv("PHASE_B_NO_LOG_FALLBACK_BAT_SEC", "180"))
+        first_stale = min(short_stale, sched_stale)
+
+        def _direct_bat_wait(snap: dict, intro: str):
+            blog(intro)
+            ok_b, _out_b, err_b = run_batch_subprocess(batch_file, log_fn=blog)
+            bat_stale = float(os.getenv("PHASE_B_STALE_LOG_ABORT_BAT_SEC", "600"))
+            st_b, msg_b, lat_b = wait_for_auto_update_logs(
+                log_dir,
+                max_wait_sec=max_b,
+                poll_interval=3.0,
+                log_fn=blog,
+                log_mtime_snapshot=snap,
+                min_log_mtime=None,
+                stale_abort_sec=bat_stale,
+            )
+            return st_b, msg_b, lat_b, ok_b, err_b
+
+        if scheduled_task_launch_failure_suspect(lr, st_line):
+            blog(
+                "计划任务 Last Result 为失败 HRESULT 且状态非 Running，"
+                "跳过长时间等日志，改为本进程直接执行 bat"
+            )
+            snap_b = snapshot_auto_update_log_mtimes(log_dir)
+            st, msg, latest, ok, stderr = _direct_bat_wait(
+                snap_b,
+                "正在直接执行 PostgreSQL 更新批处理（绕过失败的任务计划）",
+            )
+            fin = datetime.now().isoformat()
+            if st == "completed":
+                _full_update_sync_state(
+                    run_id,
+                    phase="completed",
+                    message=msg or "全量更新已完成",
+                    phase_b_log=latest,
+                    finished_at=fin,
+                )
+            else:
+                if ok and _try_promote_phase_b_completed_from_logs(
+                    run_id,
+                    log_dir,
+                    job_started_at=_full_update_started_at_snapshot(),
+                    log_fn=blog,
+                ):
+                    return
+                extra = ""
+                if not ok and stderr:
+                    extra = f"（bat：{stderr[:280]}）"
+                hint = ""
+                if lr is not None and lr < 0:
+                    hint = (
+                        f" 计划任务 Last Result={lr}，请核对任务中 bat 路径、"
+                        "「起始于」目录及运行账户是否有权访问含空格的路径。"
+                    )
+                _full_update_sync_state(
+                    run_id,
+                    phase="failed",
+                    message=(msg or "阶段B未完成") + extra + hint,
+                    phase_b_log=latest,
+                    finished_at=fin,
+                )
+            return
+
+        st, msg, latest = wait_for_auto_update_logs(
+            log_dir,
+            max_wait_sec=max_b,
+            poll_interval=5.0,
+            log_fn=blog,
+            log_mtime_snapshot=snap_before_phase_b,
+            min_log_mtime=None,
+            stale_abort_sec=first_stale,
+        )
+        if st == "completed":
+            fin = datetime.now().isoformat()
+            _full_update_sync_state(
+                run_id,
+                phase="completed",
+                message=msg or "全量更新已完成",
+                phase_b_log=latest,
+                finished_at=fin,
+            )
+            return
+        if st == "failed" and phase_b_wait_message_is_stale_no_log(msg):
+            blog(
+                "计划任务触发后 %ds 内未见 auto_update 新输出（.log/.txt），"
+                "改由本进程直接执行 bat" % int(first_stale)
+            )
+            snap2 = snapshot_auto_update_log_mtimes(log_dir)
+            st2, msg2, latest2, ok2, stderr2 = _direct_bat_wait(
+                snap2,
+                "正在直接执行 PostgreSQL 更新批处理（计划任务未产生日志时的回退）",
+            )
+            fin = datetime.now().isoformat()
+            if st2 == "completed":
+                _full_update_sync_state(
+                    run_id,
+                    phase="completed",
+                    message=msg2 or "全量更新已完成",
+                    phase_b_log=latest2,
+                    finished_at=fin,
+                )
+            else:
+                if ok2 and _try_promote_phase_b_completed_from_logs(
+                    run_id,
+                    log_dir,
+                    job_started_at=_full_update_started_at_snapshot(),
+                    log_fn=blog,
+                ):
+                    return
+                extra = ""
+                if not ok2 and stderr2:
+                    extra = f"（bat：{stderr2[:280]}）"
+                _full_update_sync_state(
+                    run_id,
+                    phase="failed",
+                    message=(msg2 or "阶段B未完成") + extra,
+                    phase_b_log=latest2,
+                    finished_at=fin,
+                )
+            return
+
+        fin = datetime.now().isoformat()
+        _full_update_sync_state(
+            run_id,
+            phase="failed",
+            message=msg or "阶段B失败",
+            phase_b_log=latest,
+            finished_at=fin,
+        )
+        return
+
+    blog("计划任务未成功启动，回退为直接执行 bat")
+    snap_before_bat = snapshot_auto_update_log_mtimes(log_dir)
+    ok, _stdout, stderr = run_batch_subprocess(batch_file, log_fn=blog)
+    bat_stale = float(os.getenv("PHASE_B_STALE_LOG_ABORT_BAT_SEC", "600"))
+    st, msg, latest = wait_for_auto_update_logs(
+        log_dir,
+        max_wait_sec=min(max_b, 900),
+        poll_interval=3.0,
+        log_fn=blog,
+        log_mtime_snapshot=snap_before_bat,
+        min_log_mtime=None,
+        stale_abort_sec=bat_stale,
+    )
+    fin = datetime.now().isoformat()
+    if st == "completed":
+        _full_update_sync_state(
+            run_id,
+            phase="completed",
+            message=msg or "全量更新已完成",
+            phase_b_log=latest,
+            finished_at=fin,
+        )
+        return
+    if ok and _try_promote_phase_b_completed_from_logs(
+        run_id,
+        log_dir,
+        job_started_at=_full_update_started_at_snapshot(),
+        log_fn=blog,
+    ):
+        return
+    extra = ""
+    if not ok and stderr:
+        extra = f"（bat：{stderr[:280]}）"
+    _full_update_sync_state(
+        run_id,
+        phase="failed",
+        message=(msg or "阶段B未完成") + extra,
+        phase_b_log=latest,
+        finished_at=fin,
+    )
 
 
 # --- 管理端 IP 白名单（M8）：仅允许内网/VPN 等网段访问管理类 API ---
@@ -489,6 +1072,7 @@ def start_background_services():
         _background_services_started = True
 
     _ensure_pool_initialized()
+    _startup_reconcile_full_update_if_needed()
 
     enable_scheduler = os.getenv('ENABLE_FILE_INDEX_SCHEDULER', 'False').lower() == 'true'
     if not enable_scheduler:
@@ -1731,6 +2315,131 @@ _ensure_download_tasks_table()
 
 # 初始化 PDF 任务表
 _ensure_pdf_tasks_table()
+
+
+def _cert_pdf_status_table_exists(cursor) -> bool:
+    """Cert_PDF_Status 为混合大小写表名，PostgreSQL 需用 pg_tables 检查"""
+    if is_postgres():
+        cursor.execute("""
+            SELECT EXISTS (
+                SELECT 1 FROM pg_tables
+                WHERE schemaname = 'public' AND tablename = 'Cert_PDF_Status'
+            ) AS exists
+        """)
+        row = cursor.fetchone()
+        return bool(row.get('exists') if isinstance(row, dict) else row[0]) if row else False
+    cursor.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='Cert_PDF_Status'"
+    )
+    return cursor.fetchone() is not None
+
+
+def _ensure_cert_pdf_tables():
+    """确保 Cert of Compliance PDF 任务与状态表存在"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        if not _table_exists(cursor, 'cert_pdf_tasks'):
+            if is_postgres():
+                cursor.execute("""
+                    CREATE TABLE cert_pdf_tasks (
+                        task_id TEXT PRIMARY KEY,
+                        user_id BIGINT NOT NULL,
+                        shipping_no BIGINT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        progress INTEGER NOT NULL DEFAULT 0,
+                        message TEXT,
+                        pdf_path TEXT,
+                        error_message TEXT,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        started_at TIMESTAMPTZ,
+                        completed_at TIMESTAMPTZ,
+                        expires_at TIMESTAMPTZ
+                    )
+                """)
+            else:
+                cursor.execute("""
+                    CREATE TABLE cert_pdf_tasks (
+                        task_id TEXT PRIMARY KEY,
+                        user_id INTEGER NOT NULL,
+                        shipping_no INTEGER NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        progress INTEGER DEFAULT 0,
+                        message TEXT,
+                        pdf_path TEXT,
+                        error_message TEXT,
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        started_at TEXT,
+                        completed_at TEXT,
+                        expires_at TEXT
+                    )
+                """)
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cert_pdf_tasks_user_id ON cert_pdf_tasks(user_id)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cert_pdf_tasks_shipping_no "
+                "ON cert_pdf_tasks(shipping_no)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cert_pdf_tasks_status ON cert_pdf_tasks(status)"
+            )
+            conn.commit()
+            logger.info("cert_pdf_tasks table created")
+        if not _cert_pdf_status_table_exists(cursor):
+            if is_postgres():
+                cursor.execute("""
+                    CREATE TABLE "Cert_PDF_Status" (
+                        shipping_no BIGINT PRIMARY KEY,
+                        pdf_status TEXT NOT NULL DEFAULT 'pending',
+                        pdf_path TEXT,
+                        generated_at TIMESTAMPTZ,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                """)
+                cursor.execute(
+                    'CREATE INDEX IF NOT EXISTS idx_cert_pdf_status_status '
+                    'ON "Cert_PDF_Status"(pdf_status)'
+                )
+            else:
+                cursor.execute("""
+                    CREATE TABLE Cert_PDF_Status (
+                        shipping_no INTEGER PRIMARY KEY,
+                        pdf_status TEXT NOT NULL DEFAULT 'pending',
+                        pdf_path TEXT,
+                        generated_at TEXT,
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                cursor.execute(
+                    'CREATE INDEX IF NOT EXISTS idx_cert_pdf_status_status '
+                    'ON Cert_PDF_Status(pdf_status)'
+                )
+            conn.commit()
+            logger.info("Cert_PDF_Status table created")
+        elif is_postgres():
+            cursor.execute(
+                'CREATE INDEX IF NOT EXISTS idx_cert_pdf_status_status '
+                'ON "Cert_PDF_Status"(pdf_status)'
+            )
+            conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"_ensure_cert_pdf_tables failed: {e}", exc_info=True)
+        raise
+    finally:
+        conn.close()
+
+
+_ensure_cert_pdf_tables()
+
+
+def check_cert_pdf_status_table_exists(conn):
+    try:
+        cursor = conn.cursor()
+        return _cert_pdf_status_table_exists(cursor)
+    except Exception:
+        return False
 
 
 def check_pdf_status_table_exists(conn):
@@ -3528,6 +4237,412 @@ def group_by_job_no():
         }), 500
 
 
+# ==================== Cert of Compliance ====================
+
+@app.route('/api/cert-of-compliance/list', methods=['GET'])
+def get_cert_of_compliance_list():
+    """CERT OF COMPLIANCE 列表（PostgreSQL cert_of_compliance + Cert_PDF_Status）"""
+    try:
+        page = request.args.get('page', 1, type=int)
+        per_page_param = request.args.get('per_page', 100)
+        shipping_no = request.args.get('shipping_no', '').strip()
+        job_no = request.args.get('job_no', '').strip()
+        start_date = request.args.get('start_date', '').strip()
+        end_date = request.args.get('end_date', '').strip()
+
+        current_user = get_current_user(optional=True)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cert_status_exists = check_cert_pdf_status_table_exists(conn)
+        where_conditions = []
+        params = []
+
+        if shipping_no:
+            where_conditions.append(f"CAST(c.shipping_no AS TEXT) LIKE {db_placeholders(1)}")
+            params.append(f"%{shipping_no}%")
+        if job_no:
+            where_conditions.append(f"CAST(c.jobsite_no AS TEXT) LIKE {db_placeholders(1)}")
+            params.append(f"%{job_no}%")
+        if start_date:
+            if is_postgres():
+                where_conditions.append(
+                    f"CAST(c.del_date AS DATE) >= CAST({db_placeholders(1)} AS DATE)"
+                )
+            else:
+                where_conditions.append(f"c.del_date >= {db_placeholders(1)}")
+            params.append(start_date.replace('/', '-'))
+        if end_date:
+            if is_postgres():
+                where_conditions.append(
+                    f"CAST(c.del_date AS DATE) <= CAST({db_placeholders(1)} AS DATE)"
+                )
+            else:
+                where_conditions.append(f"c.del_date <= {db_placeholders(1)}")
+            params.append(end_date.replace('/', '-'))
+
+        if current_user and current_user.get('role') == 'user':
+            scoped_jobs = _fetch_user_job_nos(conn, current_user['id'])
+            if scoped_jobs:
+                placeholders = ','.join([db_placeholders(1)] * len(scoped_jobs))
+                where_conditions.append(f"CAST(c.jobsite_no AS TEXT) IN ({placeholders})")
+                params.extend([str(j).strip() for j in scoped_jobs])
+            else:
+                where_conditions.append('1 = 0')
+
+        where_clause = ('WHERE ' + ' AND '.join(where_conditions)) if where_conditions else ''
+
+        count_query = f"SELECT COUNT(*) as count FROM cert_of_compliance c {where_clause}"
+        cursor.execute(count_query, params)
+        row = cursor.fetchone()
+        if isinstance(row, dict):
+            total_records = row.get('count', 0) or list(row.values())[0]
+        else:
+            total_records = row[0] if row else 0
+
+        try:
+            if per_page_param == 'all':
+                per_page = total_records or 1
+            else:
+                per_page = int(per_page_param)
+                if per_page <= 0:
+                    per_page = 100
+        except (ValueError, TypeError):
+            per_page = 100
+
+        total_pages = max((total_records + per_page - 1) // per_page, 1) if total_records else 1
+        if page < 1:
+            page = 1
+        if page > total_pages:
+            page = total_pages
+        offset = (page - 1) * per_page
+
+        if cert_status_exists:
+            status_table = 'Cert_PDF_Status' if not is_postgres() else '"Cert_PDF_Status"'
+            query = f"""
+                SELECT
+                    c.shipping_no,
+                    c.del_date,
+                    c.jobsite_no,
+                    c.jobsite_name,
+                    c.client_name,
+                    c.main_contractor,
+                    c.work_order_no,
+                    c.bbs_no_list,
+                    c.del_address,
+                    COALESCE(p.pdf_status, 'pending') AS pdf_status,
+                    p.pdf_path,
+                    p.generated_at
+                FROM cert_of_compliance c
+                LEFT JOIN {status_table} p ON c.shipping_no = p.shipping_no
+                {where_clause}
+                ORDER BY c.del_date DESC, c.shipping_no DESC
+                LIMIT {db_placeholders(1)} OFFSET {db_placeholders(1)}
+            """
+        else:
+            query = f"""
+                SELECT
+                    c.shipping_no,
+                    c.del_date,
+                    c.jobsite_no,
+                    c.jobsite_name,
+                    c.client_name,
+                    c.main_contractor,
+                    c.work_order_no,
+                    c.bbs_no_list,
+                    c.del_address,
+                    'pending' AS pdf_status,
+                    NULL AS pdf_path,
+                    NULL AS generated_at
+                FROM cert_of_compliance c
+                {where_clause}
+                ORDER BY c.del_date DESC, c.shipping_no DESC
+                LIMIT {db_placeholders(1)} OFFSET {db_placeholders(1)}
+            """
+
+        cursor.execute(query, params + [per_page, offset])
+        data = [dict(r) for r in cursor.fetchall()]
+        conn.close()
+
+        return jsonify({
+            'success': True,
+            'data': data,
+            'pagination': {
+                'current_page': page,
+                'per_page': per_page,
+                'total_records': total_records,
+                'total_pages': total_pages,
+            },
+        })
+    except Exception as e:
+        logger.error(f"cert-of-compliance list failed: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': _safe_error_message(e)}), 500
+
+
+@app.route('/api/cert-of-compliance/generate', methods=['POST'])
+@require_auth()
+@_route_limit(RATE_LIMIT_PDF_GENERATE)
+def generate_cert_pdf():
+    try:
+        if CertPDFTaskManager is None:
+            return jsonify({'success': False, 'error': 'Cert PDF task manager not available'}), 500
+        data = request.get_json(silent=True) or {}
+        shipping_no = data.get('shipping_no')
+        if not shipping_no:
+            return jsonify({'success': False, 'error': 'shipping_no is required'}), 400
+        user_id = g.current_user['id']
+        task_manager = CertPDFTaskManager(DB_PATH)
+        task_id = task_manager.create_task(user_id, int(shipping_no))
+
+        def process_async():
+            try:
+                task_manager.process_task(task_id, int(shipping_no))
+            except Exception as ex:
+                logger.error(f"Cert PDF background failed: {ex}", exc_info=True)
+
+        threading.Thread(target=process_async, daemon=True).start()
+        return jsonify({
+            'success': True,
+            'task_id': task_id,
+            'shipping_no': shipping_no,
+            'message': 'Certificate PDF generation task created',
+        }), 202
+    except Exception as e:
+        return jsonify({'success': False, 'error': _safe_error_message(e)}), 500
+
+
+@app.route('/api/cert-of-compliance/task-status/<task_id>', methods=['GET'])
+@require_auth()
+def get_cert_pdf_task_status(task_id):
+    try:
+        if CertPDFTaskManager is None:
+            return jsonify({'success': False, 'error': 'Cert PDF task manager not available'}), 500
+        task_manager = CertPDFTaskManager(DB_PATH)
+        task_status = task_manager.get_task_status(task_id, g.current_user['id'])
+        if not task_status:
+            return jsonify({'success': False, 'error': 'Task not found or access denied'}), 404
+        result = {
+            'success': True,
+            'task_id': task_status['task_id'],
+            'shipping_no': task_status['shipping_no'],
+            'status': task_status['status'],
+            'progress': task_status.get('progress') or 0,
+            'message': task_status.get('message') or '',
+        }
+        if task_status['status'] == 'completed':
+            result['pdf_path'] = task_status.get('pdf_path')
+            result['pdf_status'] = 'generated'
+        elif task_status['status'] == 'failed':
+            result['error_message'] = task_status.get('error_message', '')
+            result['pdf_status'] = 'failed'
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'success': False, 'error': _safe_error_message(e)}), 500
+
+
+@app.route('/api/cert-of-compliance/download/<int:shipping_no>', methods=['GET'])
+@require_auth()
+@_route_limit(RATE_LIMIT_DOWNLOAD_GET)
+def download_cert_pdf(shipping_no):
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        current_user = g.current_user
+
+        cursor.execute(
+            f"""
+            SELECT c.jobsite_no, c.del_date,
+                   p.pdf_path, p.pdf_status
+            FROM cert_of_compliance c
+            LEFT JOIN {"Cert_PDF_Status" if not is_postgres() else '"Cert_PDF_Status"'} p
+                ON c.shipping_no = p.shipping_no
+            WHERE c.shipping_no = {db_placeholders(1)}
+            """,
+            (shipping_no,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            conn.close()
+            return jsonify({'success': False, 'error': 'Shipping record not found'}), 404
+        info = dict(row)
+        if current_user.get('role') == 'user':
+            job_scope = {str(j).strip().upper() for j in _fetch_user_job_nos(conn, current_user['id']) if j}
+            job_val = str(info.get('jobsite_no') or '').strip().upper()
+            if not job_val or job_val not in job_scope:
+                conn.close()
+                return jsonify({'success': False, 'error': 'Not authorized for this Job No'}), 403
+
+        backend_dir = os.path.dirname(__file__)
+        pdf_path = info.get('pdf_path')
+        del_date = info.get('del_date')
+        abs_pdf_path = None
+        if pdf_path:
+            abs_pdf_path = os.path.normpath(
+                os.path.join(backend_dir, pdf_path) if not os.path.isabs(pdf_path) else pdf_path
+            )
+        if not abs_pdf_path or not os.path.exists(abs_pdf_path):
+            try:
+                from generate_cert_compliance_pdf import CertCompliancePDFGenerator
+                candidate = CertCompliancePDFGenerator.find_existing_pdf(
+                    backend_dir, shipping_no, del_date
+                )
+            except Exception:
+                candidate = None
+            if candidate and os.path.exists(candidate):
+                abs_pdf_path = candidate
+                rel_path = os.path.relpath(candidate, backend_dir)
+                if check_cert_pdf_status_table_exists(conn):
+                    st = '"Cert_PDF_Status"' if is_postgres() else 'Cert_PDF_Status'
+                    if is_postgres():
+                        cursor.execute(
+                            f"""
+                            INSERT INTO {st}
+                            (shipping_no, pdf_status, pdf_path, generated_at, updated_at)
+                            VALUES ({db_placeholders(1)}, 'generated', {db_placeholders(1)},
+                                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                            ON CONFLICT (shipping_no) DO UPDATE SET
+                                pdf_path = EXCLUDED.pdf_path,
+                                pdf_status = 'generated',
+                                updated_at = CURRENT_TIMESTAMP
+                            """,
+                            (shipping_no, rel_path),
+                        )
+                    else:
+                        cursor.execute(
+                            f"""
+                            INSERT OR REPLACE INTO {st}
+                            (shipping_no, pdf_status, pdf_path, generated_at, updated_at)
+                            VALUES ({db_placeholders(1)}, 'generated', {db_placeholders(1)},
+                                    CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                            """,
+                            (shipping_no, rel_path),
+                        )
+                    conn.commit()
+        conn.close()
+        if not abs_pdf_path or not os.path.exists(abs_pdf_path):
+            return jsonify({'success': False, 'error': 'Certificate PDF not found. Generate it first.'}), 404
+        allowed = os.path.normpath(os.path.join(backend_dir, 'Generated_Cert_PDFs'))
+        if not os.path.abspath(abs_pdf_path).startswith(allowed):
+            return jsonify({'success': False, 'error': 'Invalid file path'}), 403
+        return send_file(
+            abs_pdf_path,
+            as_attachment=True,
+            download_name=os.path.basename(abs_pdf_path),
+            mimetype='application/pdf',
+        )
+    except Exception as e:
+        return jsonify({'success': False, 'error': _safe_error_message(e)}), 500
+
+
+@app.route('/api/cert-of-compliance/batch-download', methods=['POST'])
+@require_auth()
+@_route_limit(RATE_LIMIT_HEAVY_POST)
+def batch_download_cert_pdf():
+    try:
+        data = request.get_json(silent=True) or {}
+        shipping_nos = data.get('shipping_nos', [])
+        if not shipping_nos:
+            return jsonify({'success': False, 'error': 'No shipping numbers provided'}), 400
+        if len(shipping_nos) > 200:
+            return jsonify({'success': False, 'error': 'Maximum 200 shipping numbers per batch'}), 400
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        current_user = g.current_user
+        user_job_scope = set()
+        if current_user.get('role') == 'user':
+            user_job_scope = {str(j).strip().upper() for j in _fetch_user_job_nos(conn, current_user['id']) if j}
+            if not user_job_scope:
+                conn.close()
+                return jsonify({'success': False, 'error': 'No authorized Job No'}), 403
+
+        shipping_nos_int = [int(x) for x in shipping_nos]
+        placeholders = ','.join([db_placeholders(1)] * len(shipping_nos_int))
+        status_table = 'Cert_PDF_Status' if not is_postgres() else '"Cert_PDF_Status"'
+        cursor.execute(
+            f"""
+            SELECT c.shipping_no, c.del_date, c.jobsite_no, p.pdf_path, p.pdf_status
+            FROM cert_of_compliance c
+            LEFT JOIN {status_table} p ON c.shipping_no = p.shipping_no
+            WHERE c.shipping_no IN ({placeholders})
+            """,
+            shipping_nos_int,
+        )
+        rows = cursor.fetchall()
+        conn.close()
+
+        backend_dir = os.path.dirname(__file__)
+        allowed_dir = os.path.normpath(os.path.join(backend_dir, 'Generated_Cert_PDFs'))
+        pdf_files = []
+        missing = []
+
+        def sanitize_folder(value):
+            if not value:
+                return 'Unknown_Date'
+            text = str(value).strip()[:10].replace('/', '-')
+            return text or 'Unknown_Date'
+
+        for row in rows:
+            info = dict(row)
+            sn = info['shipping_no']
+            job_val = str(info.get('jobsite_no') or '').strip().upper()
+            if current_user.get('role') == 'user' and (not job_val or job_val not in user_job_scope):
+                continue
+            pdf_path = info.get('pdf_path')
+            del_date = info.get('del_date')
+            abs_path = None
+            if pdf_path:
+                abs_path = os.path.normpath(
+                    os.path.join(backend_dir, pdf_path) if not os.path.isabs(pdf_path) else pdf_path
+                )
+            if not abs_path or not os.path.exists(abs_path):
+                try:
+                    from generate_cert_compliance_pdf import CertCompliancePDFGenerator
+                    candidate = CertCompliancePDFGenerator.find_existing_pdf(
+                        backend_dir, sn, del_date
+                    )
+                except Exception:
+                    candidate = None
+                if candidate and os.path.exists(candidate):
+                    abs_path = candidate
+            if not abs_path or not os.path.exists(abs_path):
+                missing.append(sn)
+                continue
+            if not os.path.abspath(abs_path).startswith(allowed_dir):
+                missing.append(sn)
+                continue
+            pdf_files.append({
+                'shipping_no': sn,
+                'path': abs_path,
+                'del_date': sanitize_folder(del_date),
+                'job_no': job_val or 'Unknown',
+            })
+
+        if not pdf_files:
+            return jsonify({
+                'success': False,
+                'error': 'No valid certificate PDF files to download',
+                'missing': missing,
+            }), 400
+
+        temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
+        temp_zip_path = temp_zip.name
+        temp_zip.close()
+        with zipfile.ZipFile(temp_zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for item in sorted(pdf_files, key=lambda x: (x['del_date'], x['job_no'], str(x['shipping_no']))):
+                arc = f"{item['del_date']}/Job_No_{item['job_no']}/{os.path.basename(item['path'])}"
+                zipf.write(item['path'], arc)
+        return send_file(
+            temp_zip_path,
+            as_attachment=True,
+            download_name=f'Cert_Compliance_{datetime.now().strftime("%Y%m%d_%H%M%S")}.zip',
+            mimetype='application/zip',
+        )
+    except Exception as e:
+        logger.error(f"cert batch download failed: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': _safe_error_message(e)}), 500
+
+
 @app.route('/api/pdf/generate', methods=['POST'])
 @require_auth()
 @_route_limit(RATE_LIMIT_PDF_GENERATE)
@@ -3874,6 +4989,8 @@ def download_pdf(order_no):
         # 使用转换后的绝对路径
         pdf_path = abs_pdf_path
         conn.close()
+
+        _audit_log_download('tr_pdf_single', [order_no])
         
         # 返回PDF文件
         return send_file(
@@ -4199,6 +5316,19 @@ def batch_download_pdf():
             zip_filename = f'Orders_{datetime.now().strftime("%Y%m%d_%H%M%S")}.zip'
             
             logger.info(f"[BATCH DOWNLOAD] Returning ZIP file: {zip_filename}, path: {temp_zip_path}")
+
+            delivered_orders = [pf['order_no'] for pf in pdf_files]
+            audit_extra = f"requested={','.join(order_nos_str)}"
+            if missing_files:
+                audit_extra += f" missing={','.join(str(o) for o in missing_files)}"
+            _audit_log_download(
+                'tr_pdf_batch',
+                delivered_orders,
+                zip_size=zip_size,
+                file_count=len(pdf_files),
+                zip_name=zip_filename,
+                extra=audit_extra,
+            )
             
             return send_file(
                 temp_zip_path,
@@ -4251,92 +5381,65 @@ def health_check():
 @_route_limit(RATE_LIMIT_SYSTEM_POST)
 def update_all_tables():
     """
-    执行数据更新（调用批处理文件）
-    仅管理员可以执行
+    全量更新：异步顺序执行
+      阶段 A — EXEC dbo.sync_tr_data（日志 sync_tr_data_*.log）
+      阶段 B — update_tr_tables_postgres.bat / 计划任务 TR_PostgreSQL_Update
+    仅管理员；同一时刻仅允许一单作业（409）。
     """
     try:
-        # 批处理文件路径
-        batch_file = r'C:\TR-master\TR database\auto_update_all_tables.bat'
-        # 可由环境变量覆盖的计划任务名称（任务需预先配置为“使用最高权限运行”）
-        scheduled_task_name = os.getenv('UPDATE_ALL_TABLES_TASK_NAME', 'TR-Auto-Update-All-Tables')
-        
-        # 检查文件是否存在
+        batch_file = os.getenv(
+            'UPDATE_TR_TABLES_POSTGRES_BAT',
+            r'C:\TR-master\TR database\auto_update_postgres_for_ui.bat',
+        )
+        scheduled_task_name = os.getenv('UPDATE_POSTGRES_TASK_NAME', 'TR_PostgreSQL_Update')
+
         if not os.path.exists(batch_file):
             return jsonify({
                 'success': False,
                 'error': f'批处理文件不存在: {batch_file}'
             }), 404
-        
-        # 优先使用计划任务触发（可实现管理员权限运行）
-        # 注意：Web 后端进程无法直接无交互弹出 UAC 并提权，推荐通过“最高权限”计划任务执行。
-        try:
-            task_cmd = ['schtasks', '/Run', '/TN', scheduled_task_name]
-            task_proc = subprocess.run(
-                task_cmd,
-                capture_output=True,
-                text=True,
-                shell=False,
-                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
-            )
-            if task_proc.returncode == 0:
-                return jsonify({
-                    'success': True,
-                    'message': f'数据更新已通过计划任务启动: {scheduled_task_name}',
-                    'status': 'running',
-                    'runner': 'scheduled_task'
-                })
-            else:
-                logger.warning(
-                    f"Scheduled task start failed ({scheduled_task_name}): "
-                    f"code={task_proc.returncode}, stderr={task_proc.stderr.strip()}"
-                )
-        except Exception as task_error:
-            logger.warning(f"Scheduled task start exception ({scheduled_task_name}): {task_error}")
 
-        # 计划任务不可用时，回退到旧逻辑：在后台线程中执行批处理文件（可能受权限限制）
-        def run_batch():
-            try:
-                # 切换到批处理文件所在目录
-                batch_dir = os.path.dirname(batch_file)
-                # 执行批处理文件
-                process = subprocess.Popen(
-                    batch_file,
-                    cwd=batch_dir,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    shell=True,
-                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
-                )
-                # 等待执行完成（不阻塞主线程）
-                stdout, stderr = process.communicate()
-                return process.returncode == 0, stdout.decode('utf-8', errors='ignore'), stderr.decode('utf-8', errors='ignore')
-            except Exception as e:
-                return False, '', _safe_error_message(e)
-        
-        # 启动后台线程执行
-        result_container = {'success': None, 'stdout': '', 'stderr': '', 'error': None}
-        
-        def execute():
-            try:
-                success, stdout, stderr = run_batch()
-                result_container['success'] = success
-                result_container['stdout'] = stdout
-                result_container['stderr'] = stderr
-            except Exception as e:
-                result_container['error'] = _safe_error_message(e)
-        
-        thread = threading.Thread(target=execute, daemon=True)
+        eff = _effective_full_update_state()
+        if eff.get('phase') in ('sync', 'batch'):
+            return jsonify({
+                'success': False,
+                'error': '已有数据更新正在执行，请等待完成后再试',
+            }), 409
+
+        with _full_update_lock:
+            if _full_update_state.get('phase') in ('sync', 'batch'):
+                return jsonify({
+                    'success': False,
+                    'error': '已有数据更新正在执行，请等待完成后再试',
+                }), 409
+            run_id = str(uuid.uuid4())
+            _full_update_state.update({
+                'run_id': run_id,
+                'phase': 'sync',
+                'message': '已排队：即将执行阶段A...',
+                'phase_a_log': None,
+                'phase_b_log': None,
+                'started_at': datetime.now().isoformat(),
+                'finished_at': None,
+            })
+        _persist_full_update_state()
+
+        thread = threading.Thread(
+            target=_full_update_worker,
+            args=(run_id, batch_file, scheduled_task_name),
+            daemon=True,
+        )
         thread.start()
-        
-        # 立即返回，告诉前端已开始执行
+
         return jsonify({
             'success': True,
-            'message': '数据更新已启动，正在后台执行',
-            'status': 'running'
+            'message': '全量更新已启动（阶段A→阶段B），请通过状态接口轮询进度',
+            'status': 'running',
+            'run_id': run_id,
+            'poll_hint_sec': 5,
         })
-        
+
     except Exception as e:
-        import traceback
         logger.error(f"启动数据更新失败: {e}")
         traceback.print_exc()
         return jsonify({
@@ -4349,86 +5452,93 @@ def update_all_tables():
 @require_auth(role='admin')
 def check_update_status():
     """
-    检查更新状态（通过检查最近的日志文件）
+    检查全量更新状态：优先返回后台作业阶段（sync / batch / completed / failed）；
+    无进行中的作业时，回退为读取 auto_update_all 输出 *.log / *.txt（兼容手工跑批处理）。
     """
     try:
-        import glob
         import time
-        
-        log_dir = r'C:\TR-master\TR database\logs'
+
+        st = _effective_full_update_state()
+        # 内存中的作业状态不含 _persisted_at（仅写入 JSON 时附带），从磁盘补全以便核对 mtime 门槛正确
+        disk_snap = _load_full_update_state_disk()
+        if (
+            disk_snap
+            and isinstance(disk_snap, dict)
+            and disk_snap.get("run_id") is not None
+            and disk_snap.get("run_id") == st.get("run_id")
+            and disk_snap.get("_persisted_at") is not None
+        ):
+            st = dict(st)
+            st["_persisted_at"] = disk_snap["_persisted_at"]
+
+        rec = try_reconcile_full_update_from_logs(st)
+        if rec is not None:
+            _merge_reconciled_full_update_into_memory(rec)
+            st = rec
+
+        if st.get('phase') in ('sync', 'batch', 'completed', 'failed'):
+            phase = st['phase']
+            api_status = 'running' if phase in ('sync', 'batch') else phase
+            return jsonify({
+                'success': True,
+                'status': api_status,
+                'phase': phase,
+                'message': st.get('message') or '',
+                'run_id': st.get('run_id'),
+                'phase_a_log': st.get('phase_a_log'),
+                'phase_b_log': st.get('phase_b_log'),
+                'started_at': st.get('started_at'),
+                'finished_at': st.get('finished_at'),
+            })
+
+        log_dir = resolve_tr_update_log_dir()
         if not os.path.exists(log_dir):
             return jsonify({
                 'success': True,
                 'status': 'unknown',
-                'message': '日志目录不存在'
+                'message': '日志目录不存在',
+                'phase': 'idle',
             })
-        
-        # 查找最新的日志文件
-        log_files = glob.glob(os.path.join(log_dir, 'auto_update_all_*.log'))
+
+        log_files = glob_auto_update_all_outputs(log_dir)
         if not log_files:
             return jsonify({
                 'success': True,
                 'status': 'unknown',
-                'message': '未找到更新日志'
+                'message': '未找到更新日志',
+                'phase': 'idle',
             })
-        
-        # 获取最新的日志文件
+
         latest_log = max(log_files, key=os.path.getmtime)
-        
-        # 检查文件修改时间
-        mtime = os.path.getmtime(latest_log)
-        time_diff = time.time() - mtime
-        
-        # 如果文件在最近5分钟内被修改，说明正在运行
-        if time_diff < 300:  # 5分钟
-            # 读取最后几行日志判断状态
-            try:
-                with open(latest_log, 'r', encoding='utf-8', errors='ignore') as f:
-                    lines = f.readlines()
-                    last_lines = ''.join(lines[-10:]) if len(lines) > 10 else ''.join(lines)
-                    
-                    if '自动更新流程结束' in last_lines or '更新流程结束' in last_lines:
-                        if '成功' in last_lines or '🎉' in last_lines:
-                            status = 'completed'
-                            message = '更新已完成'
-                        else:
-                            status = 'failed'
-                            message = '更新可能失败，请查看日志'
-                    else:
-                        status = 'running'
-                        message = '更新正在进行中'
-            except:
-                status = 'running'
-                message = '更新可能正在进行中'
+        lm = os.path.getmtime(latest_log)
+        time_diff = time.time() - lm
+
+        phase_b_st, phase_b_msg = auto_update_log_phase_b_status(
+            latest_log, recent_secs=300.0 if time_diff < 300 else 0.0
+        )
+        if phase_b_st == 'completed':
+            status, message = 'completed', '更新已完成'
+        elif phase_b_st == 'failed':
+            status, message = 'failed', (
+                '更新可能失败，请查看日志' if time_diff < 300 else '更新可能失败'
+            )
+        elif phase_b_st == 'running':
+            status, message = 'running', (
+                '更新正在进行中' if time_diff < 300 else '更新可能仍在进行'
+            )
         else:
-            # 读取日志判断最终状态
-            try:
-                with open(latest_log, 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f.read()
-                    if '自动更新流程结束' in content or '更新流程结束' in content:
-                        if '成功' in content or '🎉' in content:
-                            status = 'completed'
-                            message = '更新已完成'
-                        else:
-                            status = 'failed'
-                            message = '更新可能失败'
-                    else:
-                        status = 'unknown'
-                        message = '无法确定状态'
-            except:
-                status = 'unknown'
-                message = '无法读取日志'
-        
+            status, message = 'unknown', phase_b_msg or '无法确定状态'
+
         return jsonify({
             'success': True,
             'status': status,
             'message': message,
             'log_file': latest_log,
-            'last_modified': datetime.fromtimestamp(mtime).isoformat()
+            'last_modified': datetime.fromtimestamp(lm).isoformat(),
+            'phase': 'idle',
         })
-        
+
     except Exception as e:
-        import traceback
         logger.error(f"检查更新状态失败: {e}")
         traceback.print_exc()
         return jsonify({
@@ -5825,17 +6935,25 @@ def edit_orders_gen_pdf(order_no: int):
         return jsonify(payload), 500
 
 if __name__ == '__main__':
-    # 检查数据库是否存在
-    if not os.path.exists(DB_PATH):
+    from db_adapter import POSTGRES_DSN as _PG_DSN
+
+    if is_postgres():
+        if not _PG_DSN:
+            logger.error("POSTGRES_DSN is required when DB_BACKEND=postgres")
+            exit(1)
+        db_label = f"PostgreSQL ({_PG_DSN})"
+    elif not os.path.exists(DB_PATH):
         logger.error(f"Database not found: {DB_PATH}")
         logger.error("Please ensure data_3years.db exists in the TR database directory.")
         exit(1)
+    else:
+        db_label = DB_PATH
     
     start_background_services()
 
     logger.info("=" * 50)
     logger.info("TR Fill In API Server")
-    logger.info(f"Database: {DB_PATH}")
+    logger.info(f"Database: {db_label}")
     logger.info("=" * 50)
     logger.info("\nAvailable endpoints:")
     logger.info("  POST /api/auth/login - User login")
