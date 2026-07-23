@@ -273,15 +273,16 @@ createApp({
             }
         },
         isAllSelected() {
+            const selectable = this.filteredRecords.filter(r => this.isRecordSelectable(r));
             const currentSelected = this.currentSelectedRecords;
-            return this.filteredRecords.length > 0 && 
-                   this.filteredRecords.every(record => currentSelected.includes(record.id));
+            return selectable.length > 0 &&
+                   selectable.every(record => currentSelected.includes(record.id));
         },
         selectedGeneratedCount() {
             const currentSelected = this.currentSelectedRecords;
             return currentSelected.filter(id => {
                 const record = this.records.find(r => r.id === id);
-                return record && record.status === 'generated';
+                return record && this.isRecordSelectable(record) && record.status === 'generated';
             }).length;
         },
         hasSelectedGeneratedRecords() {
@@ -291,7 +292,7 @@ createApp({
             const currentSelected = this.currentSelectedRecords;
             return currentSelected.filter(id => {
                 const record = this.records.find(r => r.id === id);
-                return record && record.status !== 'generated';
+                return record && this.isRecordSelectable(record) && record.status !== 'generated';
             }).length;
         },
         hasSelectedPendingRecords() {
@@ -493,7 +494,8 @@ createApp({
                         delDate: formatDateToYYYYMMDD(order.Del_Date),
                         status: (order.pdf_status || '').toLowerCase() || 'pending',
                         pdfPath: order.pdf_path || null,
-                        generatedAt: order.generated_at || null
+                        generatedAt: order.generated_at || null,
+                        ...this.mapOrderCompleteness(order)
                     }));
                 } else {
                     // TR记录管理标签页：从 TR_Report_Deduplication 表获取数据
@@ -510,7 +512,8 @@ createApp({
                         rmDnNo: order.rm_dn_no || '',
                         status: (order.pdf_status || '').toLowerCase() || 'pending',
                         pdfPath: order.pdf_path || null,
-                        generatedAt: order.generated_at || null
+                        generatedAt: order.generated_at || null,
+                        ...this.mapOrderCompleteness(order)
                     }));
                 }
 
@@ -586,7 +589,8 @@ createApp({
                         delDate: formatDateToYYYYMMDD(order.Del_Date),
                         status: (order.pdf_status || '').toLowerCase() || 'pending',
                         pdfPath: order.pdf_path || null,
-                        generatedAt: order.generated_at || null
+                        generatedAt: order.generated_at || null,
+                        ...this.mapOrderCompleteness(order)
                     }));
                 } else {
                     // TR记录管理标签页：从 TR_Report_Deduplication 表获取数据
@@ -603,7 +607,8 @@ createApp({
                         rmDnNo: order.rm_dn_no || '',
                         status: (order.pdf_status || '').toLowerCase() || 'pending',
                         pdfPath: order.pdf_path || null,
-                        generatedAt: order.generated_at || null
+                        generatedAt: order.generated_at || null,
+                        ...this.mapOrderCompleteness(order)
                     }));
                 }
 
@@ -637,6 +642,10 @@ createApp({
             // admin和manager可以重新生成PDF
             if (this.userInfo.role !== 'admin' && this.userInfo.role !== 'manager') {
                 alert('只有管理員和管理帳號可以重新生成 PDF');
+                return;
+            }
+            if (!this.isRecordSelectable(record)) {
+                alert(`Order ${record.orderNo} ${this.incompleteHint(record)}`);
                 return;
             }
             
@@ -684,6 +693,10 @@ createApp({
             // admin和manager可以生成PDF
             if (this.userInfo.role !== 'admin' && this.userInfo.role !== 'manager') {
                 alert('只有管理員和管理帳號可以生成 PDF');
+                return;
+            }
+            if (!this.isRecordSelectable(record)) {
+                alert(`Order ${record.orderNo} ${this.incompleteHint(record)}`);
                 return;
             }
             if (!confirm(`确定要生成 Order ${record.orderNo} 的PDF吗？`)) {
@@ -1298,6 +1311,11 @@ createApp({
                 event.target.closest('input')) {
                 return;
             }
+
+            if (!this.isRecordSelectable(record)) {
+                alert(`Order ${record.orderNo} ${this.incompleteHint(record)}`);
+                return;
+            }
             
             // 如果 PDF 已生成，点击行就下载
             if (record.status === 'generated') {
@@ -1407,7 +1425,8 @@ createApp({
                         delDate: formatDateToYYYYMMDD(order.Del_Date),
                         status: (order.pdf_status || 'pending').toLowerCase(),
                         pdfPath: order.pdf_path || null,
-                        generatedAt: order.generated_at || null
+                        generatedAt: order.generated_at || null,
+                        ...this.mapOrderCompleteness(order)
                     });
                 } else {
                     dataMapping = (order) => ({
@@ -1423,7 +1442,8 @@ createApp({
                         rmDnNo: order.rm_dn_no || '',
                         status: (order.pdf_status || 'pending').toLowerCase(),
                         pdfPath: order.pdf_path || null,
-                        generatedAt: order.generated_at || null
+                        generatedAt: order.generated_at || null,
+                        ...this.mapOrderCompleteness(order)
                     });
                 }
                 
@@ -1598,7 +1618,10 @@ createApp({
             } catch (error) {
                 console.error('啟動更新失敗:', error);
                 this.updateDataStatus = 'failed';
-                this.updateDataMessage = error.message || '啟動更新失敗，請稍後再試';
+                const raw = (error && error.message) ? String(error.message) : '';
+                this.updateDataMessage = raw.includes('正在執行') || raw.includes('等待完成')
+                    ? raw
+                    : (raw || '啟動更新失敗，請稍後再試');
                 this.updateDataLoading = false;
             }
         },
@@ -1752,8 +1775,34 @@ createApp({
             if (this.isAllSelected) {
                 this.currentSelectedRecordsModel = [];
             } else {
-                this.currentSelectedRecordsModel = this.filteredRecords.map(record => record.id);
+                this.currentSelectedRecordsModel = this.filteredRecords
+                    .filter(record => this.isRecordSelectable(record))
+                    .map(record => record.id);
             }
+        },
+
+        isRecordSelectable(record) {
+            if (!record) return false;
+            if (record.selectable === false) return false;
+            if ((record.trStatus || '').toLowerCase() === 'incomplete') return false;
+            return true;
+        },
+
+        mapOrderCompleteness(order) {
+            const trStatus = (order.tr_status || 'complete').toLowerCase();
+            const selectable = order.selectable !== false && trStatus !== 'incomplete';
+            return {
+                trStatus,
+                missingDiameters: order.missing_diameters || null,
+                selectable
+            };
+        },
+
+        incompleteHint(record) {
+            const miss = record && record.missingDiameters ? String(record.missingDiameters) : '';
+            return miss
+                ? `缺少 TR 数据（直径: ${miss}），不可勾选/生成/下载`
+                : '缺少 TR 数据，不可勾选/生成/下载';
         },
 
         clearSelection() {
@@ -1772,6 +1821,8 @@ createApp({
             // 这样即使搜索后 records 被更新，也能正确获取所有选中的订单号
             const orderNos = currentSelected
                 .map(id => {
+                    const record = this.records.find(r => r.id === id);
+                    if (record && !this.isRecordSelectable(record)) return null;
                     // id 就是 Order_No，但需要确保是数字或字符串格式
                     const orderNo = typeof id === 'number' ? id : parseInt(id);
                     return isNaN(orderNo) ? null : orderNo;
@@ -1779,7 +1830,7 @@ createApp({
                 .filter(no => no != null && no > 0);
 
             if (orderNos.length === 0) {
-                alert('选中的记录中没有有效的订单号！');
+                alert('选中的记录中没有可下载的订单（缺少 TR 的订单不可下载）！');
                 return;
             }
 
@@ -1896,13 +1947,15 @@ createApp({
 
             const orderNos = currentSelected
                 .map(id => {
+                    const record = this.records.find(r => r.id === id);
+                    if (record && !this.isRecordSelectable(record)) return null;
                     const orderNo = typeof id === 'number' ? id : parseInt(id);
                     return isNaN(orderNo) ? null : orderNo;
                 })
                 .filter(no => no != null && no > 0);
 
             if (orderNos.length === 0) {
-                alert('选中的记录中没有有效的订单号！');
+                alert('选中的记录中没有可下载的订单（缺少 TR 的订单不可下载）！');
                 return;
             }
 
@@ -1989,13 +2042,15 @@ createApp({
             // 直接使用 currentSelected 中的 id（它们就是 Order_No）
             const orderNos = currentSelected
                 .map(id => {
+                    const record = this.records.find(r => r.id === id);
+                    if (record && !this.isRecordSelectable(record)) return null;
                     const orderNo = typeof id === 'number' ? id : parseInt(id);
                     return isNaN(orderNo) ? null : orderNo;
                 })
                 .filter(no => no != null && no > 0);
 
             if (orderNos.length === 0) {
-                alert('选中的记录中没有有效的订单号！');
+                alert('选中的记录中没有可下载的订单（缺少 TR 的订单不可下载）！');
                 return;
             }
 
@@ -2089,13 +2144,15 @@ createApp({
             // 直接使用 currentSelected 中的 id（它们就是 Order_No）
             const orderNos = currentSelected
                 .map(id => {
+                    const record = this.records.find(r => r.id === id);
+                    if (record && !this.isRecordSelectable(record)) return null;
                     const orderNo = typeof id === 'number' ? id : parseInt(id);
                     return isNaN(orderNo) ? null : orderNo;
                 })
                 .filter(no => no != null && no > 0);
 
             if (orderNos.length === 0) {
-                alert('选中的记录中没有有效的订单号！');
+                alert('选中的记录中没有可下载的订单（缺少 TR 的订单不可下载）！');
                 return;
             }
 
@@ -2725,10 +2782,10 @@ createApp({
             const currentSelected = this.currentSelectedRecords;
             const selectedPendingRecords = currentSelected
                 .map(id => this.records.find(r => r.id === id))
-                .filter(record => record && record.status !== 'generated');
+                .filter(record => record && this.isRecordSelectable(record) && record.status !== 'generated');
 
             if (selectedPendingRecords.length === 0) {
-                alert('没有可生成的记录！');
+                alert('没有可生成的记录！缺少 TR 的订单不可生成。');
                 return;
             }
 
@@ -2910,7 +2967,7 @@ createApp({
             const currentSelected = this.currentSelectedRecords;
             const selectedGeneratedRecords = currentSelected
                 .map(id => this.records.find(r => r.id === id))
-                .filter(record => record && (record.status === 'generated' || record.status === 'pending'));
+                .filter(record => record && this.isRecordSelectable(record) && (record.status === 'generated' || record.status === 'pending'));
 
             if (selectedGeneratedRecords.length === 0) {
                 alert('没有可重新生成的记录！请选择状态为"已生成"的记录。');

@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>TR記錄管理 - TR Report System</title>
     <link rel="stylesheet" href="styles/dashboard.css">
-    <link rel="stylesheet" href="styles/tr-records.css">
+    <link rel="stylesheet" href="styles/tr-records.css?v=20260722stockstatus">
     <script src="scripts/vue.global.js"></script>
     <script src="config.js?v=20260224a"></script>
 </head>
@@ -212,6 +212,8 @@
                                             :value="record.id"
                                             v-model="currentSelectedRecordsModel"
                                             class="record-checkbox"
+                                            :disabled="!isRecordSelectable(record)"
+                                            :title="isRecordSelectable(record) ? '' : incompleteHint(record)"
                                             @click.stop
                                         >
                                     </td>
@@ -223,7 +225,10 @@
                                     <td>{{ record.client }}</td>
                                     <td>{{ record.delDate }}</td>
                                     <td class="status-cell">
-                                        <span v-if="record.status === 'generated'" class="status-badge generated">
+                                        <span v-if="!isRecordSelectable(record)" class="status-badge incomplete" :title="incompleteHint(record)">
+                                            缺 TR
+                                        </span>
+                                        <span v-else-if="record.status === 'generated'" class="status-badge generated">
                                             ✅ 已生成
                                         </span>
                                         <span v-else-if="record.status === 'failed'" class="status-badge failed">
@@ -235,27 +240,28 @@
                                     </td>
                                     <td class="action-cell" @click.stop>
                                         <button 
-                                            v-if="record.status === 'pending' || record.status === 'failed'"
+                                            v-if="isRecordSelectable(record) && (record.status === 'pending' || record.status === 'failed')"
                                             class="generate-btn" 
                                             @click="generatePDF(record)"
                                         >
                                             📄 生成
                                         </button>
                                         <button 
-                                            v-if="record.status === 'generated'" 
+                                            v-if="isRecordSelectable(record) && record.status === 'generated'" 
                                             class="download-btn" 
                                             @click="downloadRecord(record)"
                                         >
                                             📥 下載
                                         </button>
                                         <button 
-                                            v-if="record.status === 'generated' && (userInfo.role === 'admin' || userInfo.role === 'manager')" 
+                                            v-if="isRecordSelectable(record) && record.status === 'generated' && (userInfo.role === 'admin' || userInfo.role === 'manager')" 
                                             class="generate-btn" 
                                             @click.stop="regeneratePDF(record)"
                                             :title="'重新生成 Order ' + record.orderNo + ' 的PDF'"
                                         >
                                             🔄 生成
                                         </button>
+                                        <span v-if="!isRecordSelectable(record)" class="incomplete-action-hint" :title="incompleteHint(record)">不可操作</span>
                                     </td>
                                 </tr>
                                 <tr v-if="filteredRecords.length === 0">
@@ -545,12 +551,13 @@
                                 <th>JobsiteType</th>
                                 <th>DD_No</th>
                                 <th>Del_Date</th>
+                                <th>狀態</th>
                             </tr>
                         </thead>
                         <tbody>
                             <!-- 載入狀態 -->
                             <tr v-if="loading">
-                                <td colspan="7" class="loading-row">
+                                <td colspan="8" class="loading-row">
                                     <div class="table-loading">
                                         <div class="loading-spinner-small"></div>
                                         <span>正在載入數據...</span>
@@ -559,13 +566,15 @@
                             </tr>
                             <!-- 數據行 -->
                             <template v-else>
-                                <tr v-for="record in filteredRecords" :key="record.id">
+                                <tr v-for="record in filteredRecords" :key="record.id" :class="{ 'row-incomplete': !isRecordSelectable(record) }">
                                     <td class="checkbox-column">
                                         <input 
                                             type="checkbox" 
                                             :value="record.id"
                                             v-model="currentSelectedRecordsModel"
                                             class="record-checkbox"
+                                            :disabled="!isRecordSelectable(record)"
+                                            :title="isRecordSelectable(record) ? '' : incompleteHint(record)"
                                         >
                                     </td>
                                     <td>{{ record.orderNo }}</td>
@@ -574,9 +583,17 @@
                                     <td>{{ record.jobsiteType }}</td>
                                     <td>{{ record.rmDnNo }}</td>
                                     <td>{{ record.delDate }}</td>
+                                    <td class="status-cell">
+                                        <span
+                                            v-if="!isRecordSelectable(record)"
+                                            class="status-badge incomplete"
+                                            :title="incompleteHint(record)"
+                                        >缺 TR</span>
+                                        <span v-else class="status-badge complete">正常</span>
+                                    </td>
                                 </tr>
                                 <tr v-if="filteredRecords.length === 0">
-                                    <td colspan="7" class="no-data">暫無數據</td>
+                                    <td colspan="8" class="no-data">暫無數據</td>
                                 </tr>
                             </template>
                         </tbody>
@@ -684,7 +701,7 @@
         </div>
     </div>
 
-    <script src="scripts/tr-records.js?v=20260605d"></script>
+    <script src="scripts/tr-records.js?v=20260722incomplete"></script>
 </body>
 </html>
 

@@ -371,11 +371,50 @@ def update_file_index():
         logger.error(traceback.format_exc())
         return {'status': 'failed', 'error': str(e)}
 
-def main():
-    """Main function"""
+def main(skip_lock: bool = False):
+    """Main function.
+
+    skip_lock: when True, caller already holds TrUpdateLock on a dedicated
+    connection in this process (UI full-update Model B). Do not acquire again.
+    """
     global logger
     logger = setup_logging()
-    
+
+    lock = None
+    if not skip_lock and DB_BACKEND == 'postgres':
+        try:
+            from tr_update_lock import TrUpdateLock
+
+            source = os.getenv('TR_UPDATE_LOCK_SOURCE', 'scheduled_or_manual').strip() or 'scheduled_or_manual'
+            lock = TrUpdateLock(source=source)
+            if not lock.try_acquire():
+                busy = TrUpdateLock.is_held()
+                logger.warning("=" * 50)
+                logger.warning("[SKIP] Another TR PostgreSQL update is already running.")
+                logger.warning(f"[SKIP] {busy.message}")
+                logger.warning("[SKIP] Exiting without writing tables (prevents TR_Report doubling).")
+                logger.warning("=" * 50)
+                return 0  # soft skip for Task Scheduler
+        except Exception as lock_exc:
+            logger.error(f"[ERROR] Failed to acquire update lock: {lock_exc}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return 1
+
+    try:
+        return _run_update_body()
+    finally:
+        if lock is not None:
+            try:
+                lock.release()
+            except Exception as rel_exc:
+                logger.warning(f"[WARNING] lock release failed: {rel_exc}")
+
+
+def _run_update_body():
+    """Actual table update steps (assumes lock already held or not required)."""
+    global logger
+
     logger.info("=" * 50)
     logger.info("TR Database Tables Update Started")
     logger.info(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -446,7 +485,7 @@ def main():
     logger.info("")
     
     # Step 4: Update TR_Report_Deduplication table
-    logger.info("[Step 4/5] Updating TR_Report_Deduplication table...")
+    logger.info("[Step 4/6] Updating TR_Report_Deduplication table...")
     if run_script('update_tr_report_deduplication.py', 'TR_Report_Deduplication table update'):
         count = get_table_count('TR_Report_Deduplication')
         if count is not None:
@@ -465,7 +504,7 @@ def main():
     logger.info("")
     
     # Step 5: Update file_index_cache table
-    logger.info("[Step 5/5] Updating file_index_cache table...")
+    logger.info("[Step 5/6] Updating file_index_cache table...")
     file_index_result = update_file_index()
     if file_index_result.get('status') == 'success':
         stats = file_index_result.get('stats', {})
@@ -487,6 +526,17 @@ def main():
         logger.warning(f"[WARNING] file_index_cache table update failed: {file_index_result.get('error', 'Unknown error')}")
     
     logger.info("")
+
+    # Step 6: Mark incomplete BBS (missing TR) for UI selectable=false
+    logger.info("[Step 6/6] Rebuilding bbs_tr_status (incomplete / missing TR)...")
+    if run_script('rebuild_bbs_tr_status.py', 'bbs_tr_status rebuild'):
+        logger.info("[SUCCESS] bbs_tr_status rebuild completed")
+        update_results['bbs_tr_status'] = {'status': 'Updated', 'count': None}
+    else:
+        logger.warning("[WARNING] bbs_tr_status rebuild failed (non-fatal)")
+        update_results['bbs_tr_status'] = {'status': 'Failed', 'count': None}
+
+    logger.info("")
     logger.info("=" * 50)
     logger.info("TR Database Tables Update Completed")
     logger.info(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -495,8 +545,8 @@ def main():
     # Send notification email
     if update_success:
         message = (
-            "bbs_dd, cert_of_compliance, TR_Report, TR_Report_Deduplication "
-            "and file_index_cache tables updated successfully"
+            "bbs_dd, cert_of_compliance, TR_Report, TR_Report_Deduplication, "
+            "file_index_cache and bbs_tr_status updated successfully"
         )
     else:
         message = error_message
@@ -515,7 +565,7 @@ def main():
 
 if __name__ == '__main__':
     try:
-        exit_code = main()
+        exit_code = main(skip_lock=False)
         sys.exit(exit_code)
     except KeyboardInterrupt:
         if logger:

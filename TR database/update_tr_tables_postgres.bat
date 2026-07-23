@@ -19,6 +19,7 @@ set "PYTHON_SCRIPT=%SCRIPT_DIR%update_tr_tables_postgres.py"
 REM Set PostgreSQL environment variables
 set DB_BACKEND=postgres
 set POSTGRES_DSN=postgresql://postgres:postgres@127.0.0.1:5432/tr_db
+set TR_UPDATE_LOCK_SOURCE=scheduled_or_manual
 
 REM Set Python encoding environment variable
 set "PYTHONIOENCODING=utf-8"

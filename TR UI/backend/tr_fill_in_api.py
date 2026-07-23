@@ -491,6 +491,155 @@ def _try_promote_phase_b_completed_from_logs(
 
 
 def _full_update_worker(run_id: str, batch_file: str, scheduled_task_name: str) -> None:
+    """
+    全量更新工作线程（Model B）：
+      - 用专属 PG 连接持有跨进程 advisory lock，贯穿阶段 A + B
+      - 阶段 B 在本进程内调用 update_tr_tables_postgres.main(skip_lock=True)，
+        避免子进程 bat 无法共享会话锁而导致抢锁失败或锁提前释放
+    """
+    log_dir = resolve_tr_update_log_dir()
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    phase_a_log = os.path.join(log_dir, f"sync_tr_data_{ts}.log")
+
+    def blog(msg: str) -> None:
+        try:
+            logger.info("[full-update %s] %s", run_id, msg)
+        except Exception:
+            pass
+
+    lock = None
+    try:
+        from tr_update_lock import TrUpdateLock
+
+        lock = TrUpdateLock(source="ui_full")
+        if not lock.try_acquire():
+            busy = TrUpdateLock.is_held()
+            msg = busy.message or "已有数据更新正在执行，请等待完成后再试"
+            blog(f"无法获取跨进程锁: {msg}")
+            _full_update_sync_state(
+                run_id,
+                phase="failed",
+                message=msg,
+                finished_at=datetime.now().isoformat(),
+            )
+            return
+        blog("已获取跨进程更新锁（专属 PG 会话）")
+    except Exception as exc:
+        blog(f"获取跨进程锁异常: {exc}")
+        traceback.print_exc()
+        _full_update_sync_state(
+            run_id,
+            phase="failed",
+            message=f"无法获取更新锁: {_safe_error_message(exc)}",
+            finished_at=datetime.now().isoformat(),
+        )
+        return
+
+    try:
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+        except OSError as exc:
+            _full_update_sync_state(
+                run_id,
+                phase="failed",
+                message=f"无法创建日志目录: {_safe_error_message(exc)}",
+                finished_at=datetime.now().isoformat(),
+            )
+            return
+
+        append_log(phase_a_log, f"run_id={run_id} 阶段A开始")
+        _full_update_sync_state(
+            run_id,
+            phase_a_log=phase_a_log,
+            message="阶段A：正在执行数据库同步存储过程...",
+        )
+
+        try:
+            lock.heartbeat()
+            execute_sync_tr_data(phase_a_log)
+        except Exception as exc:
+            blog(f"阶段A异常: {exc}")
+            traceback.print_exc()
+            _full_update_sync_state(
+                run_id,
+                phase="failed",
+                message=f"阶段A失败: {_safe_error_message(exc)}",
+                finished_at=datetime.now().isoformat(),
+            )
+            return
+
+        _full_update_sync_state(
+            run_id,
+            phase="batch",
+            message="阶段B：正在更新 PostgreSQL 表（进程内，持锁）...",
+        )
+        blog("阶段B：进程内执行 update_tr_tables_postgres.main(skip_lock=True)")
+
+        try:
+            lock.heartbeat()
+            tr_db_dir = os.path.normpath(
+                os.path.join(os.path.dirname(__file__), "..", "..", "TR database")
+            )
+            if tr_db_dir not in sys.path:
+                sys.path.insert(0, tr_db_dir)
+            os.environ.setdefault("DB_BACKEND", "postgres")
+            if "POSTGRES_DSN" not in os.environ:
+                os.environ["POSTGRES_DSN"] = (
+                    "postgresql://postgres:postgres@127.0.0.1:5432/tr_db"
+                )
+            # Import by file path to avoid package name issues
+            import importlib.util
+
+            script_path = os.path.join(tr_db_dir, "update_tr_tables_postgres.py")
+            spec = importlib.util.spec_from_file_location(
+                "update_tr_tables_postgres", script_path
+            )
+            if spec is None or spec.loader is None:
+                raise RuntimeError(f"无法加载更新脚本: {script_path}")
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            rc = int(mod.main(skip_lock=True) or 0)
+        except Exception as exc:
+            blog(f"阶段B异常: {exc}")
+            traceback.print_exc()
+            _full_update_sync_state(
+                run_id,
+                phase="failed",
+                message=f"阶段B失败: {_safe_error_message(exc)}",
+                finished_at=datetime.now().isoformat(),
+            )
+            return
+
+        fin = datetime.now().isoformat()
+        if rc == 0:
+            _full_update_sync_state(
+                run_id,
+                phase="completed",
+                message="全量更新已完成（阶段A + PostgreSQL 表更新）",
+                finished_at=fin,
+            )
+            blog("全量更新完成")
+        else:
+            _full_update_sync_state(
+                run_id,
+                phase="failed",
+                message=f"阶段B返回非零退出码: {rc}",
+                finished_at=fin,
+            )
+            blog(f"阶段B失败 exit_code={rc}")
+    finally:
+        if lock is not None:
+            try:
+                lock.release()
+                blog("已释放跨进程更新锁")
+            except Exception as rel_exc:
+                blog(f"释放更新锁失败: {rel_exc}")
+
+
+def _full_update_worker_legacy_bat(
+    run_id: str, batch_file: str, scheduled_task_name: str
+) -> None:
+    """旧版：阶段B走计划任务/bat（无跨进程会话锁贯穿）。保留供紧急回退。"""
     log_dir = resolve_tr_update_log_dir()
     max_b = int(os.getenv("FULL_UPDATE_PHASE_B_MAX_WAIT_SEC", "7200"))
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1024,6 +1173,46 @@ import threading
 
 # 导入数据库适配器函数（模块级别，避免作用域问题）
 from db_adapter import is_postgres, get_connection as adapter_get_connection, placeholders as db_placeholders, sql_placeholder
+from tr_completeness import assert_orders_tr_complete, get_orders_tr_status
+
+
+def _enrich_orders_with_tr_status(conn, data):
+    """Attach tr_status / missing_diameters / selectable onto list rows."""
+    if not data:
+        return data
+    order_nos = []
+    for row in data:
+        try:
+            order_nos.append(int(row.get("Order_No")))
+        except (TypeError, ValueError):
+            continue
+    status_map = get_orders_tr_status(conn, order_nos)
+    for row in data:
+        try:
+            ono = int(row.get("Order_No"))
+        except (TypeError, ValueError):
+            row.setdefault("tr_status", "complete")
+            row.setdefault("missing_diameters", None)
+            row.setdefault("selectable", True)
+            continue
+        info = status_map.get(ono) or {
+            "tr_status": "complete",
+            "missing_diameters": None,
+            "selectable": True,
+        }
+        row["tr_status"] = info.get("tr_status") or "complete"
+        row["missing_diameters"] = info.get("missing_diameters")
+        row["selectable"] = bool(info.get("selectable", True))
+    return data
+
+
+def _reject_incomplete_orders(conn, order_nos):
+    """Return Flask JSON error response if any order is incomplete, else None."""
+    try:
+        assert_orders_tr_complete(conn, order_nos)
+        return None
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
 
 # 初始化連接池（最大連接數20）
 _pool_initialized = False
@@ -3757,6 +3946,8 @@ def get_bbs_dd_list(page, per_page_param, order_no, job_no, dn_no, start_date, e
                 'pdf_path': row['pdf_path'],
                 'generated_at': row['generated_at']
             })
+
+        _enrich_orders_with_tr_status(conn, data)
         
         # 注意：不要在这里关闭连接，连接是在调用函数之前创建的
         # conn.close()  # 移除这行
@@ -4066,7 +4257,8 @@ def get_orders_list():
                     # 如果包含无法编码的字符，使用 repr 或跳过
                     logger.debug(f"/api/orders/list - First record: Order_No={row_dict.get('Order_No')}, Client={repr(row_dict.get('Client'))}, Jobsite={repr(row_dict.get('Jobsite'))}")
             data.append(row_dict)
-        
+
+        _enrich_orders_with_tr_status(conn, data)
         conn.close()
         
         # 调试信息：打印分页信息
@@ -4691,6 +4883,17 @@ def generate_pdf():
                 'success': False,
                 'error': 'Order No is required'
             }), 400
+
+        check_conn = get_db_connection()
+        try:
+            blocked = _reject_incomplete_orders(check_conn, [int(order_no)])
+            if blocked is not None:
+                return blocked
+        finally:
+            try:
+                check_conn.close()
+            except Exception:
+                pass
         
         user_id = current_user['id']
         
@@ -5042,6 +5245,11 @@ def batch_download_pdf():
         conn = get_db_connection()
         cursor = conn.cursor()
 
+        blocked = _reject_incomplete_orders(conn, order_nos)
+        if blocked is not None:
+            conn.close()
+            return blocked
+
         current_user = g.current_user
         user_job_scope = set()
         # manager和admin可以批量下载所有PDF
@@ -5383,7 +5591,7 @@ def update_all_tables():
     """
     全量更新：异步顺序执行
       阶段 A — EXEC dbo.sync_tr_data（日志 sync_tr_data_*.log）
-      阶段 B — update_tr_tables_postgres.bat / 计划任务 TR_PostgreSQL_Update
+      阶段 B — 进程内 update_tr_tables_postgres（持跨进程 PG advisory 锁）
     仅管理员；同一时刻仅允许一单作业（409）。
     """
     try:
@@ -5394,10 +5602,25 @@ def update_all_tables():
         scheduled_task_name = os.getenv('UPDATE_POSTGRES_TASK_NAME', 'TR_PostgreSQL_Update')
 
         if not os.path.exists(batch_file):
-            return jsonify({
-                'success': False,
-                'error': f'批处理文件不存在: {batch_file}'
-            }), 404
+            # 新路径阶段 B 不再依赖 bat，但保留检查以兼容 legacy 回退
+            if os.getenv('FULL_UPDATE_LEGACY_BAT', '').strip().lower() in ('1', 'true', 'yes'):
+                return jsonify({
+                    'success': False,
+                    'error': f'批处理文件不存在: {batch_file}'
+                }), 404
+
+        # Cross-process lock probe (scheduled bat / other UI may hold it)
+        try:
+            from tr_update_lock import TrUpdateLock
+            busy = TrUpdateLock.is_held()
+            if busy.held:
+                return jsonify({
+                    'success': False,
+                    'error': busy.message or '已有数据更新正在执行，请等待完成后再试',
+                    'lock': busy.as_dict(),
+                }), 409
+        except Exception as lock_exc:
+            logger.warning("update lock probe failed: %s", lock_exc)
 
         eff = _effective_full_update_state()
         if eff.get('phase') in ('sync', 'batch'):
@@ -5424,8 +5647,12 @@ def update_all_tables():
             })
         _persist_full_update_state()
 
+        use_legacy = os.getenv('FULL_UPDATE_LEGACY_BAT', '').strip().lower() in (
+            '1', 'true', 'yes',
+        )
+        worker = _full_update_worker_legacy_bat if use_legacy else _full_update_worker
         thread = threading.Thread(
-            target=_full_update_worker,
+            target=worker,
             args=(run_id, batch_file, scheduled_task_name),
             daemon=True,
         )
@@ -5479,6 +5706,12 @@ def check_update_status():
         if st.get('phase') in ('sync', 'batch', 'completed', 'failed'):
             phase = st['phase']
             api_status = 'running' if phase in ('sync', 'batch') else phase
+            lock_info = None
+            try:
+                from tr_update_lock import TrUpdateLock
+                lock_info = TrUpdateLock.is_held().as_dict()
+            except Exception:
+                pass
             return jsonify({
                 'success': True,
                 'status': api_status,
@@ -5489,6 +5722,7 @@ def check_update_status():
                 'phase_b_log': st.get('phase_b_log'),
                 'started_at': st.get('started_at'),
                 'finished_at': st.get('finished_at'),
+                'lock': lock_info,
             })
 
         log_dir = resolve_tr_update_log_dir()
@@ -5819,6 +6053,17 @@ def download_stockist_test_by_order(order_no):
         # 获取当前用户
         current_user = g.current_user
         user_id = current_user['id']
+
+        check_conn = get_db_connection()
+        try:
+            blocked = _reject_incomplete_orders(check_conn, [int(order_no)])
+            if blocked is not None:
+                return blocked
+        finally:
+            try:
+                check_conn.close()
+            except Exception:
+                pass
         
         # 创建任务管理器（单例，固定 worker 队列）
         task_manager = get_download_task_manager()
@@ -5874,6 +6119,37 @@ def download_stockist_test_by_dd_no(dd_no):
     """
     try:
         from stockist_test_download import StockistTestDownloader
+
+        check_conn = get_db_connection()
+        try:
+            cur = check_conn.cursor()
+            if is_postgres():
+                cur.execute(
+                    "SELECT bbs_no FROM bbs_dd WHERE CAST(dd_no AS TEXT) = %s",
+                    (str(dd_no).strip(),),
+                )
+            else:
+                cur.execute(
+                    "SELECT bbs_no FROM bbs_dd WHERE CAST(dd_no AS TEXT) = ?",
+                    (str(dd_no).strip(),),
+                )
+            rows = cur.fetchall()
+            order_nos = []
+            for row in rows:
+                val = row["bbs_no"] if isinstance(row, dict) else row[0]
+                try:
+                    order_nos.append(int(val))
+                except (TypeError, ValueError):
+                    pass
+            if order_nos:
+                blocked = _reject_incomplete_orders(check_conn, order_nos)
+                if blocked is not None:
+                    return blocked
+        finally:
+            try:
+                check_conn.close()
+            except Exception:
+                pass
         
         # 获取基础文件夹路径
         base_folder = os.getenv('STOCKIST_TEST_FOLDER', r'D:\Stockist&Test Report')
@@ -5966,6 +6242,17 @@ def download_stockist_test_by_order_nos_grouped_by_dd_no():
                 'success': False,
                 'error': '订单数量过多，最多支持500个订单'
             }), 400
+
+        check_conn = get_db_connection()
+        try:
+            blocked = _reject_incomplete_orders(check_conn, order_nos)
+            if blocked is not None:
+                return blocked
+        finally:
+            try:
+                check_conn.close()
+            except Exception:
+                pass
         
         # 获取当前用户
         current_user = g.current_user
@@ -6243,6 +6530,17 @@ def download_stockist_test_by_order_nos_grouped_by_date():
                 'success': False,
                 'error': '订单数量过多，最多支持500个订单'
             }), 400
+
+        check_conn = get_db_connection()
+        try:
+            blocked = _reject_incomplete_orders(check_conn, order_nos)
+            if blocked is not None:
+                return blocked
+        finally:
+            try:
+                check_conn.close()
+            except Exception:
+                pass
         
         # 获取当前用户
         current_user = g.current_user
@@ -6670,6 +6968,17 @@ def download_stockist_test_by_order_nos():
                 'success': False,
                 'error': '订单数量过多，最多支持500个订单'
             }), 400
+
+        check_conn = get_db_connection()
+        try:
+            blocked = _reject_incomplete_orders(check_conn, order_nos)
+            if blocked is not None:
+                return blocked
+        finally:
+            try:
+                check_conn.close()
+            except Exception:
+                pass
         
         # 获取当前用户
         current_user = g.current_user
